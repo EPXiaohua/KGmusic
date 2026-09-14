@@ -1,0 +1,36 @@
+name: iOS Build (unsigned)
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build-ios:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: 3.47.0
+          channel: stable
+          cache: true
+
+      - name: Pub get
+        run: flutter pub get
+
+      - name: Build iOS (no codesign)
+        run: flutter build ios --release --no-codesign
+
+      - name: Package as unsigned ipa
+        run: |
+          cd build/ios/iphoneos
+          mkdir -p Payload
+          cp -R Runner.app Payload/Runner.app
+          zip -qry ../MD3Music-unsigned.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: md3music-ios-unsigned
+          path: build/ios/MD3Music-unsigned.ipa
