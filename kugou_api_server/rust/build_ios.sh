@@ -15,7 +15,7 @@ fi
 rustup target add "$TARGET"
 cargo build --release --target "$TARGET"
 
-OUT_DIR="../ios/Runner/rustlib"
+OUT_DIR="../../ios/rustlib"
 mkdir -p "$OUT_DIR"
 cp "target/$TARGET/release/libkugou_server.a" "$OUT_DIR/"
 echo "OK -> $OUT_DIR/libkugou_server.a ($TARGET)"

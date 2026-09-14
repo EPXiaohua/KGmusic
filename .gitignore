@@ -46,6 +46,11 @@ app.*.map.json
 
 # Rust API server build artifacts
 /kugou_api_server/rust/target/
+# iOS Rust static lib（构建时由 kugou_api_server/rust/build_ios.sh 生成）
+/ios/rustlib/
 
 # Widget Preview related
 .widget_preview/
+
+# Project archive snapshot
+/md3Music-rust-local-force.zip
