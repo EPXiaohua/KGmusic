@@ -25,6 +25,11 @@ jobs:
       - name: Pub get
         run: flutter pub get
 
+      - name: Build Rust server for iOS
+        run: |
+          cd kugou_api_server/rust
+          ./build_ios.sh
+
       - name: Build iOS (no codesign)
         run: flutter build ios --release --no-codesign
 

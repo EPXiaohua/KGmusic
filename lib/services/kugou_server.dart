@@ -95,11 +95,16 @@ class KugouApiServer {
     if (Platform.isWindows) return 'kugou_server.dll';
     if (Platform.isLinux) return 'libkugou_server.so';
     if (Platform.isMacOS) return 'libkugou_server.dylib';
+    if (Platform.isIOS) return 'libkugou_server.a (静态链接进可执行文件)';
     return 'libkugou_server.so'; // Android
   }
 
   static DynamicLibrary _loadLib() {
-    _lib ??= DynamicLibrary.open(_libraryName());
+    _lib ??= Platform.isIOS
+        // iOS：Rust 静态库经 -force_load 链接进 Runner 可执行文件，
+        // 符号需从进程自身查找，而非打开动态库文件
+        ? DynamicLibrary.process()
+        : DynamicLibrary.open(_libraryName());
     return _lib!;
   }
 

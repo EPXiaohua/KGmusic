@@ -56,6 +56,15 @@
 	<!-- record 插件：录音功能 -->
 	<key>NSMicrophoneUsageDescription</key>
 	<string>需要访问麦克风以使用录音功能</string>
+	<!-- ATS 放行：本地 LAN HTTP 服务器 / DLNA / 部分封面 CDN 为明文 HTTP -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+	</dict>
+	<!-- DLNA 投屏与局域网封面服务需要访问本地网络 -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>需要访问本地网络以使用 DLNA 投屏和局域网封面共享功能</string>
 	<!-- image_picker 插件：歌单截图导入 -->
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>需要访问相册以导入歌单截图</string>

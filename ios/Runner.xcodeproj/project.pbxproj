@@ -383,6 +383,11 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-force_load",
+					"\"$(SRCROOT)/rustlib/libkugou_server.a\"",
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.md3music.md3music;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_OBJC_BRIDGING_HEADER = "Runner/Runner-Bridging-Header.h";
@@ -564,6 +569,11 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-force_load",
+					"\"$(SRCROOT)/rustlib/libkugou_server.a\"",
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.md3music.md3music;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_OBJC_BRIDGING_HEADER = "Runner/Runner-Bridging-Header.h";
@@ -585,6 +595,11 @@
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
+				);
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-force_load",
+					"\"$(SRCROOT)/rustlib/libkugou_server.a\"",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.md3music.md3music;
 				PRODUCT_NAME = "$(TARGET_NAME)";

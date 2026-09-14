@@ -5,7 +5,8 @@ edition = "2021"
 
 [lib]
 name = "kugou_server"
-crate-type = ["cdylib", "rlib"]
+# staticlib 供 iOS 静态链接进可执行文件（DynamicLibrary.process() 加载符号）
+crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 tiny_http = "0.12"
