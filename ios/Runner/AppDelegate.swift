@@ -64,11 +64,12 @@ import UniformTypeIdentifiers
       .compactMap { $0 as? UIWindowScene }
       .flatMap { $0.windows }
     for window in windows {
-      if let root = window.rootViewController as? FlutterViewController {
-        return root
+      guard let root = window.rootViewController else { continue }
+      if let vc = root as? FlutterViewController {
+        return vc
       }
       // 根不是（例如被导航/容器包住）时向下找一层
-      for child in root?.children ?? [] {
+      for child in root.children {
         if let vc = child as? FlutterViewController {
           return vc
         }
