@@ -1147,10 +1147,21 @@ class AudioPlaybackService : Service() {
         // （1003 可见通知）已撑住进程前台，保活空通知（1002）不再需要，
         // 避免系统里多个前台服务/通知并存。桌面歌词关闭后由
         // ACTION_REFRESH_FOREGROUND 或下一次周期通知更新恢复。
+        // 阶段9：播放中 MD3MusicMediaSessionService 亦会自行 startForeground 撑住进程级 FGS，
+        // 同样让位（少一条常驻保活通知），前台保护不缺失。
         // 用存活探测而非纯标志位：桌面歌词被系统强杀时 onDestroy 可能未执行、
         // isRunning 残留 true，此时不能继续让位（会失去前台保护）。
-        if (isFloatingLyricActuallyRunning()) {
-            // 让位给 FloatingLyricService（1003 常驻 FGS 撑住进程前台）。
+        // 只探测一次并复用：既避免重复 binder 调用，也防止两次探测之间服务状态翻转
+        // 导致「日志说让位给 A、实际让位给 B」。
+        val yieldTarget = if (isFloatingLyricActuallyRunning()) {
+            "FloatingLyricService"
+        } else if (isMedia3Foreground()) {
+            "MD3MusicMediaSessionService"
+        } else {
+            null
+        }
+        if (yieldTarget != null) {
+            // 让位给 FloatingLyricService / MD3MusicMediaSessionService 常驻 FGS 撑住进程前台。
             // 但 startForegroundService 拉起本服务会产生"5 秒内必须 startForeground"
             // 的系统义务，直接跳过会触发 ForegroundServiceDidNotStartInTimeException
             // 闪退（实测 2026-09-02：桌面歌词运行中暂停/恢复等媒体状态变化重启本服务即崩）。
@@ -1160,7 +1171,7 @@ class AudioPlaybackService : Service() {
                 try { stopForeground(Service.STOP_FOREGROUND_REMOVE) } catch (_: Throwable) {}
             } catch (_: Throwable) {}
             foregroundStarted = false
-            Log.d(TAG, "startForegroundDetached: deferred to FloatingLyricService")
+            Log.d(TAG, "startForegroundDetached: deferred to $yieldTarget")
             return
         }
         try {
@@ -1242,6 +1253,20 @@ class AudioPlaybackService : Service() {
                 .any { it.service.className == FloatingLyricService::class.java.name }
         } catch (_: Exception) {
             true // 探测失败时保守按标志位处理（不打断正常让位）
+        }
+    }
+
+    /// 阶段9：媒体3 会话承载服务（MD3MusicMediaSessionService）是否处于前台。
+    /// 播放中它由 media3 自己调用 startForeground 撑住「进程级 FGS」，
+    /// 此时本服务再挂一条保活通知属于重复：让位可以少一条常驻通知，且不损失前台保护。
+    private fun isMedia3Foreground(): Boolean {
+        return try {
+            val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            am.getRunningServices(100).any {
+                it.service.className == MD3MusicMediaSessionService::class.java.name && it.foreground
+            }
+        } catch (_: Exception) {
+            false // 探测失败按「未在前台」处理：退回常驻保活通知，宁可多一条也别掉前台保护
         }
     }
 
@@ -2035,6 +2060,29 @@ class AudioPlaybackService : Service() {
         }
     }
 
+    /// 方案B：是否允许用歌词行改写 MediaSession TITLE。
+    /// 蓝牙歌词开启 + 有当前歌词行时才允许；但 LyricInfo(ColorOS) 协议激活时
+    /// 保留真实曲名（ColorOS 桌面歌词走 extras.lyricInfo，不依赖 TITLE）。
+    private fun btLyricRewriteActive(): Boolean {
+        if (!bluetoothLyricEnabled) return false
+        if (currentBtLyricText.isEmpty()) return false
+        val colorOsActive = try {
+            getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
+                .getString("flutter.lyric_push_protocol", "") == "lyric_info"
+        } catch (_: Exception) {
+            false
+        }
+        return !colorOsActive
+    }
+
+    private fun btLyricDisplayTitle(): String =
+        if (btLyricRewriteActive()) currentBtLyricText else originalTitle
+
+    private fun btLyricDisplayArtist(): String =
+        if (btLyricRewriteActive())
+            (if (originalArtist.isNotEmpty()) "$originalArtist - $originalTitle" else originalTitle)
+        else originalArtist
+
     /// 蓝牙歌词轻量刷新：歌词行变化或开关切换时，复用缓存的 bitmap 和播放状态
     /// 重建通知和 MediaSession 元数据，不重新下载封面。
     /// 仅在 showNotification 至少被调用过一次后有效（originalTitle 非空判定）。
@@ -2051,10 +2099,10 @@ class AudioPlaybackService : Service() {
             scheduleMetadataRefresh()
             return
         }
-        // Bluetooth AVRCP 与 SystemUI 共用该 MediaSession；为保证锁屏曲目身份稳定，
-        // 这里始终发布真实歌名/歌手，不再逐句改写 TITLE/ARTIST。
-        val displayTitle = originalTitle
-        val displayArtist = originalArtist
+        // 方案B：蓝牙歌词开启且非 ColorOS(LyricInfo) 场景时，把歌词行写入 TITLE
+        // （AVRCP 设备据此显示歌词）；ColorOS 场景保留真实曲名（歌词走 extras.lyricInfo）。
+        val displayTitle = btLyricDisplayTitle()
+        val displayArtist = btLyricDisplayArtist()
 
         // P0: 文本未变化（歌词行未变 / 开关未切换）时直接跳过，避免无效刷新。
         // 但 LyricInfo 歌词转发（currentLyricInfo 变化）不依赖 title/artist 变化，
@@ -2092,8 +2140,6 @@ class AudioPlaybackService : Service() {
     private fun performMetadataRefresh() {
         val mediaId = originalMediaId
         if (mediaId.isEmpty()) return
-        val displayTitle = originalTitle
-        val displayArtist = originalArtist
         val effectiveLyricInfo = lyricInfoForCurrentTrack()
         // 方案B阶段5：自定义会话已移除，不再 setMetadata。
         // 媒体3会话的元数据（标题/艺术家/封面/LyricInfo）由下方 updateActiveSession* 同步，
@@ -2104,9 +2150,11 @@ class AudioPlaybackService : Service() {
         AudioPlayer.updateActiveSessionTitleArtistAndLyricInfo(
             mediaId,
             metadataGeneration,
-            displayTitle,
-            displayArtist,
-            effectiveLyricInfo
+            originalTitle,
+            originalArtist,
+            effectiveLyricInfo,
+            btLyricDisplayTitle(),
+            btLyricDisplayArtist()
         )
         // 方案B阶段4：按当前开关状态渲染媒体3通知栏的自定义按钮（桌面歌词/收藏）。
         pushMedia3CustomActions(
@@ -2114,7 +2162,53 @@ class AudioPlaybackService : Service() {
             lastIsFavorited,
             hasTranslationForCurrentTrack()
         )
+        // MD3Music fork: Vivo 原子随身听（vivomusicmix）歌词推送（歌词就绪后发一次，
+        // 定时器 25s 重发兜底）。
+        pushVivoAtomicExtras()
     }
+
+    // ==== MD3Music fork: Vivo 原子随身听（vivomusicmix）歌词推送 ====
+    // 协议字段照抄 vivo 官方拼写错误（meida / meidia），写成正确拼写反而收不到。
+    private val vivoAtomicHandler = Handler(Looper.getMainLooper())
+    private var lastVivoLrcSentAt = 0L
+    private var lastVivoLrcMediaId = ""
+
+    private fun startVivoAtomicTimer() {
+        vivoAtomicHandler.removeCallbacksAndMessages(null)
+        vivoAtomicHandler.postDelayed(object : Runnable {
+            override fun run() {
+                pushVivoAtomicExtras()
+                vivoAtomicHandler.postDelayed(this, 25_000L)
+            }
+        }, 25_000L)
+    }
+
+    /// 原子随身听歌词：通过 legacy MediaSessionCompat 静态通道向活跃 session 重发
+    /// lrc_change extras（framework extras，25s 定时兜底：覆盖"原子在首次发送后才连上"）。
+    /// meidia_id 必须与 hook 补进 metadata 的身份完全一致（title|artist），
+    /// 否则原子 E0()/z1() 匹配失败 → 封面纯色、歌词不显示（实测 songId 数字 ID 不匹配）。
+    /// 无整段歌词时安全跳过，不推空 Bundle。
+    private fun pushVivoAtomicExtras() {
+        try {
+            val mediaId = if (originalMediaId.isNotEmpty()) originalMediaId
+                else "$originalTitle|$originalArtist"
+            // 与 hook 补的 MEDIA_ID 保持一致：统一用 title|artist 身份
+            val atomicMediaId = "$originalTitle|$originalArtist"
+            if (originalTitle.isEmpty()) return
+            val lrc = AudioPlayer.extractCarLyricsFromLyricInfo(lyricInfoForCurrentTrack())
+                ?: return
+            androidx.media3.session.legacy.MediaSessionCompat
+                .resendVivoLrcChange(lrc, atomicMediaId)
+            lastVivoLrcSentAt = System.currentTimeMillis()
+            lastVivoLrcMediaId = atomicMediaId
+            lastVivoLrcSentLrc = lrc
+        } catch (e: Throwable) {
+            Log.w(TAG, "pushVivoAtomicExtras failed: ${e.message}", e)
+        }
+    }
+
+    @Volatile
+    private var lastVivoLrcSentLrc = ""
 
     private fun lyricInfoForCurrentTrack(): String {
         if (currentLyricInfo.isEmpty()) return ""
@@ -2154,6 +2248,8 @@ class AudioPlaybackService : Service() {
         setLyriconEnabledState(false)
         // P0: 取消排期中的 setMetadata 合并刷新，防止服务销毁后仍回调
         metadataRefreshHandler.removeCallbacksAndMessages(null)
+        // MD3Music fork: 取消原子随身听 25s 重发定时器
+        vivoAtomicHandler.removeCallbacksAndMessages(null)
         releaseWakeLock()
         // 释放缓存的封面 bitmap
         lastArtBitmap?.let { if (!it.isRecycled) it.recycle() }

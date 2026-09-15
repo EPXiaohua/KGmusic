@@ -1,12 +1,12 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:provider/provider.dart';
 
 import '../../core/services/usb_audio_service.dart';
+import '../../core/utils/audio_format_utils.dart';
 import '../../core/utils/audio_scanner.dart' show audioExtensions;
 import '../../data/models/song.dart';
 import '../../providers/player_provider.dart';
@@ -143,48 +143,9 @@ class _SongInfoPageState extends State<SongInfoPage> {
   }
 
   /// 解析音频文件头（FLAC STREAMINFO / WAV fmt chunk）获取原始位深。
-  /// 本地文件直接读，网络 URL 用 Range 请求前 64 字节。解析失败返回 null。
-  Future<int?> _parseHeaderBitDepth(String? url, String? localPath) async {
-    try {
-      Uint8List head;
-      if (localPath != null) {
-        final f = File(localPath);
-        if (!await f.exists()) return null;
-        final raf = await f.open();
-        head = await raf.read(64);
-        await raf.close();
-      } else if (url != null) {
-        final resp = await http
-            .get(Uri.parse(url), headers: {'Range': 'bytes=0-63'})
-            .timeout(const Duration(seconds: 5));
-        if (resp.statusCode < 200 || resp.statusCode >= 300) return null;
-        head = resp.bodyBytes;
-      } else {
-        return null;
-      }
-
-      if (head.length < 32) return null;
-
-      // FLAC: "fLaC" + STREAMINFO 块，采样参数在 offset 8+10=18（8 字节）
-      if (head[0] == 0x66 && head[1] == 0x4C && head[2] == 0x61 && head[3] == 0x43) {
-        const off = 18;
-        if (head.length < off + 4) return null;
-        final bps = (((head[off + 2] & 0x01) << 4) | ((head[off + 3] >> 4) & 0x0F)) + 1;
-        if (bps > 0 && bps <= 32) return bps;
-      }
-
-      // WAV: "RIFF" + fmt chunk 的 bitsPerSample（offset 34，2 字节 LE）
-      if (head[0] == 0x52 && head[1] == 0x49 && head[2] == 0x46 && head[3] == 0x46) {
-        if (head.length >= 36) {
-          final bps = (head[34] & 0xFF) | ((head[35] & 0xFF) << 8);
-          if (bps > 0 && bps <= 32) return bps;
-        }
-      }
-    } catch (_) {
-      // 网络/文件解析失败静默处理
-    }
-    return null;
-  }
+  /// 实现统一收敛到 [AudioFormatUtils]，与 USB 独占格式链共用同一逻辑。
+  Future<int?> _parseHeaderBitDepth(String? url, String? localPath) =>
+      AudioFormatUtils.parseAudioBitDepth(url, localPath);
 
   @override
   Widget build(BuildContext context) {
@@ -381,11 +342,8 @@ class _SongInfoPageState extends State<SongInfoPage> {
     );
   }
 
-  String _formatRate(int rate) {
-    if (rate <= 0) return '—';
-    if (rate % 1000 == 0) return '${rate ~/ 1000} kHz';
-    return '${(rate / 1000).toStringAsFixed(1)} kHz';
-  }
+  /// 采样率/位深格式化与 Media3 编码映射统一走 [AudioFormatUtils]（与 USB 格式链一致）。
+  String _formatRate(int rate) => AudioFormatUtils.formatRate(rate);
 
   String _formatFileSize(int bytes) {
     if (bytes <= 0) return '—';
@@ -396,20 +354,7 @@ class _SongInfoPageState extends State<SongInfoPage> {
   }
 
   /// Media3 编码常量 → 位深（bit）。
-  int _encodingBits(int encoding) {
-    switch (encoding) {
-      case 4: // C.ENCODING_PCM_FLOAT
-        return 32;
-      case 2: // C.ENCODING_PCM_16BIT
-        return 16;
-      case 0x15: // C.ENCODING_PCM_24BIT
-        return 24;
-      case 0x16: // C.ENCODING_PCM_32BIT
-        return 32;
-      default:
-        return 16;
-    }
-  }
+  int _encodingBits(int encoding) => AudioFormatUtils.encodingBits(encoding);
 
   String _formatChannels(int ch) {
     switch (ch) {

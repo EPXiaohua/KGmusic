@@ -1378,6 +1378,11 @@ import org.checkerframework.checker.initialization.qual.Initialized;
       @Nullable Bitmap artworkBitmap = null;
       ListenableFuture<Bitmap> bitmapFuture =
           sessionImpl.getBitmapLoader().loadBitmapFromMetadata(newMediaMetadata);
+      // MD3Music fork: 诊断日志（封面链路，Log.i：vivo 屏蔽 D 级）
+      android.util.Log.i("MD3CarLyrics", "updateMetadataIfChanged: loader="
+          + (bitmapFuture == null ? "null(无artworkData/artworkUri)" : "future")
+          + " artData=" + (newMediaMetadata.artworkData != null)
+          + " artUri=" + (newMediaMetadata.artworkUri != null));
       if (bitmapFuture != null) {
         pendingBitmapLoadCallback = null;
         if (bitmapFuture.isDone()) {

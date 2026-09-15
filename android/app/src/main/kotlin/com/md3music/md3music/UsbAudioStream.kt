@@ -17,7 +17,9 @@ class UsbAudioStream(
         sampleRate: Int,
         channelCount: Int,
         bitDepth: Int,
-        maxPacketSize: Int
+        maxPacketSize: Int,
+        /** USB 总线速度：true=full-speed（每 ISO packet 对应 1ms 帧），false=high-speed（125µs microframe）。 */
+        fullSpeed: Boolean = false
 ) {
 
     /** Native UsbAudioContext 指针。 */
@@ -27,10 +29,10 @@ class UsbAudioStream(
     init {
         nativeHandle = nativeUsbAudioCreate(
                 fd, interfaceId, endpointOut, endpointFeedback,
-                sampleRate, channelCount, bitDepth, maxPacketSize
+                sampleRate, channelCount, bitDepth, maxPacketSize, fullSpeed
         )
         if (nativeHandle == 0L) {
-            Log.e(TAG, "nativeUsbAudioCreate returned 0 — check logcat for native errors")
+            UsbLog.e(TAG, "nativeUsbAudioCreate returned 0 — check logcat for native errors")
         }
     }
 
@@ -162,14 +164,15 @@ class UsbAudioStream(
         if (nativeHandle == 0L) return
         nativeUsbAudioDestroy(nativeHandle)
         nativeHandle = 0L
-        Log.i(TAG, "UsbAudioStream released")
+        UsbLog.i(TAG, "UsbAudioStream released")
     }
 
     // JNI declarations（与 usb-audio-output.cpp 导出符号一一对应）
 
     private external fun nativeUsbAudioCreate(
             fd: Int, interfaceId: Int, endpointOut: Int, endpointFeedback: Int,
-            sampleRate: Int, channelCount: Int, bitDepth: Int, maxPacketSize: Int
+            sampleRate: Int, channelCount: Int, bitDepth: Int, maxPacketSize: Int,
+            fullSpeed: Boolean
     ): Long
 
     private external fun nativeUsbAudioSetAltSetting(handle: Long, altSetting: Int): Boolean
@@ -200,6 +203,14 @@ class UsbAudioStream(
          */
         @JvmStatic
         external fun nativeUsbReset(fd: Int): Int
+
+        /** 读取 native 环形日志（诊断导出用）；异常/为空时返回空串。 */
+        @JvmStatic
+        external fun nativeGetRecentLogs(): String?
+
+        /** native 环形日志安全封装。 */
+        fun recentNativeLogs(): String =
+                try { nativeGetRecentLogs() ?: "" } catch (_: Throwable) { "" }
 
         /**
          * 释放路径专用：SETCONFIGURATION(0) → SETCONFIGURATION(current) 触发 USB core

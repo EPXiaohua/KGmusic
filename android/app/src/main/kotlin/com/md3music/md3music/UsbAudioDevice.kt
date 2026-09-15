@@ -49,6 +49,14 @@ class UsbAudioDevice private constructor(private val context: Context) {
     @Volatile
     private var volumeChannel: Int = -1
 
+    /** 最近一次 setSampleRate 结果（诊断展示用）；null=本次打开后未执行。 */
+    @Volatile
+    private var lastRateSetOk: Boolean? = null
+
+    /** 最近一次 UAC1 GET_CUR 回读的 DAC 端点采样率；-1=未回读/不支持/失败。 */
+    @Volatile
+    private var lastRateReadback: Int = -1
+
     /** DAC 是否支持硬件音量控制（存在 Feature Unit 且带 Volume 控制位）。 */
     val hasHardwareVolume: Boolean
         get() = featureUnitId > 0 && (featureUnitMasterControls and 0x02) != 0
@@ -87,7 +95,7 @@ class UsbAudioDevice private constructor(private val context: Context) {
                 // USB Audio Class: class=1 (Audio), subclass=2 (AudioStreaming)
                 if (iface.interfaceClass == UsbConstants.USB_CLASS_AUDIO &&
                     iface.interfaceSubclass == 2) {
-                    Log.i(TAG, "Found USB audio device: ${device.productName} " +
+                    UsbLog.i(TAG, "Found USB audio device: ${device.productName} " +
                             "(vendor=0x${device.vendorId.toString(16)}, " +
                             "product=0x${device.productId.toString(16)})")
                     return device
@@ -113,7 +121,7 @@ class UsbAudioDevice private constructor(private val context: Context) {
      */
     fun requestPermission(device: UsbDevice, callback: (Boolean) -> Unit) {
         if (usbManager.hasPermission(device)) {
-            Log.i(TAG, "Permission already granted for ${device.productName}")
+            UsbLog.i(TAG, "Permission already granted for ${device.productName}")
             callback(true)
             return
         }
@@ -130,7 +138,7 @@ class UsbAudioDevice private constructor(private val context: Context) {
             override fun onReceive(ctx: Context, intent: Intent) {
                 if (intent.action == context.packageName + ACTION_USB_PERMISSION_SUFFIX) {
                     val granted = intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
-                    Log.i(TAG, "USB permission result: granted=$granted for ${device.productName}")
+                    UsbLog.i(TAG, "USB permission result: granted=$granted for ${device.productName}")
                     context.unregisterReceiver(this)
                     callback(granted)
                 }
@@ -145,16 +153,18 @@ class UsbAudioDevice private constructor(private val context: Context) {
         }
 
         usbManager.requestPermission(device, permissionIntent)
-        Log.i(TAG, "Permission requested for ${device.productName}")
+        UsbLog.i(TAG, "Permission requested for ${device.productName}")
     }
 
     /**
      * Open the USB device and extract all information needed for audio I/O.
      *
-     * Finds the AudioStreaming interface, locates the isochronous OUT and
-     * feedback IN endpoints, and returns everything the native layer needs.
+     * 接口/端点发现完全由 raw USB 描述符驱动（多接口 UAC1/UAC2 DAC 通吃）：
+     * 解析 UAC 版本 → 收集全部 AudioStreaming alt → 按目标采样率选择
+     * 输出流接口组的最佳 alt，并 claim 对应接口。
      *
-     * @param device The USB audio device to open.
+     * @param device     The USB audio device to open.
+     * @param targetRate 目标采样率（当前播放格式；0=未知，按最高位深选择）。
      * @return Device info with fd and endpoint addresses, or null on failure.
      */
     /** Cached device info from the last successful openDevice() call. */
@@ -163,76 +173,76 @@ class UsbAudioDevice private constructor(private val context: Context) {
     /** 最近一次成功 openDevice 的设备信息（供插件 getStatus 上报）。 */
     fun getCachedInfo(): UsbAudioDeviceInfo? = cachedDeviceInfo
 
-    fun openDevice(device: UsbDevice): UsbAudioDeviceInfo? {
-        // Return cached info if already open with valid connection
+    fun openDevice(device: UsbDevice, targetRate: Int = 0, targetBits: Int = 0): UsbAudioDeviceInfo? {
+        // 缓存命中时仍需按目标格式重新选择 alt：targetRate/targetBits（位深/采样率强制）
+        // 变化必须反映到流配置，否则 override 不生效（修复：缓存短路吞掉参数）。
         val cached = cachedDeviceInfo
-        if (cached != null && connection != null) {
-            Log.i(TAG, "Device already open, reusing fd=${cached.fd}")
-            return cached
+        val openConn = connection
+        if (cached != null && openConn != null) {
+            val asAlts = parseAudioStreaming(openConn, cached.uacVersion)
+            val chosen = pickBestAlt(asAlts, targetRate, targetBits)
+            if (chosen == null) {
+                // 描述符重解析异常：保守复用缓存（与旧行为一致）
+                UsbLog.w(TAG, "openDevice: cached re-parse failed — reusing fd=${cached.fd}")
+                return cached
+            }
+            if (chosen.interfaceNumber == cached.interfaceId && chosen.alt == cached.bestAltSetting) {
+                // 目标格式对应同一 alt：零开销复用
+                UsbLog.i(TAG, "Device already open, reusing fd=${cached.fd} " +
+                        "(iface=${cached.interfaceId} alt=${cached.bestAltSetting} bits=${cached.bestBitDepth})")
+                return cached
+            }
+            if (chosen.interfaceNumber != cached.interfaceId) {
+                // 新选择在不同 AS 接口：需要重新 claim，走完整重开（落到下方主流程）
+                UsbLog.i(TAG, "Target format needs iface=${chosen.interfaceNumber} " +
+                        "(cached iface=${cached.interfaceId}) — reopening device")
+            } else {
+                // 同接口换 alt：免重开设备（claim 仍有效），仅更新选择。
+                // 后续 setAlt(0)/setAlt(N) 由 createStartedStream 在同接口执行。
+                UsbLog.i(TAG, "Cached switch: iface=${chosen.interfaceNumber} " +
+                        "alt=${cached.bestAltSetting}→${chosen.alt}, " +
+                        "bits=${cached.bestBitDepth}→${chosen.bitResolution}, " +
+                        "maxPacket=${cached.maxPacketSize}→${chosen.outMaxPacket}")
+                val info = cached.copy(
+                        maxPacketSize = chosen.outMaxPacket,
+                        altSettingCount = asAlts.size,
+                        bestAltSetting = chosen.alt,
+                        bestBitDepth = chosen.bitResolution,
+                        supportedRates = chosen.rates,
+                        feedbackSource = if (chosen.fbEp > 0) "same-iface" else "none"
+                )
+                cachedDeviceInfo = info
+                return info
+            }
         }
-        // Close any stale connection before opening new
+        // Close any stale connection before opening new（缓存分支决定重开时此调用幂等）
         closeDevice()
         val conn = usbManager.openDevice(device)
         if (conn == null) {
-            Log.e(TAG, "Failed to open device ${device.productName}")
+            UsbLog.e(TAG, "Failed to open device ${device.productName}")
             return null
         }
 
-        // Find the AudioStreaming interface with OUT endpoint and its feedback endpoint
-        // Some DACs (e.g. TANCHJIM BUNNY DSP) have multiple AudioStreaming interface groups;
-        // we must scan all of them to find the one with the ISO OUT endpoint.
-        var streamingInterface: UsbInterface? = null
-        var endpointOut = -1
-        var endpointFeedback = -1
-        var maxPacketSize = 0
-        var altSettingCount = 0
-
-        for (i in 0 until device.interfaceCount) {
-            val iface = device.getInterface(i)
-            if (iface.interfaceClass == UsbConstants.USB_CLASS_AUDIO &&
-                iface.interfaceSubclass == 2) {
-                altSettingCount++
-
-                if (iface.endpointCount > 0) {
-                    // Scan this interface for OUT and IN endpoints
-                    var candidateOut = -1
-                    var candidateFb = -1
-                    var candidateMaxPkt = 0
-                    for (e in 0 until iface.endpointCount) {
-                        val ep = iface.getEndpoint(e)
-                        when {
-                            ep.type == UsbConstants.USB_ENDPOINT_XFER_ISOC &&
-                                    ep.direction == UsbConstants.USB_DIR_OUT -> {
-                                candidateOut = ep.address
-                                candidateMaxPkt = ep.maxPacketSize
-                                Log.i(TAG, "Interface $i: ISO OUT address=0x${ep.address.toString(16)}, " +
-                                        "maxPacket=$candidateMaxPkt, interval=${ep.interval}")
-                            }
-                            ep.type == UsbConstants.USB_ENDPOINT_XFER_ISOC &&
-                                    ep.direction == UsbConstants.USB_DIR_IN -> {
-                                candidateFb = ep.address
-                                Log.i(TAG, "Interface $i: ISO IN (feedback) address=0x${ep.address.toString(16)}, " +
-                                        "interval=${ep.interval}")
-                            }
-                        }
-                    }
-                    // Prefer interface with OUT endpoint; feedback is optional
-                    if (candidateOut >= 0 && streamingInterface == null) {
-                        streamingInterface = iface
-                        endpointOut = candidateOut
-                        endpointFeedback = candidateFb
-                        maxPacketSize = candidateMaxPkt
-                        Log.i(TAG, "Selected AudioStreaming interface $i with OUT endpoint")
-                    }
-                }
-            }
-        }
-
-        if (streamingInterface == null || endpointOut < 0) {
-            Log.e(TAG, "No suitable AudioStreaming interface/endpoint found")
+        // 由描述符驱动：UAC 版本 + USB 速度 + 全部 AudioStreaming alt + 最佳输出流 alt
+        val uacVersion = parseUacVersion(conn)
+        val fullSpeed = parseUsbSpeed(conn, uacVersion)
+        val asAlts = parseAudioStreaming(conn, uacVersion)
+        val chosen = pickBestAlt(asAlts, targetRate, targetBits)
+        if (chosen == null) {
+            UsbLog.e(TAG, "No suitable AudioStreaming interface/endpoint found " +
+                    "(uac=UAC$uacVersion, asAlts=${asAlts.size})")
             conn.close()
             return null
         }
+        UsbLog.i(TAG, "Selected AudioStreaming: iface=${chosen.interfaceNumber} alt=${chosen.alt} " +
+                "epOut=0x${chosen.outEp.toString(16)} maxPacket=${chosen.outMaxPacket} " +
+                "bits=${chosen.bitResolution} ch=${chosen.channels} rates=${chosen.rates.contentToString()}")
+
+        // 能力并集（仅含 OUT 端点的输出流 alt），供输出格式选择 UI 生成可选项
+        val outs = asAlts.filter { it.outEp >= 0 }
+        val allRates = outs.flatMap { it.rates.asIterable() }.distinct().sorted().toIntArray()
+        val allBits = outs.map { it.bitResolution }.distinct().sorted().toIntArray()
+        val allChannels = outs.map { it.channels }.filter { it > 0 }.distinct().sorted().toIntArray()
 
         // Claim the AudioControl interface (0) with force=true to disconnect kernel driver
         val controlInterface = (0 until device.interfaceCount)
@@ -242,59 +252,65 @@ class UsbAudioDevice private constructor(private val context: Context) {
         if (controlInterface != null) {
             val claimed = conn.claimInterface(controlInterface, true)
             if (claimed) claimedInterfaces.add(controlInterface)
-            Log.i(TAG, "Claimed AudioControl interface ${controlInterface.id} force=true: $claimed")
+            UsbLog.i(TAG, "Claimed AudioControl interface ${controlInterface.id} force=true: $claimed")
         }
 
-        // Claim the AudioStreaming interface with force=true to disconnect kernel driver (snd-usb-audio)
-        // NOTE: We claim the zero-bandwidth alt setting (alt=0). The actual streaming alt setting
-        // will be activated later via setInterface() which allocates USB bandwidth.
-        val claimed = conn.claimInterface(streamingInterface, true)
-        Log.i(TAG, "Claimed AudioStreaming interface ${streamingInterface.id} force=true: $claimed " +
-                "(alt=${streamingInterface.alternateSetting}, endpoints=${streamingInterface.endpointCount})")
-        if (!claimed) {
-            Log.e(TAG, "Failed to claim streaming interface — kernel driver may still be active")
+        // Claim 所选输出流接口：按 bInterfaceNumber + bAlternateSetting 精确匹配，
+        // 避免在多 AS 组设备（录音/播放两组接口）上命中错误接口
+        val streamingInterface = (0 until device.interfaceCount)
+                .map { device.getInterface(it) }
+                .firstOrNull { it.interfaceClass == UsbConstants.USB_CLASS_AUDIO &&
+                        it.interfaceSubclass == 2 &&
+                        it.id == chosen.interfaceNumber &&
+                        it.alternateSetting == chosen.alt }
+        if (streamingInterface == null) {
+            UsbLog.e(TAG, "Streaming UsbInterface not found: " +
+                    "number=${chosen.interfaceNumber}, alt=${chosen.alt}")
+            conn.close()
+            return null
+        }
+        val claimedStreaming = conn.claimInterface(streamingInterface, true)
+        UsbLog.i(TAG, "Claimed AudioStreaming interface ${streamingInterface.id} " +
+                "(alt=${streamingInterface.alternateSetting}, " +
+                "endpoints=${streamingInterface.endpointCount}) force=true: $claimedStreaming")
+        if (!claimedStreaming) {
+            UsbLog.e(TAG, "Failed to claim streaming interface — kernel driver may still be active")
             conn.close()
             return null
         }
         claimedInterfaces.add(streamingInterface)
 
-        // Force alt=0 to stop any streaming left by kernel driver
+        // Force alt=0（同一 interfaceNumber 的零带宽设置）以停止内核驱动残留的流。
+        // 实际流式 alt 将由原生 SETINTERFACE(interfaceId, N) 激活。
         val zeroAlt = (0 until device.interfaceCount)
                 .map { device.getInterface(it) }
                 .firstOrNull { it.interfaceClass == UsbConstants.USB_CLASS_AUDIO &&
-                        it.interfaceSubclass == 2 && it.alternateSetting == 0 }
+                        it.interfaceSubclass == 2 &&
+                        it.id == chosen.interfaceNumber &&
+                        it.alternateSetting == 0 }
         if (zeroAlt != null) {
             conn.setInterface(zeroAlt)
-            Log.i(TAG, "Reset streaming to alt=0 (zero-bandwidth)")
+            UsbLog.i(TAG, "Reset streaming iface=${chosen.interfaceNumber} to alt=0 (zero-bandwidth)")
         }
         Thread.sleep(100)
 
-        // Log all available alt settings for debugging
-        for (i in 0 until device.interfaceCount) {
-            val iface = device.getInterface(i)
-            if (iface.interfaceClass == UsbConstants.USB_CLASS_AUDIO && iface.interfaceSubclass == 2) {
-                Log.d(TAG, "  AudioStreaming alt=${iface.alternateSetting}: " +
-                        "id=${iface.id}, endpoints=${iface.endpointCount}")
-            }
-        }
-
         val fd = conn.fileDescriptor
-        val interfaceId = streamingInterface.id
 
-        Log.i(TAG, "Device opened: ${device.productName}, fd=$fd, " +
-                "iface=$interfaceId, epOut=0x${endpointOut.toString(16)}, " +
-                "epFb=0x${endpointFeedback.toString(16)}, " +
-                "maxPacket=$maxPacketSize, altSettings=$altSettingCount")
+        // UAC2 才有 Clock Source 实体；UAC1 采样率走端点请求（见 setSampleRate）
+        val clockSourceId = if (uacVersion == 2) parseClockSourceId(conn) else -1
+        featureUnitId = parseFeatureUnitId(conn)
+        val feedbackSource = if (chosen.fbEp > 0) "same-iface" else "none"
 
         connection = conn
         currentDevice = device
 
-        // Auto-detect Clock Source ID and best alt setting from USB descriptors
-        val clockSourceId = parseClockSourceId(conn)
-        val (bestAlt, bestBits) = parseBestAltSetting(conn)
-        featureUnitId = parseFeatureUnitId(conn)
-        Log.i(TAG, "Auto-detected: clockSourceId=0x${clockSourceId.toString(16)}, " +
-                "bestAlt=$bestAlt, bestBits=$bestBits, featureUnitId=0x${if (featureUnitId > 0) featureUnitId.toString(16) else "-"} " +
+        UsbLog.i(TAG, "Device opened: ${device.productName}, fd=$fd, uac=UAC$uacVersion, " +
+                "${if (fullSpeed) "full-speed" else "high-speed"}, " +
+                "iface=${chosen.interfaceNumber}, epOut=0x${chosen.outEp.toString(16)}, " +
+                "epFb=${if (chosen.fbEp > 0) "0x${chosen.fbEp.toString(16)}" else "none($feedbackSource)"}, " +
+                "maxPacket=${chosen.outMaxPacket}, " +
+                "clockSourceId=${if (clockSourceId > 0) "0x${clockSourceId.toString(16)}" else "-"}, " +
+                "featureUnitId=${if (featureUnitId > 0) "0x${featureUnitId.toString(16)}" else "-"} " +
                 "masterControls=0x${featureUnitMasterControls.toString(16)}" +
                 if (hasHardwareVolume) " (硬件音量可用)" else " (无硬件音量，用软件音量 fallback)")
 
@@ -302,14 +318,21 @@ class UsbAudioDevice private constructor(private val context: Context) {
                 connection = conn,
                 fd = fd,
                 deviceName = device.productName ?: "USB Audio Device",
-                interfaceId = interfaceId,
-                endpointOutAddress = endpointOut,
-                endpointFeedbackAddress = endpointFeedback,
-                maxPacketSize = maxPacketSize,
-                altSettingCount = altSettingCount,
+                interfaceId = chosen.interfaceNumber,
+                endpointOutAddress = chosen.outEp,
+                endpointFeedbackAddress = chosen.fbEp,
+                maxPacketSize = chosen.outMaxPacket,
+                altSettingCount = asAlts.size,
                 clockSourceId = clockSourceId,
-                bestAltSetting = bestAlt,
-                bestBitDepth = bestBits
+                bestAltSetting = chosen.alt,
+                bestBitDepth = chosen.bitResolution,
+                uacVersion = uacVersion,
+                supportedRates = chosen.rates,
+                feedbackSource = feedbackSource,
+                fullSpeed = fullSpeed,
+                allRates = allRates,
+                allBits = allBits,
+                allChannels = allChannels
         )
         cachedDeviceInfo = info
         return info
@@ -324,11 +347,11 @@ class UsbAudioDevice private constructor(private val context: Context) {
         val conn = connection ?: return
         val fd = conn.fileDescriptor
 
-        Log.i(TAG, "Performing REAL USBDEVFS_RESET on fd=$fd...")
+        UsbLog.i(TAG, "Performing REAL USBDEVFS_RESET on fd=$fd...")
 
         // Real USB port reset via native ioctl — resets DAC clock state
         val ret = UsbAudioStream.nativeUsbReset(fd)
-        Log.i(TAG, "USBDEVFS_RESET result: $ret")
+        UsbLog.i(TAG, "USBDEVFS_RESET result: $ret")
 
         // Reset releases all interface claims. The fd remains valid.
         // Clear cache so openDevice re-claims, but KEEP the connection
@@ -375,7 +398,7 @@ class UsbAudioDevice private constructor(private val context: Context) {
                 // CLOCK_SOURCE = 0x0A
                 if (bDescriptorSubtype == 0x0A && bLength >= 5) {
                     val bClockID = raw[i + 3].toInt() and 0xFF
-                    Log.i(TAG, "parseClockSourceId: found CLOCK_SOURCE bClockID=0x${bClockID.toString(16)}")
+                    UsbLog.i(TAG, "parseClockSourceId: found CLOCK_SOURCE bClockID=0x${bClockID.toString(16)}")
                     return bClockID
                 }
             }
@@ -383,8 +406,263 @@ class UsbAudioDevice private constructor(private val context: Context) {
             i += bLength
         }
 
-        Log.w(TAG, "parseClockSourceId: no CLOCK_SOURCE descriptor found")
+        UsbLog.w(TAG, "parseClockSourceId: no CLOCK_SOURCE descriptor found")
         return -1
+    }
+
+    // ── 描述符驱动的 AudioStreaming 解析 ─────────────────────────
+
+    /** 一个 AudioStreaming alt 设置的解析结果（来自 raw USB 描述符）。 */
+    @Suppress("ArrayInDataClass")
+    private data class AsAlt(
+        val interfaceNumber: Int,   // bInterfaceNumber
+        val alt: Int,               // bAlternateSetting
+        val outEp: Int,             // ISO OUT 数据端点地址；无则 -1
+        val outMaxPacket: Int,      // 该 OUT 端点 wMaxPacketSize
+        val fbEp: Int,              // 同接口内显式 feedback ISO IN 端点；无则 -1
+        val channels: Int,
+        val bitResolution: Int,
+        val subslotSize: Int,       // 每样本字节数
+        val rates: IntArray         // UAC1 离散采样率列表；UAC2/连续区间为空
+    )
+
+    /**
+     * 解析 UAC 版本：在 AudioControl 接口（class=1, subclass=1）内找
+     * CS_INTERFACE HEADER（subtype 0x01），读 bcdADC 高字节：
+     * 0x0100→UAC1，0x0200→UAC2，其余按 UAC2 兜底（保持既有行为）。
+     */
+    private fun parseUacVersion(conn: UsbDeviceConnection): Int {
+        val raw = conn.rawDescriptors ?: return 2
+        var i = 0
+        var inAudioControl = false
+        while (i + 1 < raw.size) {
+            val bLength = raw[i].toInt() and 0xFF
+            if (bLength < 2) break
+            if (i + bLength > raw.size) break
+            val bDescriptorType = raw[i + 1].toInt() and 0xFF
+
+            if (bDescriptorType == 0x04 && bLength >= 9) {
+                val cls = raw[i + 5].toInt() and 0xFF
+                val sub = raw[i + 6].toInt() and 0xFF
+                inAudioControl = (cls == 1 && sub == 1)
+            }
+
+            // CS_INTERFACE HEADER：bcdADC 位于 payload 偏移 0-1（小端）
+            if (inAudioControl && bDescriptorType == 0x24 && bLength >= 5 &&
+                (raw[i + 2].toInt() and 0xFF) == 0x01) {
+                val bcdAdc = (raw[i + 3].toInt() and 0xFF) or
+                        ((raw[i + 4].toInt() and 0xFF) shl 8)
+                val version = bcdAdc shr 8
+                UsbLog.i(TAG, "parseUacVersion: bcdADC=0x${bcdAdc.toString(16)} → UAC$version")
+                return if (version == 1) 1 else 2
+            }
+
+            i += bLength
+        }
+        UsbLog.w(TAG, "parseUacVersion: no AUDIO header found — 默认按 UAC2")
+        return 2
+    }
+
+    /**
+     * 判定 USB 总线速度（决定 native 每 ISO packet 装载的时长）。
+     * 规则：
+     * - UAC1 → 强制 full-speed：UAC1 设备均为 1ms 帧。bcdUSB 不可靠——
+     *   它只是"声明的规范版本"（如 KTMicro 标 0x0200 仅表示 USB2.0 兼容），
+     *   不代表以 high-speed 运行；误判会让 native 按 microframe 装包，
+     *   数据供给率只有需求的 1/8（噪音/进度极慢的根因）。
+     * - UAC2+ → bcdUSB ≥ 0x0200 按 high-speed（绝大多数 UAC2 为 high-speed）；
+     *   raw 描述符无 device descriptor 时按默认 high-speed。
+     */
+    private fun parseUsbSpeed(conn: UsbDeviceConnection, uacVersion: Int): Boolean {
+        if (uacVersion == 1) {
+            UsbLog.i(TAG, "parseUsbSpeed: UAC1 → full-speed (bcdUSB 不可靠，忽略)")
+            return true
+        }
+        val raw = conn.rawDescriptors ?: return false
+        var i = 0
+        while (i + 1 < raw.size) {
+            val bLength = raw[i].toInt() and 0xFF
+            if (bLength < 2) break
+            if (i + bLength > raw.size) break
+            if ((raw[i + 1].toInt() and 0xFF) == 0x01 && bLength >= 4) {
+                val bcdUsb = (raw[i + 2].toInt() and 0xFF) or
+                        ((raw[i + 3].toInt() and 0xFF) shl 8)
+                val full = bcdUsb < 0x0200
+                UsbLog.i(TAG, "parseUsbSpeed: bcdUSB=0x${bcdUsb.toString(16)} → " +
+                        if (full) "full-speed" else "high-speed")
+                return full
+            }
+            i += bLength
+        }
+        UsbLog.w(TAG, "parseUsbSpeed: 无 device descriptor → 默认 high-speed")
+        return false
+    }
+
+    /**
+     * 线性扫描 raw 描述符，收集全部 AudioStreaming alt 设置（含录音接口）。
+     * - 端点：ISO OUT → outEp/outMaxPacket；ISO IN 且 usage=feedback(0x01) → fbEp
+     *   （implicit-feedback 的 IN 数据端点不作为 feedback，避免把音频数据当时钟读）。
+     * - 格式：FORMAT_TYPE_I(subtype 0x02, bFormatType=1)。
+     *   UAC1 布局：bNrChannels/bSubframeSize/bBitResolution/bSamFreqType[+3字节频率×N]。
+     *   UAC2 布局：bSubslotSize/bBitResolution（声道取 AS_GENERAL 的 bNrChannels）。
+     */
+    private fun parseAudioStreaming(conn: UsbDeviceConnection, uacVersion: Int): List<AsAlt> {
+        val raw = conn.rawDescriptors ?: return emptyList()
+        val result = mutableListOf<AsAlt>()
+
+        var curNumber = -1
+        var curAlt = -1
+        var inAS = false
+        var outEp = -1
+        var outMaxPacket = 0
+        var fbEp = -1
+        var channels = 0
+        var bitRes = 0
+        var subslot = 0
+        var rates = mutableListOf<Int>()
+
+        fun flush() {
+            if (inAS && curAlt > 0) {
+                result.add(AsAlt(curNumber, curAlt, outEp, outMaxPacket, fbEp,
+                        channels, bitRes, subslot, rates.toIntArray()))
+            }
+            outEp = -1; outMaxPacket = 0; fbEp = -1
+            // 注意：channels 不在此重置——bNrChannels 是流级属性（AS_GENERAL 通常
+            // 只挂在 alt0，跨全部 alt 共享）。sticky 保留最近一次 AS_GENERAL 的值，
+            // 标准布局设备的 alt1+ 也能拿到正确声道数；bitRes/subslot/rates/端点
+            // 是每个 alt 各自的属性，仍按 alt 重置。
+            bitRes = 0; subslot = 0
+            rates = mutableListOf()
+        }
+
+        var i = 0
+        while (i + 1 < raw.size) {
+            val bLength = raw[i].toInt() and 0xFF
+            if (bLength < 2) break
+            if (i + bLength > raw.size) break
+            when (raw[i + 1].toInt() and 0xFF) {
+                0x04 -> {  // INTERFACE
+                    val newNumber = if (bLength >= 9) raw[i + 2].toInt() and 0xFF else curNumber
+                    flush()
+                    // 切换到另一个接口（如输出流→录音流）：声道数改由新接口自己的
+                    // AS_GENERAL 决定，缺失则保持 0（未知→不钳制），避免跨接口串值。
+                    if (newNumber != curNumber) channels = 0
+                    if (bLength >= 9) {
+                        curNumber = raw[i + 2].toInt() and 0xFF
+                        curAlt = raw[i + 3].toInt() and 0xFF
+                        val cls = raw[i + 5].toInt() and 0xFF
+                        val sub = raw[i + 6].toInt() and 0xFF
+                        inAS = (cls == 1 && sub == 2)
+                    } else {
+                        inAS = false
+                    }
+                }
+                0x05 -> {  // ENDPOINT
+                    if (inAS && bLength >= 7) {
+                        val addr = raw[i + 2].toInt() and 0xFF
+                        val attr = raw[i + 3].toInt() and 0xFF
+                        val maxPkt = (raw[i + 4].toInt() and 0xFF) or
+                                ((raw[i + 5].toInt() and 0xFF) shl 8)
+                        if ((attr and 0x03) == 0x01) {  // isochronous
+                            if (addr and 0x80 == 0) {   // OUT 数据端点
+                                outEp = addr
+                                outMaxPacket = maxPkt
+                            } else if (((attr shr 4) and 0x03) == 0x01) {
+                                fbEp = addr  // IN + usage=feedback（显式异步反馈）
+                            }
+                        }
+                    }
+                }
+                0x24 -> {  // CS_INTERFACE
+                    if (inAS && bLength >= 6) {
+                        when (raw[i + 2].toInt() and 0xFF) {
+                            0x01 -> {  // AS_GENERAL：UAC2 的声道数（诊断用，尽力而为）
+                                // UAC2 AS_GENERAL 标准布局：bTerminalLink(3)、bmControls(4)、
+                                // bFormatType(5)、bmFormats(6..9)、bNrChannels(10)、
+                                // bmChannelConfig(11..14)。
+                                // 注意：声道数在偏移 10，不是 11——偏移 11 是声道位置位图
+                                // （bmChannelConfig）低字节，立体声 FL|FR=0x03 会被误读成 3 声道。
+                                if (uacVersion >= 2 && bLength >= 11) {
+                                    val nrChannels = raw[i + 10].toInt() and 0xFF
+                                    val chCfg = if (bLength >= 15) {
+                                        (raw[i + 11].toInt() and 0xFF) or
+                                                ((raw[i + 12].toInt() and 0xFF) shl 8) or
+                                                ((raw[i + 13].toInt() and 0xFF) shl 16) or
+                                                ((raw[i + 14].toInt() and 0xFF) shl 24)
+                                    } else 0
+                                    // 合理性校验：USB 音频声道数 1..8，越界视为描述符无效 → 0（不钳制）
+                                    channels = if (nrChannels in 1..8) nrChannels else 0
+                                    UsbLog.i(TAG, "AS_GENERAL: bNrChannels=$nrChannels" +
+                                            " bmChannelConfig=0x${chCfg.toString(16)}" +
+                                            " (iface=$curNumber alt=$curAlt)")
+                                }
+                            }
+                            0x02 -> {  // FORMAT_TYPE
+                                if ((raw[i + 3].toInt() and 0xFF) == 1) {  // Type I（PCM）
+                                    if (uacVersion == 1 && bLength >= 8) {
+                                        val nrChannels = raw[i + 4].toInt() and 0xFF
+                                        channels = if (nrChannels in 1..8) nrChannels else 0
+                                        subslot = raw[i + 5].toInt() and 0xFF
+                                        bitRes = raw[i + 6].toInt() and 0xFF
+                                        val n = raw[i + 7].toInt() and 0xFF
+                                        if (n > 0 && bLength >= 8 + 3 * n) {
+                                            for (k in 0 until n) {
+                                                val o = i + 8 + k * 3
+                                                rates.add((raw[o].toInt() and 0xFF) or
+                                                        ((raw[o + 1].toInt() and 0xFF) shl 8) or
+                                                        ((raw[o + 2].toInt() and 0xFF) shl 16))
+                                            }
+                                        }
+                                    } else if (uacVersion >= 2) {
+                                        subslot = raw[i + 4].toInt() and 0xFF
+                                        bitRes = raw[i + 5].toInt() and 0xFF
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            i += bLength
+        }
+        flush()
+
+        UsbLog.i(TAG, "parseAudioStreaming: uac=UAC$uacVersion, ${result.size} alts: " +
+                result.joinToString { a ->
+                    "iface${a.interfaceNumber}/alt${a.alt}" +
+                            "(ep=0x${a.outEp.toString(16)},maxPkt=${a.outMaxPacket}," +
+                            "ch=${a.channels},bits=${a.bitResolution}," +
+                            "fb=${if (a.fbEp > 0) "0x${a.fbEp.toString(16)}" else "-"})"
+                })
+        return result
+    }
+
+    /**
+     * 选择最佳输出流 alt：仅在含 ISO OUT 端点的 alt 中挑选。
+     * 采样率：targetRate>0 时优先支持该率（含 UAC2 连续区间）。
+     * 位深：targetBits>0 时优先精确匹配，其次 ≥targetBits 的最小位深，再回退最高位深。
+     * 最终在池内取最高位深、最大包长。
+     */
+    private fun pickBestAlt(asAlts: List<AsAlt>, targetRate: Int, targetBits: Int = 0): AsAlt? {
+        val outs = asAlts.filter { it.outEp >= 0 }
+        if (outs.isEmpty()) return null
+        val matched = if (targetRate > 0) {
+            outs.filter { it.rates.isEmpty() || it.rates.contains(targetRate) }
+        } else {
+            emptyList()
+        }
+        val ratePool = matched.ifEmpty { outs }
+        val pool = if (targetBits > 0) {
+            val exact = ratePool.filter { it.bitResolution == targetBits }
+            when {
+                exact.isNotEmpty() -> exact
+                else -> ratePool.filter { it.bitResolution > targetBits }
+                        .minByOrNull { it.bitResolution }?.let { listOf(it) } ?: ratePool
+            }
+        } else {
+            ratePool
+        }
+        return pool.maxWithOrNull(compareBy({ it.bitResolution }, { it.outMaxPacket }))
     }
 
     /**
@@ -424,7 +702,7 @@ class UsbAudioDevice private constructor(private val context: Context) {
                             mc = mc or ((raw[i + 6 + k].toInt() and 0xFF) shl (8 * k))
                         }
                         featureUnitMasterControls = mc
-                        Log.i(TAG, "parseFeatureUnitId: bUnitID=0x${bUnitID.toString(16)} " +
+                        UsbLog.i(TAG, "parseFeatureUnitId: bUnitID=0x${bUnitID.toString(16)} " +
                                 "bControlSize=$bControlSize masterControls=0x${mc.toString(16)} " +
                                 "mute=${(mc and 0x01) != 0} volume=${(mc and 0x02) != 0}")
                     }
@@ -434,7 +712,7 @@ class UsbAudioDevice private constructor(private val context: Context) {
 
             i += bLength
         }
-        Log.w(TAG, "parseFeatureUnitId: no Feature Unit found — DAC 无硬件音量控制")
+        UsbLog.w(TAG, "parseFeatureUnitId: no Feature Unit found — DAC 无硬件音量控制")
         return -1
     }
 
@@ -474,12 +752,12 @@ class UsbAudioDevice private constructor(private val context: Context) {
                     val cur = (probe[0].toInt() and 0xFF) or ((probe[1].toInt() and 0xFF) shl 8)
                     val signed = if (cur >= 0x8000) cur - 0x10000 else cur
                     volumeChannel = ch
-                    Log.i(TAG, "setDacVolume: probe channel $ch OK (cur=${signed / 256.0}dB)")
+                    UsbLog.i(TAG, "setDacVolume: probe channel $ch OK (cur=${signed / 256.0}dB)")
                     break
                 }
             }
             if (volumeChannel < 0) {
-                Log.w(TAG, "setDacVolume: FU 0x${fuId.toString(16)} all channels no volume — DAC 不支持硬件音量")
+                UsbLog.w(TAG, "setDacVolume: FU 0x${fuId.toString(16)} all channels no volume — DAC 不支持硬件音量")
                 return false
             }
         }
@@ -499,120 +777,25 @@ class UsbAudioDevice private constructor(private val context: Context) {
         val wValue = (0x02 shl 8) or volumeChannel
         val ret = conn.controlTransfer(0x22, 0x01, wValue, (fuId shl 8) or 0, data, data.size, 1000)
         if (ret >= 0) {
-            Log.i(TAG, "setDacVolume($p%) ch=$volumeChannel vol=$volume (${volume / 256.0}dB) OK")
+            UsbLog.i(TAG, "setDacVolume($p%) ch=$volumeChannel vol=$volume (${volume / 256.0}dB) OK")
             return true
         }
-        Log.w(TAG, "setDacVolume($p%): SET_CUR failed ret=$ret")
+        UsbLog.w(TAG, "setDacVolume($p%): SET_CUR failed ret=$ret")
         return false
-    }
-
-    /**
-     * Parse raw USB descriptors to find the best (highest bit depth) alt setting
-     * for the AudioStreaming interface.
-     *
-     * Scans AS Format Type I descriptors (CS_INTERFACE 0x02) for bBitResolution
-     * and returns the alt setting with the highest value.
-     *
-     * @return Pair(altSetting, bitDepth), or Pair(1, 16) as default.
-     */
-    /** Parsed alt setting: (altNumber, bitResolution) */
-    private var parsedAltSettings: List<Pair<Int, Int>> = emptyList()
-
-    private fun parseBestAltSetting(conn: UsbDeviceConnection): Pair<Int, Int> {
-        val raw = conn.rawDescriptors ?: return Pair(1, 16)
-        val altSettings = mutableListOf<Pair<Int, Int>>()
-
-        var i = 0
-        var currentAlt = 0
-        var inAudioStreaming = false
-        var bestAlt = 1
-        var bestBits = 16
-
-        while (i + 1 < raw.size) {
-            val bLength = raw[i].toInt() and 0xFF
-            if (bLength < 2) break
-            if (i + bLength > raw.size) break
-
-            val bDescriptorType = raw[i + 1].toInt() and 0xFF
-
-            // Interface descriptor (0x04)
-            if (bDescriptorType == 0x04 && bLength >= 9) {
-                val bInterfaceClass = raw[i + 5].toInt() and 0xFF
-                val bInterfaceSubClass = raw[i + 6].toInt() and 0xFF
-                val bAlternateSetting = raw[i + 3].toInt() and 0xFF
-                inAudioStreaming = (bInterfaceClass == 1 && bInterfaceSubClass == 2)
-                if (inAudioStreaming) currentAlt = bAlternateSetting
-            }
-
-            // CS_INTERFACE (0x24) in AudioStreaming — Format Type I (subtype 0x02)
-            if (inAudioStreaming && bDescriptorType == 0x24 && bLength >= 6) {
-                val bDescriptorSubtype = raw[i + 2].toInt() and 0xFF
-                if (bDescriptorSubtype == 0x02) {
-                    val bSubslotSize = raw[i + 4].toInt() and 0xFF
-                    val bBitResolution = raw[i + 5].toInt() and 0xFF
-                    Log.i(TAG, "parseBestAltSetting: alt=$currentAlt subslotSize=$bSubslotSize bitResolution=$bBitResolution")
-
-                    if (currentAlt > 0) {
-                        altSettings.add(Pair(currentAlt, bBitResolution))
-                    }
-                    if (bBitResolution > bestBits && currentAlt > 0) {
-                        bestBits = bBitResolution
-                        bestAlt = currentAlt
-                    }
-                }
-            }
-
-            i += bLength
-        }
-
-        parsedAltSettings = altSettings
-        Log.i(TAG, "parseBestAltSetting: best alt=$bestAlt bits=$bestBits, all=$altSettings")
-        return Pair(bestAlt, bestBits)
-    }
-
-    /**
-     * Find the alt setting that matches the given source bit depth exactly.
-     * If no exact match, returns the next higher bit depth.
-     * Fallback: returns the best (highest) alt setting.
-     *
-     * @return Pair(altSetting, bitDepth)
-     */
-    fun findAltSettingForBitDepth(targetBitDepth: Int): Pair<Int, Int> {
-        if (parsedAltSettings.isEmpty()) {
-            val info = cachedDeviceInfo ?: return Pair(1, 16)
-            return Pair(info.bestAltSetting, info.bestBitDepth)
-        }
-
-        // Exact match
-        val exact = parsedAltSettings.firstOrNull { it.second == targetBitDepth }
-        if (exact != null) {
-            Log.i(TAG, "findAltSettingForBitDepth($targetBitDepth): exact match alt=${exact.first}")
-            return exact
-        }
-
-        // Next higher
-        val higher = parsedAltSettings
-                .filter { it.second > targetBitDepth }
-                .minByOrNull { it.second }
-        if (higher != null) {
-            Log.i(TAG, "findAltSettingForBitDepth($targetBitDepth): next higher alt=${higher.first} bits=${higher.second}")
-            return higher
-        }
-
-        // Fallback to best
-        val best = parsedAltSettings.maxByOrNull { it.second } ?: Pair(1, 16)
-        Log.i(TAG, "findAltSettingForBitDepth($targetBitDepth): fallback to best alt=${best.first} bits=${best.second}")
-        return best
     }
 
     /**
      * Close the USB device and release all resources.
      */
     fun closeDevice() {
+        // 先取已选输出流接口号，供 alt=0 恢复精确匹配（多 AS 组设备不能取"第一个 alt=0"）
+        val openedIfaceNumber = cachedDeviceInfo?.interfaceId
         cachedDeviceInfo = null
         featureUnitId = -1
         featureUnitMasterControls = 0
         volumeChannel = -1
+        lastRateSetOk = null
+        lastRateReadback = -1
         val conn = connection
         val device = currentDevice
         if (conn != null && device != null) {
@@ -620,7 +803,8 @@ class UsbAudioDevice private constructor(private val context: Context) {
             try {
                 (0 until device.interfaceCount).map { device.getInterface(it) }
                     .firstOrNull { it.interfaceClass == UsbConstants.USB_CLASS_AUDIO &&
-                            it.interfaceSubclass == 2 && it.alternateSetting == 0 }
+                            it.interfaceSubclass == 2 && it.alternateSetting == 0 &&
+                            (openedIfaceNumber == null || it.id == openedIfaceNumber) }
                     ?.let { conn.setInterface(it) }
             } catch (_: Exception) {}
             // 2) 释放所有已 claim 的接口（AudioControl + AudioStreaming）
@@ -634,9 +818,9 @@ class UsbAudioDevice private constructor(private val context: Context) {
             val fd = conn.fileDescriptor
             try {
                 val ret = UsbAudioStream.nativeUsbReconfigure(fd)
-                Log.i(TAG, "nativeUsbReconfigure ret=$ret")
+                UsbLog.i(TAG, "nativeUsbReconfigure ret=$ret")
             } catch (e: Exception) {
-                Log.e(TAG, "nativeUsbReconfigure failed: ${e.message}")
+                UsbLog.e(TAG, "nativeUsbReconfigure failed: ${e.message}")
             }
         }
         val releasedCount = claimedInterfaces.size
@@ -644,25 +828,66 @@ class UsbAudioDevice private constructor(private val context: Context) {
         connection?.close()
         connection = null
         currentDevice = null
-        Log.i(TAG, "USB device closed ($releasedCount interfaces released + reconnect)")
+        UsbLog.i(TAG, "USB device closed ($releasedCount interfaces released + reconnect)")
     }
 
     /**
-     * Set the sample rate on a UAC2 Clock Source entity via SET_CUR control transfer.
+     * Set the sample rate on the DAC via SET_CUR control transfer.
      *
-     * Tries multiple common clock source entity IDs since we can't easily read
-     * the AudioControl descriptors from userspace on Android.
-     *
-     * UAC2 SET_CUR format:
-     *   bmRequestType = 0x21 (Host-to-Device, Class, Interface)
+     * UAC1（多接口廉价 DAC 常见）：SAMPLING_FREQ_CONTROL 端点请求
+     *   bmRequestType = 0x22 (Host-to-Device, Class, Endpoint)
      *   bRequest = 0x01 (SET_CUR)
-     *   wValue = (CS_SAM_FREQ_CONTROL << 8) | 0 = 0x0100
+     *   wValue = 0x0100 (CS_SAM_FREQ_CONTROL << 8 | channel 0)
+     *   wIndex = OUT 端点地址
+     *   data = 3-byte LE sample rate
+     *
+     * UAC2：Clock Source 实体请求（沿用既有路径）
+     *   bmRequestType = 0x21 (Host-to-Device, Class, Interface)
      *   wIndex = (clockSourceEntityId << 8) | audioControlInterfaceNumber
      *   data = 4-byte LE sample rate
      */
     fun setSampleRate(sampleRateHz: Int): Boolean {
         val conn = connection ?: return false
+        val info = cachedDeviceInfo
 
+        // UAC1：端点请求，3 字节 LE
+        if (info != null && info.uacVersion == 1) {
+            val data3 = byteArrayOf(
+                    (sampleRateHz and 0xFF).toByte(),
+                    ((sampleRateHz shr 8) and 0xFF).toByte(),
+                    ((sampleRateHz shr 16) and 0xFF).toByte())
+            val ret = conn.controlTransfer(
+                    0x22,    // bmRequestType: Host-to-Device, Class, Endpoint
+                    0x01,    // bRequest: SET_CUR
+                    0x0100,  // wValue: CS_SAM_FREQ_CONTROL
+                    info.endpointOutAddress and 0xFF,  // wIndex: OUT 端点地址
+                    data3,
+                    data3.size,
+                    1000
+            )
+            if (ret >= 0) {
+                UsbLog.i(TAG, "UAC1 setSampleRate($sampleRateHz Hz): OK " +
+                        "ep=0x${info.endpointOutAddress.toString(16)} ret=$ret")
+                lastRateSetOk = true
+                // GET_CUR 回读 DAC 端点当前采样率（bmRequestType 0xA2, wIndex=OUT 端点, 3 字节 LE）
+                // 用于暴露"DAC 实际率 ≠ 发送率"；部分 UAC1 不支持端点 GET_CUR → FAIL 仅记录
+                val rb = ByteArray(3)
+                val rr = conn.controlTransfer(0xA2, 0x01, 0x0100,
+                        info.endpointOutAddress and 0xFF, rb, rb.size, 1000)
+                lastRateReadback = if (rr >= 3) {
+                    (rb[0].toInt() and 0xFF) or ((rb[1].toInt() and 0xFF) shl 8) or
+                            ((rb[2].toInt() and 0xFF) shl 16)
+                } else 0  // 0 = 回读失败（DAC 不支持端点 GET_CUR），与"未执行"(-1) 区分
+                UsbLog.i(TAG, "UAC1 rate readback: $lastRateReadback Hz (ret=$rr)")
+                return true
+            }
+            UsbLog.w(TAG, "UAC1 setSampleRate($sampleRateHz Hz): failed ret=$ret " +
+                    "(rates=${info.supportedRates.contentToString()}，DAC 可能自适应采样率)")
+            lastRateSetOk = false
+            return false
+        }
+
+        // UAC2：Clock Source 实体 SET_CUR
         val data = ByteArray(4)
         data[0] = (sampleRateHz and 0xFF).toByte()
         data[1] = ((sampleRateHz shr 8) and 0xFF).toByte()
@@ -692,49 +917,15 @@ class UsbAudioDevice private constructor(private val context: Context) {
                     1000     // timeout ms
             )
             if (ret >= 0) {
-                Log.i(TAG, "setSampleRate($sampleRateHz Hz): SUCCESS with clockSourceId=0x${csId.toString(16)} (wIndex=0x${wIndex.toString(16)}, ret=$ret)")
+                UsbLog.i(TAG, "setSampleRate($sampleRateHz Hz): SUCCESS with clockSourceId=0x${csId.toString(16)} (wIndex=0x${wIndex.toString(16)}, ret=$ret)")
+                lastRateSetOk = true
                 return true
             }
         }
 
-        Log.w(TAG, "setSampleRate($sampleRateHz Hz): all clock source IDs failed, DAC may auto-detect")
+        UsbLog.w(TAG, "setSampleRate($sampleRateHz Hz): all clock source IDs failed, DAC may auto-detect")
+        lastRateSetOk = false
         return false
-    }
-
-    /**
-     * Read the current sample rate from the DAC via UAC2 GET_CUR.
-     * This verifies whether our SET_CUR actually took effect.
-     */
-    fun readSampleRate(): Int {
-        val conn = connection ?: return -1
-        val data = ByteArray(4)
-
-        val detectedId = cachedDeviceInfo?.clockSourceId ?: -1
-        val clockSourceIds = if (detectedId > 0) intArrayOf(detectedId)
-                else intArrayOf(0x05, 0x09, 0x0A, 0x0B, 0x0C, 0x28, 0x29)
-        for (csId in clockSourceIds) {
-            val wIndex = (csId shl 8) or 0
-            val ret = conn.controlTransfer(
-                    0xA1,    // bmRequestType: Device-to-Host, Class, Interface
-                    0x01,    // bRequest: GET_CUR (actually CUR is 0x01 for both)
-                    0x0100,  // wValue: CS_SAM_FREQ_CONTROL
-                    wIndex,
-                    data,
-                    data.size,
-                    1000
-            )
-            if (ret >= 4) {
-                val rate = (data[0].toInt() and 0xFF) or
-                        ((data[1].toInt() and 0xFF) shl 8) or
-                        ((data[2].toInt() and 0xFF) shl 16) or
-                        ((data[3].toInt() and 0xFF) shl 24)
-                Log.i(TAG, "readSampleRate: GET_CUR clockSourceId=0x${csId.toString(16)} " +
-                        "returned $rate Hz (raw=${data.joinToString(",") { "0x${(it.toInt() and 0xFF).toString(16)}" }})")
-                return rate
-            }
-        }
-        Log.w(TAG, "readSampleRate: all GET_CUR attempts failed")
-        return -1
     }
 
     /**
@@ -747,6 +938,9 @@ class UsbAudioDevice private constructor(private val context: Context) {
      */
     fun readClockValid(): Boolean {
         val conn = connection ?: return false
+        // UAC1 无 CLOCK_VALID 概念，直接视为有效（实际结果由 setSampleRate 返回值体现）
+        val info = cachedDeviceInfo
+        if (info != null && info.uacVersion == 1) return true
         val data = ByteArray(1)
 
         val detectedId = cachedDeviceInfo?.clockSourceId ?: -1
@@ -765,11 +959,11 @@ class UsbAudioDevice private constructor(private val context: Context) {
             )
             if (ret >= 1) {
                 val valid = data[0].toInt() and 0x01
-                Log.i(TAG, "readClockValid: clockSourceId=0x${csId.toString(16)} valid=$valid")
+                UsbLog.i(TAG, "readClockValid: clockSourceId=0x${csId.toString(16)} valid=$valid")
                 return valid == 1
             }
         }
-        Log.w(TAG, "readClockValid: all GET_CUR attempts failed")
+        UsbLog.w(TAG, "readClockValid: all GET_CUR attempts failed")
         return false
     }
 
@@ -780,21 +974,24 @@ class UsbAudioDevice private constructor(private val context: Context) {
     fun setAltSetting(altSetting: Int): Boolean {
         val conn = connection ?: return false
         val device = currentDevice ?: return false
+        // 收敛为按已选输出流接口号匹配（多 AS 组设备不能按裸 alt 号猜接口）
+        val openedIfaceNumber = cachedDeviceInfo?.interfaceId
 
         // Find the UsbInterface with the matching alt setting
         for (i in 0 until device.interfaceCount) {
             val iface = device.getInterface(i)
             if (iface.interfaceClass == UsbConstants.USB_CLASS_AUDIO &&
                 iface.interfaceSubclass == 2 &&
-                iface.alternateSetting == altSetting) {
+                iface.alternateSetting == altSetting &&
+                (openedIfaceNumber == null || iface.id == openedIfaceNumber)) {
                 val result = conn.setInterface(iface)
-                Log.i(TAG, "setAltSetting($altSetting) via Java API: $result " +
+                UsbLog.i(TAG, "setAltSetting($altSetting) via Java API: $result " +
                         "(iface id=${iface.id}, endpoints=${iface.endpointCount})")
                 return result
             }
         }
 
-        Log.w(TAG, "setAltSetting($altSetting): no matching UsbInterface found, " +
+        UsbLog.w(TAG, "setAltSetting($altSetting): no matching UsbInterface found, " +
                 "trying all AudioStreaming interfaces...")
 
         // Fallback: try any AudioStreaming interface with matching alt
@@ -808,6 +1005,62 @@ class UsbAudioDevice private constructor(private val context: Context) {
         }
 
         return false
+    }
+
+    /**
+     * Salt Player 式诊断导出：设备拓扑 + 所选端点 + UAC 版本 + 采样率能力，
+     * 经 getStatus()["diagnostics"] 透出至「调试信息」面板，供用户复制回传定位。
+     */
+    fun buildDiagnostics(device: UsbDevice?, info: UsbAudioDeviceInfo?): String {
+        val sb = StringBuilder()
+        sb.appendLine("USB Exclusive Diagnostics")
+        sb.appendLine("Package: com.md3music.md3music")
+        if (device == null) {
+            sb.appendLine("Device: none")
+            return sb.toString()
+        }
+        sb.appendLine("Device: ${device.productName}")
+        sb.appendLine("VID:PID: ${device.vendorId.toString(16).uppercase().padStart(4, '0')}" +
+                ":${device.productId.toString(16).uppercase().padStart(4, '0')}")
+        sb.appendLine("Manufacturer: ${device.manufacturerName ?: "-"}")
+        sb.appendLine("USB Permission: ${usbManager.hasPermission(device)}")
+        sb.appendLine("Interface Count: ${device.interfaceCount}")
+        for (i in 0 until device.interfaceCount) {
+            val f = device.getInterface(i)
+            sb.appendLine("Interface #$i: id=${f.id} alt=${f.alternateSetting} " +
+                    "class=${f.interfaceClass} subclass=${f.interfaceSubclass} " +
+                    "endpoints=${f.endpointCount}")
+            for (e in 0 until f.endpointCount) {
+                val ep = f.getEndpoint(e)
+                sb.appendLine("  EP 0x${ep.address.toString(16).uppercase()} " +
+                        "dir=${if (ep.direction == UsbConstants.USB_DIR_IN) "IN" else "OUT"} " +
+                        "type=${ep.type} interval=${ep.interval} " +
+                        "maxPacket=${ep.maxPacketSize} attributes=0x${ep.attributes.toString(16)}")
+            }
+        }
+        if (info != null) {
+            sb.appendLine("Opened: true / fd=${info.fd}")
+            sb.appendLine("UAC Version: ${info.uacVersion}")
+            sb.appendLine("USB Speed: ${if (info.fullSpeed) "full" else "high"}")
+            sb.appendLine("Selected Endpoint: iface=${info.interfaceId} alt=${info.bestAltSetting} " +
+                    "ep=0x${info.endpointOutAddress.toString(16).uppercase()} " +
+                    "maxPacket=${info.maxPacketSize} bits=${info.bestBitDepth}")
+            sb.appendLine("Supported Rates: ${info.supportedRates.joinToString(",")}")
+            sb.appendLine("All Rates: ${info.allRates.joinToString(",")}")
+            sb.appendLine("All Bits: ${info.allBits.joinToString(",")}")
+            sb.appendLine("All Channels: ${info.allChannels.joinToString(",")}")
+            sb.appendLine("Rate Set: ${when (lastRateSetOk) { true -> "OK"; false -> "FAIL"; null -> "未执行" }}")
+            sb.appendLine("Rate Readback: ${if (lastRateReadback > 0) "$lastRateReadback Hz" else if (lastRateReadback == 0) "FAIL" else "未回读"}")
+            sb.appendLine("Feedback: ${info.feedbackSource} " +
+                    "ep=${if (info.endpointFeedbackAddress > 0) "0x${info.endpointFeedbackAddress.toString(16).uppercase()}" else "none"}")
+            sb.appendLine("Clock Source: ${if (info.clockSourceId > 0) "0x${info.clockSourceId.toString(16).uppercase()}" else "none"}")
+            sb.appendLine("Hardware Volume: ${hasHardwareVolume} " +
+                    "(featureUnitId=${if (featureUnitId > 0) "0x${featureUnitId.toString(16)}" else "-"})")
+            sb.appendLine("Claimed Interfaces: ${claimedInterfaces.joinToString { "${it.id}/alt${it.alternateSetting}" }}")
+        } else {
+            sb.appendLine("Opened: false（设备未成功打开，无已选端点信息）")
+        }
+        return sb.toString()
     }
 
 }

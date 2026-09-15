@@ -73,6 +73,9 @@ class FloatingLyricService : Service() {
     private var gradientEnd = 0xFFFF00FF.toInt()
     private var unplayedColor = 0xFF666666.toInt()
     private var isPlayingFlag = false
+    // 当前悬浮窗宽度与歌词换行最大宽度（旋转时随 displayMetrics 重算）
+    private var windowWidthPx = 0
+    private var lyricMaxWidthPx = 0
 
     // views
     private var lockButton: ImageView? = null
@@ -174,6 +177,13 @@ class FloatingLyricService : Service() {
         } catch (_: Exception) {}
         isRunning = true
         instance = this
+    }
+
+    override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
+        super.onConfigurationChanged(newConfig)
+        // 悬浮窗未创建（服务刚起/已销毁）时无需处理；post 到下一帧按最终
+        // displayMetrics 重排，规避个别 ROM 回调时尺寸尚未刷新的时序问题。
+        rootView?.post { relayoutForOrientation() }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -464,11 +474,13 @@ class FloatingLyricService : Service() {
 
         // 窗口宽度固定：随文字变化宽度会触发 WindowManager 重定位
         // （先瞬移后动画回中）。固定后 gravity 居中恒成立，永不跳动。
-        val fixedWindowWidth = resources.displayMetrics.widthPixels - dp(32)
+        windowWidthPx = resources.displayMetrics.widthPixels - dp(32)
+        val fixedWindowWidth = windowWidthPx
 
         // 歌词文本最大宽度：窗口宽减去根 padding(20×2)，LinearLayout 约束实际生效，
         // maxWidth 保留为兜底，防止超长歌词撑破窗口
-        val lyricMaxWidth = fixedWindowWidth - dp(40)
+        lyricMaxWidthPx = fixedWindowWidth - dp(40)
+        val lyricMaxWidth = lyricMaxWidthPx
 
         lyricText1 = GradientTextView(this).apply {
             setTextSize(TypedValue.COMPLEX_UNIT_SP, scaledFontSizeSp())
@@ -569,6 +581,36 @@ class FloatingLyricService : Service() {
             Log.w(TAG, "Overlay window rejected: ${e.message}")
             false
         }
+    }
+
+    /// 按当前显示尺寸重算悬浮窗宽度与纵向位置。
+    /// 修复横屏开启（缓存了宽屏尺寸）后转竖屏时，窗口宽 > 屏宽导致
+    /// CENTER_HORIZONTAL 无法居中的错位；两个方向旋转都走这里，行为一致。
+    private fun relayoutForOrientation() {
+        val root = rootView ?: return
+        val p = params ?: return
+        val wm = windowManager ?: return
+
+        val newWidth = resources.displayMetrics.widthPixels - dp(32)
+        val newMaxWidth = newWidth - dp(40)
+        windowWidthPx = newWidth
+        lyricMaxWidthPx = newMaxWidth
+
+        p.width = newWidth
+        // 旋转后屏幕高度变化，重新 clamp 纵向位置，防止落在屏幕外
+        p.y = p.y.coerceIn(0, resources.displayMetrics.heightPixels - dp(120))
+
+        // 换行宽度跟随新窗口宽：更新 maxWidth 后 requestLayout 触发重测量，
+        // 渐变 shader 会在下次 onDraw 按新 width 自动重建（见 ensureGradientShader）
+        lyricText1?.maxWidth = newMaxWidth
+        lyricText2?.maxWidth = newMaxWidth
+        lyricText1?.requestLayout()
+        lyricText2?.requestLayout()
+        root.requestLayout()
+
+        try {
+            wm.updateViewLayout(root, p)
+        } catch (_: Exception) {}
     }
 
     private fun toggleExpanded() {

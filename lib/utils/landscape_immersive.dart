@@ -4,6 +4,20 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 
+/// 全屏播放器 Zen 模式「实际生效」的沉浸状态。
+///
+/// 由 MD3 / AM 两套全屏播放器在进入/退出 Zen 时置位；主界面 [_SystemUiUpdater]
+/// 据此跳过系统栏覆盖，避免亮屏 resumed、切歌重建等场景把 Zen 的
+/// immersiveSticky 冲掉、导致状态栏重新显示。参照 kCoverFlowImmersiveActive 模式。
+final ValueNotifier<bool> kPlayerZenImmersiveActive = ValueNotifier<bool>(false);
+
+/// 全屏播放器横屏沉浸（非 Zen）「实际生效」状态。
+///
+/// 横屏下 [applyImmersiveForOrientation] 启用 immersiveSticky 隐藏系统栏；
+/// 由 MD3 / AM 播放器在所有系统栏决策点同步，主界面 [_SystemUiUpdater] 据此
+/// 跳过覆盖，避免切歌/亮屏把横屏沉浸冲掉（与 Zen 同源问题）。参照 kCoverFlowImmersiveActive 模式。
+final ValueNotifier<bool> kPlayerLandscapeImmersiveActive = ValueNotifier<bool>(false);
+
 /// 全屏播放器竖屏下的系统栏样式。
 ///
 /// **重要**：[AmStyleFullPlayer._buildFullLayout] 中 AnnotatedRegion 的 value

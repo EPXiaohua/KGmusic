@@ -321,6 +321,16 @@ class _FlowingGradientPainter extends CustomPainter {
 
     final rect = Offset.zero & size;
 
+    // 底层：整屏铺一层不透明色彩基底（对角线性渐变，深→中），
+    // 消除光斑之间的黑色空隙，解决"太透明"问题；上层光斑在其上形成流动高光
+    final basePaint = Paint()
+      ..shader = LinearGradient(
+        begin: Alignment.topLeft,
+        end: Alignment.bottomRight,
+        colors: [colors[2], colors[1]], // colors[2] 最深、colors[1] 中间
+      ).createShader(rect);
+    canvas.drawRect(rect, basePaint);
+
     // 层 1：主色，大幅慢速流动
     _paintLayer(
       canvas,
@@ -329,7 +339,7 @@ class _FlowingGradientPainter extends CustomPainter {
       cx: 0.3 + 0.3 * math.sin(time),
       cy: 0.3 + 0.3 * math.cos(time * 1.4),
       radius: 1.4,
-      alpha: 160,
+      alpha: 235,
     );
 
     // 层 2：强调色，中速流动
@@ -340,7 +350,7 @@ class _FlowingGradientPainter extends CustomPainter {
       cx: 0.7 + 0.25 * math.cos(time * 0.8),
       cy: 0.6 + 0.25 * math.sin(time),
       radius: 1.2,
-      alpha: 140,
+      alpha: 220,
     );
 
     // 层 3：深色，快速流动
@@ -351,7 +361,7 @@ class _FlowingGradientPainter extends CustomPainter {
       cx: 0.5 + 0.2 * math.sin(time * 1.2 + 1.0),
       cy: 0.8 + 0.2 * math.cos(time * 1.1 + 1.0),
       radius: 1.1,
-      alpha: 130,
+      alpha: 205,
     );
   }
 

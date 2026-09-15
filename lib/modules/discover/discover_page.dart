@@ -19,6 +19,7 @@ import '../../widgets/smart_artwork_image.dart';
 import '../../widgets/song_list_item.dart';
 import '../charts/charts_page.dart';
 import '../personal_fm/personal_fm_section.dart';
+import '../player/mini_player.dart';
 import '../playlist/playlist_page.dart';
 import '../recognition/song_recognition_page.dart';
 import '../search/search_page.dart';
@@ -869,6 +870,7 @@ class _DailyRecommendDetailPageState extends State<_DailyRecommendDetailPage> {
                 );
               },
             ),
+      bottomNavigationBar: const MiniPlayer(),
     );
   }
 }

@@ -76,7 +76,7 @@ class UsbAudioPlugin(private val context: Context) {
             val pct = systemVolumePercent()
             if (pct != lastSystemVolumePct) {
                 lastSystemVolumePct = pct
-                Log.i(TAG, "system media volume: $pct%")
+                UsbLog.i(TAG, "system media volume: $pct%")
                 applyDacVolume()
             }
             mainHandler.postDelayed(this, 500)
@@ -95,11 +95,19 @@ class UsbAudioPlugin(private val context: Context) {
     private var hardwareVolumeTried: Boolean = false
     private var lastAppliedDacPct: Int = -1
 
-    /**
-     * USB 独占独立音量系数（0..1，默认 1.0），由设置页/歌曲信息页的"USB 音量"slider
+    /** USB 独占独立音量系数（0..1，默认 1.0），由设置页/歌曲信息页的"USB 音量"slider
      * 控制，仅独占开启时参与 DAC 音量计算，与应用内/系统音量分开记忆（Dart 持久化）。
      */
     private var usbVolumePercent: Float = 100f
+
+    /** 用户强制输出格式（0=自适应跟随源）。位深只影响流配置；率/声道还需数据路径转换。 */
+    private var forceRate: Int = 0
+    private var forceBits: Int = 0
+    private var forceChannels: Int = 0
+
+    /** 最近一次流创建的关键步骤摘要（诊断面板展示，覆盖式记录）。 */
+    @Volatile
+    private var lastSetupSummary: String = "-"
 
     /**
      * 计算并应用 DAC 音量（硬件音量优先，无硬件音量/设置失败时回退软件缩放）：
@@ -111,7 +119,7 @@ class UsbAudioPlugin(private val context: Context) {
         val dacPct = (sysPct * (usbVolumePercent / 100f)).toInt().coerceIn(0, 100)
         if (dacPct != lastAppliedDacPct) {
             lastAppliedDacPct = dacPct
-            Log.i(TAG, "applyDacVolume: sys=$sysPct% usbVol=${usbVolumePercent}% → dac=$dacPct%")
+            UsbLog.i(TAG, "applyDacVolume: sys=$sysPct% usbVol=${usbVolumePercent}% → dac=$dacPct%")
         }
         if (!UsbAudioSinkController.isEnabled()) return
         if (hardwareVolumeUsable) {
@@ -121,9 +129,9 @@ class UsbAudioPlugin(private val context: Context) {
             hardwareVolumeTried = true
             if (usbAudioDevice.hasHardwareVolume && usbAudioDevice.setDacVolume(dacPct)) {
                 hardwareVolumeUsable = true
-                Log.i(TAG, "hardware volume usable — DAC 硬件音量接管")
+                UsbLog.i(TAG, "hardware volume usable — DAC 硬件音量接管")
             } else {
-                Log.w(TAG, "hardware volume unavailable — 使用软件音量 fallback")
+                UsbLog.w(TAG, "hardware volume unavailable — 使用软件音量 fallback")
                 UsbAudioStream.streamVolume = dacPct / 100f
             }
         } else {
@@ -176,7 +184,7 @@ class UsbAudioPlugin(private val context: Context) {
         override fun onReceive(ctx: Context, intent: Intent) {
             when (intent.action) {
                 UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
-                    Log.i(TAG, "USB_DEVICE_ATTACHED (exclusive=" + UsbAudioSinkController.isEnabled() + ")")
+                    UsbLog.i(TAG, "USB_DEVICE_ATTACHED (exclusive=" + UsbAudioSinkController.isEnabled() + ")")
                     invalidateDeviceCache()
                     // 未开独占时 UI 也要刷新"设备已连接"（替代轮询发现）
                     pushStatus()
@@ -186,7 +194,7 @@ class UsbAudioPlugin(private val context: Context) {
                     }
                 }
                 UsbManager.ACTION_USB_DEVICE_DETACHED -> {
-                    Log.w(TAG, "USB_DEVICE_DETACHED — 自动关闭独占，避免写入失效 fd")
+                    UsbLog.w(TAG, "USB_DEVICE_DETACHED — 自动关闭独占，避免写入失效 fd")
                     invalidateDeviceCache()
                     // 与 MethodChannel 的 disable 共用同一把锁，后台线程执行，
                     // 避免与手动关闭（RESET/config 切换）并发操作设备导致重复释放
@@ -209,17 +217,26 @@ class UsbAudioPlugin(private val context: Context) {
             try {
                 handleMethod(call, result)
             } catch (e: Exception) {
-                Log.e(TAG, "handleMethod(" + call.method + ") threw: " + e.message, e)
+                UsbLog.e(TAG, "handleMethod(" + call.method + ") threw: " + e.message, e)
                 if (call.method != "enableExclusive") {
                     result.error("INTERNAL_ERROR", e.message, null)
                 }
             }
         }
 
+        // just_audio 模块链路日志桥接：只进应用侧环形缓冲（源头已写 logcat，避免重复）
+        UsbAudioSinkController.setLogForwarder { level, tag, msg ->
+            UsbLog.bridge(level, tag, msg)
+        }
+
         // 采样率/声道变化 → 应用侧重建流（在 ExoPlayer 渲染线程回调）
         UsbAudioSinkController.setReconfigListener { rate, ch, enc ->
-            Log.i(TAG, "reconfig requested: $rate Hz / $ch ch / enc=$enc")
-            rebuildStream(rate, ch)
+            UsbLog.i(TAG, "reconfig requested: $rate Hz / $ch ch / enc=$enc")
+            val adapter = rebuildStream(rate, ch)
+            // 重建后推送最新状态：切歌/采样率钳制后 Dart 侧格式链需实时刷新
+            // （失败时控制器已 disable 回退普通输出，推送同样让 UI 同步）
+            pushStatus()
+            adapter
         }
 
         // 播放器音量变化 → 更新 DAC 硬件音量（渲染线程回调，controlTransfer 很短可接受）
@@ -236,7 +253,7 @@ class UsbAudioPlugin(private val context: Context) {
         try {
             context.applicationContext.registerReceiver(usbReceiver, filter)
         } catch (e: Exception) {
-            Log.e(TAG, "registerReceiver failed: ${e.message}")
+            UsbLog.e(TAG, "registerReceiver failed: ${e.message}")
         }
     }
 
@@ -245,22 +262,52 @@ class UsbAudioPlugin(private val context: Context) {
             "listDevices" -> result.success(listDevices())
             "getStatus" -> result.success(getStatus())
             "getFormatInfo" -> result.success(UsbAudioSinkController.getFormatInfo())
+            "getUsbLogs" -> {
+                // 三路合并：app 内存环形 + native（USB 传输层）环形 + logcat 自读（just_audio 模块）
+                result.success(
+                        UsbLog.exportAll() +
+                        "\n── native 环形（USB 传输层） ──\n" + UsbAudioStream.recentNativeLogs())
+            }
             "isEnabled" -> result.success(UsbAudioSinkController.isEnabled())
             "setFloatOutputEnabled" -> {
                 // 32bit 播放支持开关（默认关闭）。开启后在 DefaultAudioSink 的 float 决策点生效，
                 // 下一首歌 configure 即按新开关走 float 高解析；关闭则回退 16bit 保证正确播放。
                 val enabled = call.argument<Boolean>("enabled") ?: false
                 UsbAudioSinkController.setFloatOutputEnabled(enabled)
-                Log.i(TAG, "setFloatOutputEnabled: $enabled (float output ${if (enabled) "开启" else "关闭"})")
+                UsbLog.i(TAG, "setFloatOutputEnabled: $enabled (float output ${if (enabled) "开启" else "关闭"})")
                 result.success(true)
             }
             "enableExclusive" -> requestEnableInternal(result)
+            "setOutputFormatOverride" -> {
+                // 输出格式强制（0=自适应）：位深只影响流配置；率/声道另需数据路径转换。
+                // 独占开启中时后台重建流使其立即生效。
+                forceRate = (call.argument<Number>("sampleRate")?.toInt() ?: 0).coerceIn(0, 384000)
+                forceBits = (call.argument<Number>("bitDepth")?.toInt() ?: 0).coerceIn(0, 32)
+                forceChannels = (call.argument<Number>("channelCount")?.toInt() ?: 0).coerceIn(0, 8)
+                UsbAudioSinkController.setOutputOverride(
+                        if (forceRate > 0) forceRate else 0,
+                        if (forceChannels > 0) forceChannels else 0)
+                UsbLog.i(TAG, "setOutputFormatOverride: rate=$forceRate bits=$forceBits channels=$forceChannels")
+                if (UsbAudioSinkController.isEnabled()) {
+                    Thread {
+                        synchronized(exclusiveLock) {
+                            try {
+                                UsbAudioSinkController.reconfigureActiveStream()
+                            } catch (e: Exception) {
+                                UsbLog.e(TAG, "override rebuild failed: ${e.message}")
+                            }
+                            pushStatus()
+                        }
+                    }.start()
+                }
+                result.success(getStatus())
+            }
             "setUsbVolume" -> {
                 // USB 独占独立音量（0..100），仅独占时参与 DAC 音量计算，实时生效
                 val pct = (call.argument<Number>("percent")?.toFloat() ?: 100f)
                     .coerceIn(0f, 100f)
                 usbVolumePercent = pct
-                Log.i(TAG, "setUsbVolume: $pct% (仅 USB 独占生效)")
+                UsbLog.i(TAG, "setUsbVolume: $pct% (仅 USB 独占生效)")
                 applyDacVolume()
                 result.success(getStatus())
             }
@@ -317,6 +364,29 @@ class UsbAudioPlugin(private val context: Context) {
                 UsbAudioStream.streamVolume * 100f
             }
         } else 0f
+        // 输出格式选择：DAC 能力并集 + 当前 override（UI 生成可选项用）
+        base["supportedRates"] = cached?.allRates?.toList() ?: emptyList<Int>()
+        base["supportedBits"] = cached?.allBits?.toList() ?: emptyList<Int>()
+        base["supportedChannels"] = cached?.allChannels?.toList() ?: emptyList<Int>()
+        base["outputRateOverride"] = forceRate
+        base["outputBitsOverride"] = forceBits
+        base["outputChannelsOverride"] = forceChannels
+        // Salt Player 式诊断（「调试信息」面板展示/复制，便于远程定位 DAC 兼容问题）：
+        // 三段结构 = Playback（运行状态/有效格式/override）+ Stream Setup（最近一次流创建步骤链）+ Device（拓扑/端点/能力）
+        val playback = UsbAudioSinkController.getStatus()
+        val diag = StringBuilder()
+        diag.appendLine("── Playback ──")
+        diag.appendLine("Enabled: ${playback["enabled"]} / StreamAlive: ${playback["streamAlive"]}")
+        diag.appendLine("Output: ${playback["sampleRate"]} Hz / ${playback["channelCount"]} ch / ${playback["dacBitDepth"]}-bit")
+        diag.appendLine("Decoded: ${playback["lastSampleRate"]} Hz / ${playback["lastChannelCount"]} ch / enc=" +
+                UsbAudioSinkController.encName((playback["lastEncoding"] as? Number)?.toInt() ?: 0))
+        diag.appendLine("Override: rate=$forceRate bits=$forceBits channels=$forceChannels")
+        diag.appendLine("FramesWritten: ${playback["framesWritten"]}")
+        diag.appendLine("── Stream Setup (last) ──")
+        diag.appendLine(lastSetupSummary)
+        diag.appendLine("── Device ──")
+        diag.append(usbAudioDevice.buildDiagnostics(device, cached))
+        base["diagnostics"] = diag.toString()
         return base
     }
 
@@ -351,19 +421,19 @@ class UsbAudioPlugin(private val context: Context) {
     private fun requestEnableInternal(result: MethodChannel.Result?) {
         val device = findCachedDevice()
         if (device == null) {
-            Log.e(TAG, "enableExclusive: no USB audio device")
+            UsbLog.e(TAG, "enableExclusive: no USB audio device")
             if (result != null) result.error("NO_DEVICE", "未检测到 USB 音频设备", null)
             return
         }
         if (usbManager.hasPermission(device)) {
             doEnable(device, result)
         } else {
-            Log.i(TAG, "enableExclusive: requesting permission for ${device.productName}")
+            UsbLog.i(TAG, "enableExclusive: requesting permission for ${device.productName}")
             usbAudioDevice.requestPermission(device) { granted ->
                 if (granted) {
                     doEnable(device, result)
                 } else {
-                    Log.e(TAG, "enableExclusive: permission denied")
+                    UsbLog.e(TAG, "enableExclusive: permission denied")
                     if (result != null) {
                         result.error("PERMISSION_DENIED", "USB 设备授权被拒绝", null)
                     }
@@ -387,8 +457,12 @@ class UsbAudioPlugin(private val context: Context) {
                         return@Thread
                     }
                     currentAdapter = adapter
-                    val rate = UsbAudioSinkController.getLastSampleRate().takeIf { it > 0 } ?: DEFAULT_SAMPLE_RATE
-                    val ch = UsbAudioSinkController.getLastChannelCount().takeIf { it > 0 } ?: DEFAULT_CHANNELS
+                    // enable 记录必须与实际建流的率/声道一致（同为 override+钳制统一出口），
+                    // 否则 handleBuffer 的"源≠流"转换判断失效（如 192k 源错位后不降采样）
+                    val rate = UsbAudioSinkController.getTargetOutputRate().takeIf { it > 0 }
+                            ?: (UsbAudioSinkController.getLastSampleRate().takeIf { it > 0 } ?: DEFAULT_SAMPLE_RATE)
+                    val ch = UsbAudioSinkController.getTargetOutputChannels().takeIf { it > 0 }
+                            ?: (UsbAudioSinkController.getLastChannelCount().takeIf { it > 0 } ?: DEFAULT_CHANNELS)
                     val ok = UsbAudioSinkController.enable(adapter, currentDacBitDepth, rate, ch)
                     if (ok) {
                         // 应用初始 DAC 音量 + 启动系统媒体音量轮询（音量键 → DAC 硬件音量）
@@ -415,7 +489,7 @@ class UsbAudioPlugin(private val context: Context) {
                     }
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "doEnable threw: ${e.message}", e)
+                UsbLog.e(TAG, "doEnable threw: ${e.message}", e)
                 mainHandler.post {
                     if (result != null) result.error("ENABLE_FAILED", e.message, null)
                 }
@@ -428,60 +502,104 @@ class UsbAudioPlugin(private val context: Context) {
      * @return 已 start 的适配器；失败返回 null
      */
     private fun createStartedStream(device: UsbDevice): UsbAudioAdapter? {
-        var info = usbAudioDevice.openDevice(device)
+        // 目标格式：用户 override 优先（0=自适应）；自适应经 getTargetOutputRate 统一出口
+        // （含 DAC 能力钳制：192k 等超出端点装包能力的采样率自动降级，如 → 96k）
+        val targetRate = if (forceRate > 0) forceRate
+        else UsbAudioSinkController.getTargetOutputRate().takeIf { it > 0 } ?: 0
+        val ch = if (forceChannels > 0) forceChannels
+        else UsbAudioSinkController.getTargetOutputChannels().takeIf { it > 0 } ?: DEFAULT_CHANNELS
+        var info = usbAudioDevice.openDevice(device, targetRate, forceBits)
         if (info == null) {
-            Log.e(TAG, "openDevice failed")
+            UsbLog.e(TAG, "openDevice failed")
+            lastSetupSummary = "openDevice failed (target=$targetRate Hz/${forceBits}bit)"
             return null
         }
-        val rate = UsbAudioSinkController.getLastSampleRate().takeIf { it > 0 } ?: DEFAULT_SAMPLE_RATE
-        val ch = UsbAudioSinkController.getLastChannelCount().takeIf { it > 0 } ?: DEFAULT_CHANNELS
+        // 首次建流时 DAC 能力尚未同步（clampToDacRate 会直通 192k 等超能力率）；
+        // openDevice 已解析出全部能力，立即同步并重算目标率/声道——若被钳制
+        // （如 192000→96000、24000→44100、声道≠端点声道）则用新格式重开
+        // （openDevice 缓存命中，开销极低）。
+        UsbAudioSinkController.setDacSupportedRates(info.allRates.toList().toIntArray())
+        UsbAudioSinkController.setDacChannels(info.allChannels.maxOrNull() ?: 0)
+        val finalRate = UsbAudioSinkController.getTargetOutputRate().takeIf { it > 0 } ?: targetRate
+        val finalCh = UsbAudioSinkController.getTargetOutputChannels().takeIf { it > 0 } ?: ch
+        if (finalRate != targetRate || finalCh != ch) {
+            info = usbAudioDevice.openDevice(device, finalRate, forceBits)
+            if (info == null) {
+                UsbLog.e(TAG, "openDevice(clamped) failed")
+                lastSetupSummary =
+                        "openDevice failed (clamped $finalRate Hz/$finalCh ch/${forceBits}bit)"
+                return null
+            }
+        }
+        val rate = finalRate.takeIf { it > 0 } ?: DEFAULT_SAMPLE_RATE
+        // 声道必须用钳制后的 finalCh：native 流声道若与控制器记录的 usbChannelCount
+        // 不一致（如此前误用旧 ch），handleBuffer 会按错误声道数转换/装包导致数据错乱。
+        val outCh = finalCh.takeIf { it > 0 } ?: DEFAULT_CHANNELS
         val bitDepth = info.bestBitDepth
         val altSetting = info.bestAltSetting
 
-        var stream = UsbAudioStream(
+        val stream = UsbAudioStream(
             info.fd, info.interfaceId, info.endpointOutAddress, info.endpointFeedbackAddress,
-            rate, ch, bitDepth, info.maxPacketSize
+            rate, outCh, bitDepth, info.maxPacketSize, info.fullSpeed
         )
         if (!stream.isReady) {
             stream.release()
+            lastSetupSummary = "stream create failed (fd=${info.fd}, $rate Hz/$outCh ch/${bitDepth}bit)"
             return null
         }
 
-        // Step 1: setAlt(0) — 释放旧的 ISO ring；失败说明 fd 失效，重开设备
-        if (!usbAudioDevice.setAltSetting(0)) {
-            Log.w(TAG, "setAlt(0) failed — reopening device")
-            usbAudioDevice.closeDevice()
-            stream.release()
-            info = usbAudioDevice.openDevice(device) ?: return null
-            stream = UsbAudioStream(
-                info.fd, info.interfaceId, info.endpointOutAddress, info.endpointFeedbackAddress,
-                rate, ch, bitDepth, info.maxPacketSize
-            )
-            if (!stream.isReady) { stream.release(); return null }
+        // Step 1: setAlt(0) — 原生 SETINTERFACE(interfaceId, 0)，按已 claim 的接口精确执行；
+        // 失败仅记录继续（接口已正确 claim，不再整设备 close+reopen）
+        val alt0Ok = stream.setAltSetting(0)
+        if (!alt0Ok) {
+            UsbLog.w(TAG, "Step 1: setAlt(0) failed (iface=${info.interfaceId}) — 继续")
+        } else {
+            UsbLog.i(TAG, "Step 1: setAlt(0) OK")
         }
-        Log.i(TAG, "Step 1: setAlt(0) OK")
 
-        // Step 2: SET_CUR 采样率 + Step 3: CLOCK_VALID 校验
-        usbAudioDevice.setSampleRate(rate)
-        val clockValid = usbAudioDevice.readClockValid()
-        Log.i(TAG, "Step 2-3: SET_CUR=$rate CLOCK_VALID=$clockValid")
+        val altOk: Boolean
+        if (info.uacVersion == 1) {
+            // UAC1：先激活端点（setAlt(N) 分配带宽）再 SET_CUR —— 端点请求要求接口非零 alt，
+            // 在 alt=0 状态下 SET_CUR 会被 STALL（噪声根因之一）
+            stream.setAltSetting(0)
+            altOk = stream.setAltSetting(altSetting)
+            UsbLog.i(TAG, "Step 4-5(UAC1): setAlt(0)+setAlt($altSetting)=$altOk")
+            usbAudioDevice.setSampleRate(rate)
+            val clockValid = usbAudioDevice.readClockValid()
+            UsbLog.i(TAG, "Step 2-3(UAC1, after alt): SET_CUR=$rate CLOCK_VALID=$clockValid")
+            lastSetupSummary = "UAC1 alt(0)=$alt0Ok alt($altSetting)=$altOk SET_CUR=$rate Hz"
+        } else {
+            // UAC2：clock 实体请求走 AC 接口，与 alt 无关，保持原序
+            usbAudioDevice.setSampleRate(rate)
+            val clockValid = usbAudioDevice.readClockValid()
+            UsbLog.i(TAG, "Step 2-3: SET_CUR=$rate CLOCK_VALID=$clockValid")
 
-        // Step 4: 防御性 setAlt(0) + Step 5: setAlt(N) 分配新 ring
-        usbAudioDevice.setAltSetting(0)
-        val altOk = usbAudioDevice.setAltSetting(altSetting)
-        Log.i(TAG, "Step 4-5: setAlt(0)+setAlt($altSetting)=$altOk")
+            // Step 4: 防御性 setAlt(0) + Step 5: setAlt(N) 分配新 ring
+            stream.setAltSetting(0)
+            altOk = stream.setAltSetting(altSetting)
+            UsbLog.i(TAG, "Step 4-5: setAlt(0)+setAlt($altSetting)=$altOk")
+            lastSetupSummary = "UAC2 SET_CUR=$rate Hz alt($altSetting)=$altOk"
+        }
 
         // Step 6: DAC PLL 锁定时
         Thread.sleep(50)
 
         // Step 7: start
         if (!stream.start()) {
-            Log.e(TAG, "stream.start() failed")
+            UsbLog.e(TAG, "stream.start() failed")
             stream.release()
+            lastSetupSummary = "$lastSetupSummary → start failed"
             return null
         }
         currentDacBitDepth = bitDepth
-        Log.i(TAG, "USB stream ACTIVE: $rate Hz / $ch ch / ${bitDepth}bit @ ${info.deviceName}")
+        lastSetupSummary = "$lastSetupSummary → ACTIVE $rate Hz/$ch ch/${bitDepth}bit " +
+                "${if (info.fullSpeed) "full" else "high"}-speed alt=$altSetting"
+        UsbLog.i(TAG, "USB stream ACTIVE: $rate Hz / $ch ch / ${bitDepth}bit @ ${info.deviceName} " +
+                "(uac=UAC${info.uacVersion}, ${if (info.fullSpeed) "full-speed" else "high-speed"}, " +
+                "rates=${info.supportedRates.contentToString()})")
+        // 同步 DAC 能力给 Controller：输出采样率超出能力时自动降级（如 192k → 96k），
+        // 避免 native 装包超过 maxPacket 导致 SUBMITURB 失败/堆溢出。
+        UsbAudioSinkController.setDacSupportedRates(info.allRates.toList().toIntArray())
         return UsbAudioAdapter(stream)
     }
 
@@ -489,29 +607,31 @@ class UsbAudioPlugin(private val context: Context) {
     private fun rebuildStream(rate: Int, ch: Int): UsbAudioSink? {
         return try {
             val device = findCachedDevice()
-                ?: run { Log.e(TAG, "rebuild: no device"); currentAdapter = null; return null }
+                ?: run { UsbLog.e(TAG, "rebuild: no device"); currentAdapter = null; return null }
             if (!usbManager.hasPermission(device)) {
-                Log.e(TAG, "rebuild: no permission")
+                UsbLog.e(TAG, "rebuild: no permission")
                 currentAdapter = null
                 return null
             }
             val adapter = createStartedStream(device) ?: run {
-                Log.e(TAG, "rebuild: createStartedStream failed")
+                UsbLog.e(TAG, "rebuild: createStartedStream failed")
                 // 旧流已被控制器 stop/drain/release，必须清空引用防止二次 release
                 currentAdapter = null
                 return null
             }
             currentAdapter = adapter
-            Log.i(TAG, "rebuild OK: $rate Hz / $ch ch")
+            UsbLog.i(TAG, "rebuild OK: $rate Hz / $ch ch")
             adapter
         } catch (e: Exception) {
-            Log.e(TAG, "rebuild threw: ${e.message}", e)
+            UsbLog.e(TAG, "rebuild threw: ${e.message}", e)
             currentAdapter = null
             null
         }
     }
 
     private fun disableExclusive() {
+        // 清空 DAC 能力缓存（防换 DAC/重插后旧能力残留钳制）
+        UsbAudioSinkController.resetDacCapabilities()
         // 停止系统音量轮询（独占关闭后音量回到 AudioFlinger 管）
         stopVolumePolling()
         resetVolumeState()
@@ -524,7 +644,7 @@ class UsbAudioPlugin(private val context: Context) {
                 adapter.drainUrbs()
                 adapter.release()
             } catch (e: Exception) {
-                Log.e(TAG, "disableExclusive release failed: ${e.message}")
+                UsbLog.e(TAG, "disableExclusive release failed: ${e.message}")
             }
         }
         currentAdapter = null
@@ -541,7 +661,7 @@ class UsbAudioPlugin(private val context: Context) {
         // 重新设置路由，并强制 AudioTrack 重新 start（等效用户暂停→重播）。
         val usbDev = findUsbAudioDeviceInfo()
         UsbAudioSinkController.setDelegatePreferredDevice(usbDev)
-        Log.i(TAG, "disableExclusive done (delegate routed to USB: ${usbDev?.productName ?: "none"})")
+        UsbLog.i(TAG, "disableExclusive done (delegate routed to USB: ${usbDev?.productName ?: "none"})")
         // 根因：开启独占时 force disconnect 杀死了 usb HAL 的旧输出流；关闭独占后
         // delegate AudioTrack 仍连在失效流上 → 数据照走但 DAC 无声。setPreferredDevice
         // / pause / play 都不会重建该流——只有 Media3 重建 AudioTrack（configure）才能让
@@ -550,7 +670,7 @@ class UsbAudioPlugin(private val context: Context) {
         val task = Runnable {
             val dev = findUsbAudioDeviceInfo()
             UsbAudioSinkController.setDelegatePreferredDevice(dev)
-            Log.i(TAG, "delegate USB re-route (delayed): ${dev?.productName ?: "none"}")
+            UsbLog.i(TAG, "delegate USB re-route (delayed): ${dev?.productName ?: "none"}")
         }
         rerouteRunnable = task
         mainHandler.postDelayed(task, 500)

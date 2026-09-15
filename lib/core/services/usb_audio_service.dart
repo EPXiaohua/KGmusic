@@ -25,6 +25,9 @@ class UsbAudioService {
   static const String _tag = 'UsbAudioService';
   static const String _keyAutoDisableForMv = 'usb_auto_disable_for_mv';
   static const String _keyEnable32bit = 'enable_32bit_output';
+  static const String _keyOutputRate = 'usb_output_rate';
+  static const String _keyOutputBits = 'usb_output_bits';
+  static const String _keyOutputChannels = 'usb_output_channels';
 
   final StreamController<Map<String, dynamic>> _statusController =
       StreamController<Map<String, dynamic>>.broadcast();
@@ -143,6 +146,57 @@ class UsbAudioService {
     }
   }
 
+  // ── 输出格式强制（采样率/位深/声道，0=自适应跟随源） ─────────────
+  /// 0 表示自适应；>0 为用户强制值。持久化并在启动时恢复下发。
+  int _outputRate = 0;
+  int _outputBits = 0;
+  int _outputChannels = 0;
+
+  int get outputRate => _outputRate;
+  int get outputBits => _outputBits;
+  int get outputChannels => _outputChannels;
+
+  /// 启动时恢复持久化的输出格式并下发原生（幂等，模式同 initEnable32bit）。
+  Future<void> initOutputFormat() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      _outputRate = (prefs.getInt(_keyOutputRate) ?? 0).clamp(0, 384000);
+      _outputBits = (prefs.getInt(_keyOutputBits) ?? 0).clamp(0, 32);
+      _outputChannels = (prefs.getInt(_keyOutputChannels) ?? 0).clamp(0, 8);
+      await _channel.invokeMethod('setOutputFormatOverride', {
+        'sampleRate': _outputRate,
+        'bitDepth': _outputBits,
+        'channelCount': _outputChannels,
+      });
+      _debug('initOutputFormat: rate=$_outputRate bits=$_outputBits ch=$_outputChannels');
+    } catch (e) {
+      _debug('initOutputFormat failed: $e');
+    }
+  }
+
+  /// 设置输出格式强制（0=自适应）：持久化 + 下发原生；
+  /// 独占开启中时原生会立即重建流，未开启则在下次 enable 生效。
+  Future<void> setOutputFormat(int rate, int bits, int channels) async {
+    _outputRate = rate.clamp(0, 384000);
+    _outputBits = bits.clamp(0, 32);
+    _outputChannels = channels.clamp(0, 8);
+    try {
+      await _channel.invokeMethod('setOutputFormatOverride', {
+        'sampleRate': _outputRate,
+        'bitDepth': _outputBits,
+        'channelCount': _outputChannels,
+      });
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setInt(_keyOutputRate, _outputRate);
+      await prefs.setInt(_keyOutputBits, _outputBits);
+      await prefs.setInt(_keyOutputChannels, _outputChannels);
+      _debug('setOutputFormat: rate=$_outputRate bits=$_outputBits ch=$_outputChannels (persisted)');
+      _emit(_lastStatus);
+    } catch (e) {
+      _debug('setOutputFormat failed: $e');
+    }
+  }
+
   void dispose() {
     _channel.setMethodCallHandler(null);
     _inited = false;
@@ -229,6 +283,16 @@ class UsbAudioService {
     }
   }
 
+  /// 导出 USB 链路内部环形日志（Java/Kotlin + native），供诊断面板复制。
+  Future<String> getUsbLogs() async {
+    try {
+      return await _channel.invokeMethod<String>('getUsbLogs') ?? '';
+    } catch (e) {
+      _debug('getUsbLogs failed: $e');
+      return '日志导出失败: $e';
+    }
+  }
+
   Future<bool> isEnabled() async {
     try {
       return await _channel.invokeMethod<bool>('isEnabled') ?? false;
@@ -273,8 +337,8 @@ class UsbAudioService {
   // ── 工具 ──────────────────────────────────────────────────────
 
   void _debug(String msg) {
-    // ignore: avoid_print
-    print('[$_tag] $msg');
+    // debugPrint 会被 DiagnosticLogger 重定向捕获（进 app.log 随诊断报告导出）
+    debugPrint('[$_tag] $msg');
   }
 
   String _statusSummary(Map<String, dynamic> s) {

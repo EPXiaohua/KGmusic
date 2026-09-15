@@ -244,8 +244,9 @@ class _ImportPlaylistPageState extends State<ImportPlaylistPage> {
         showToast('最多支持 $_maxImages 张截图');
       }
     } catch (e) {
-      if (kDebugMode) debugPrint('[ImportPlaylist] pick images error: $e');
-      showToast('选择图片失败');
+      debugPrint('[ImportPlaylist] pick images error: $e');
+      // 临时诊断：显示真实异常，定位选图器无法弹出的问题
+      showToast('选择图片失败: $e');
     }
   }
 

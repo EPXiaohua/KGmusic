@@ -206,6 +206,12 @@ Future<void> _restoreLyricPushPref() async {
       // ignore: discarded_futures
       await DesktopLyricService.instance.setLyricInfoEnabled(true);
     }
+    // MD3Music fork: lyricInfo 推送无条件启用（Vivo 车载歌词依赖此链路：extras LYRICS_WHOLE
+    // + 原子随身听 lrc_change）。协议开关只控制 lyricon/super_lyric 等展示通道；
+    // 此前受开关控制 + 覆盖安装残留旧设置（lyric_push_protocol='none'）导致链路关闭，
+    // 原子随身听缺 8/16 能力位（无歌词无进度条）、车机无歌词。
+    // ignore: discarded_futures
+    DesktopLyricService.instance.setLyricInfoEnabled(true);
   } catch (_) {}
 }
 

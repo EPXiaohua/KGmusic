@@ -105,6 +105,11 @@ import java.util.concurrent.TimeoutException;
 
   private static final String TAG = "LegacyConversions";
 
+  // MD3Music fork: 原子随身听（vivomusicmix）能力位常量（7|8|16：播控+歌词+进度）。
+  // 字段名照抄 vivo 官方拼写；compat 普通键经 parcel 往返成为 framework 顶层键。
+  static final String VMM_SUPPORT_EVENT_KEY = "vivomusicmix.media.metadata.support_event";
+  static final long VMM_SUPPORT_EVENT_VALUE = 31L;
+
   // Stub BrowserRoot for accepting any connection here.
   public static final BrowserRoot defaultBrowserRoot =
       new BrowserRoot(MediaLibraryService.SERVICE_INTERFACE, null);
@@ -777,6 +782,13 @@ import java.util.concurrent.TimeoutException;
     if (metadata.mediaType != null) {
       builder.putLong(MediaConstants.EXTRAS_KEY_MEDIA_TYPE_COMPAT, metadata.mediaType);
     }
+
+    // MD3Music fork: 原子随身听（vivomusicmix）能力位无条件写入（7|8|16：播控+歌词+进度）。
+    // 能力位必须与歌词内容解耦：无歌词的曲子也要有 16 位，否则原子随身听
+    // SeekBarLayout 的 Y0()/Z0() 恒为 false，进度条永远 --:--（VivoCarLyrics 实测）。
+    // 该键作为 compat 普通键经 parcel 往返成为 framework MediaMetadata 顶层键，
+    // 原子随身听（合作控制器路径）原样读取。
+    builder.putLong(VMM_SUPPORT_EVENT_KEY, VMM_SUPPORT_EVENT_VALUE);
 
     if (metadata.extras != null) {
       for (@Nullable String customKey : metadata.extras.keySet()) {

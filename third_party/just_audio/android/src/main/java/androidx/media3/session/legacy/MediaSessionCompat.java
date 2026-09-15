@@ -339,6 +339,71 @@ public class MediaSessionCompat {
   // Maximum size of the bitmap in px. It shouldn't be changed.
   static int sMaxBitmapSize;
 
+  // ==== MD3Music fork: Vivo 车载歌词注入常量（ucar 车联投屏 + vivomusicmix 原子随身听） ====
+  // ucar 协议：LYRICS_WHOLE（整段 LRC）+ LYRICS_STATUS=0（有歌词）。车机按 PlaybackState
+  // 进度自行滚动整段 LRC，不需要推送"当前第几行"。
+  static final String UCAR_LYRICS_WHOLE = "ucar.media.metadata.LYRICS_WHOLE";
+  static final String UCAR_LYRICS_STATUS = "ucar.media.metadata.LYRICS_STATUS";
+  // vivomusicmix 原子随身听能力位（7|8|16：播控+歌词+进度）。字段名照抄 vivo 拼写。
+  static final String VMM_SUPPORT_EVENT = "vivomusicmix.media.metadata.support_event";
+  static final long VMM_SUPPORT_EVENT_VALUE = 31L;
+  static final String VMM_ACTION_KEY = "vivomusicmix.meida.extra.key.action";
+  static final String VMM_MEDIA_ID_KEY = "vivomusicmix.extra.key.meidia_id";
+  static final String VMM_LYRIC_KEY = "vivomusicmix.extra.key.lyric";
+  // lrc_change 节流：歌词变化立即发，相同歌词 25s 内不重发。
+  private static final Object sVivoLrcLock = new Object();
+  private static String sVivoLrcLastLyric;
+  private static long sVivoLrcLastSentAt;
+  // 活跃 MediaSessionImplApi21 列表：供宿主 App 定时重发 lrc_change 走 framework extras
+  // （覆盖"原子随身听在 lrc_change 发送之后才连上"的情况——首曲无歌词的根因）。
+  private static final java.util.ArrayList<MediaSessionImplApi21> sLiveApi21Impls =
+      new java.util.ArrayList<>();
+  // MD3Music fork: 最后一次封面缓存——切歌后的过渡更新无 Bitmap（artData=false），
+  // 原子收到后清空封面（"正确封面闪一下然后变纯色"实测）。从缓存补图保证任何
+  // 更新都带封面；新歌封面到达后覆盖（短暂显示旧封面优于纯色）。
+
+  /// 由宿主 App 定时调用：向所有活跃 session 重发 lrc_change extras。
+  /// lrc 为空时安全跳过，不推空 Bundle（避免清空原子已收到的 extras）。
+  /// 注意：不更新 shouldSendVivoLrcChange 的节流状态——那是 hook 即时发送的节流，
+  /// 定时器若更新它，会把 hook 里带正确身份的有效发送节流掉（实测导致原子收不到）。
+  public static void resendVivoLrcChange(String wholeLrc, String mediaId) {
+    if (wholeLrc == null || wholeLrc.isEmpty()) return;
+    java.util.ArrayList<MediaSessionImplApi21> live;
+    synchronized (sVivoLrcLock) {
+      live = new java.util.ArrayList<>(sLiveApi21Impls);
+    }
+    for (MediaSessionImplApi21 impl : live) {
+      try {
+        Bundle atomicExtras = new Bundle();
+        atomicExtras.putString(VMM_ACTION_KEY, "vivomusicmix.extra.lrc_change");
+        if (mediaId != null && !mediaId.isEmpty()) {
+          atomicExtras.putString(VMM_MEDIA_ID_KEY, mediaId);
+        }
+        atomicExtras.putString(VMM_LYRIC_KEY, wholeLrc);
+        impl.setExtras(atomicExtras);
+      } catch (Throwable t) {
+        // 单个 session 失败不影响其他
+      }
+    }
+    android.util.Log.i("MD3CarLyrics", "lrc_change resend: mediaId=" + mediaId
+        + " lrcLen=" + wholeLrc.length() + " sessions=" + live.size());
+  }
+
+  /// 原子随身听 lrc_change 是否需要发送：歌词变化立即发，相同歌词 25s 节流兜底
+  /// （覆盖"车机/组件在播放开始后才连上"的情况）。
+  static boolean shouldSendVivoLrcChange(String wholeLrc) {
+    synchronized (sVivoLrcLock) {
+      long now = SystemClock.elapsedRealtime();
+      if (wholeLrc.equals(sVivoLrcLastLyric)
+          && now - sVivoLrcLastSentAt < 25_000L) {
+        return false;
+      }
+      sVivoLrcLastLyric = wholeLrc;
+      sVivoLrcLastSentAt = now;
+      return true;
+    }
+  }
+
   /**
    * Creates a new session. You must call {@link #release()} when finished with the session.
    *
@@ -4054,8 +4119,153 @@ public class MediaSessionCompat {
     @Override
     public void setMetadata(@Nullable MediaMetadataCompat metadata) {
       mMetadata = metadata;
-      mSessionFwk.setMetadata(
-          metadata == null ? null : (MediaMetadata) metadata.getMediaMetadata());
+      MediaMetadata fwkMetadata =
+          metadata == null ? null : (MediaMetadata) metadata.getMediaMetadata();
+      // MD3Music fork: 注册活跃 impl（供 lrc_change 定时重发走 framework extras）
+      synchronized (sVivoLrcLock) {
+        if (!sLiveApi21Impls.contains(this)) {
+          sLiveApi21Impls.add(this);
+        }
+      }
+      // MD3Music fork: mediaId 为空时补稳定身份——必须在所有 metadata 更新上做
+      // （不只歌词更新）：切歌后先到的无歌词更新若 mediaId 为空，原子 E0()/z1()
+      // 匹配失败 → 封面回退纯色。放 hook 最前，任何更新都带稳定身份。
+      if (fwkMetadata != null) {
+        String mediaIdProbe = fwkMetadata.getString(MediaMetadata.METADATA_KEY_MEDIA_ID);
+        // MD3Music fork: 诊断 framework 层 Bitmap 是否存活（compat → parcel → hook 链路）
+        try {
+          android.graphics.Bitmap artProbe =
+              fwkMetadata.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART);
+          android.util.Log.i("MD3CarLyrics", "fwk bitmap check: albumArt="
+              + (artProbe == null || artProbe.isRecycled()
+                  ? "null" : artProbe.getWidth() + "x" + artProbe.getHeight())
+              + " artUri=" + fwkMetadata.getString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI)
+              + " art=" + (fwkMetadata.getBitmap(MediaMetadata.METADATA_KEY_ART) != null)
+              + " displayIcon=" + (fwkMetadata.getBitmap(MediaMetadata.METADATA_KEY_DISPLAY_ICON) != null));
+        } catch (Throwable t) {
+          android.util.Log.i("MD3CarLyrics", "fwk bitmap check failed: " + t);
+        }
+        if (mediaIdProbe == null || mediaIdProbe.isEmpty()) {
+          String titleFwk = fwkMetadata.getString(MediaMetadata.METADATA_KEY_TITLE);
+          if (titleFwk != null && !titleFwk.isEmpty()) {
+            String artistFwk = fwkMetadata.getString(MediaMetadata.METADATA_KEY_ARTIST);
+            fwkMetadata = new MediaMetadata.Builder(fwkMetadata)
+                .putString(MediaMetadata.METADATA_KEY_MEDIA_ID,
+                    titleFwk + "|" + (artistFwk == null ? "" : artistFwk))
+                .build();
+          }
+        }
+        // MD3Music fork（封面 1x1 纯色根因修复 v14）：只保留 ALBUM_ART 一个 bitmap，
+        // 剥掉 ART/DISPLAY_ICON，保留 artUri。实测证据（2026-09-13）：
+        // 1) v12（ALBUM_ART+ART+DISPLAY_ICON 三个 400x400 bitmap ≈1.3MB bundle）→ 原子端
+        //    covers/ 把封面存成 1x1 像素 PNG（像素=各歌封面主色调）→ 显示 = 纯色封面；
+        // 2) 音哩音哩（com.spotify.music，原生 framework MediaSession，metadata 仅 1 个
+        //    ALBUM_ART bitmap、11 个键）→ 封面完整到达（原子端存 436KB 大图），显示正常；
+        // 3) v13（全剥 bitmap 只留 artUri）→ 原子端不写文件也不显示（URI-only 不被消费）。
+        // 结论：metadata bundle 携带多个大 bitmap（≈1.3MB）时 vivo 跨进程把封面降为 1x1
+        // 平均色；单 bitmap（音哩音哩已验证）可完整到达。我们的通知封面不受影响（media3
+        // 通知在本进程内用 artworkData 构建，不经此 hook）。
+        try {
+          boolean hadBmp =
+              fwkMetadata.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART) != null
+                  || fwkMetadata.getBitmap(MediaMetadata.METADATA_KEY_ART) != null
+                  || fwkMetadata.getBitmap(MediaMetadata.METADATA_KEY_DISPLAY_ICON) != null;
+          if (hadBmp) {
+            MediaMetadata.Builder stripped = new MediaMetadata.Builder();
+            for (String k : fwkMetadata.keySet()) {
+              if (MediaMetadata.METADATA_KEY_ALBUM_ART.equals(k)
+                  || MediaMetadata.METADATA_KEY_ART.equals(k)
+                  || MediaMetadata.METADATA_KEY_DISPLAY_ICON.equals(k)) {
+                // MD3Music fork v19：剥掉全部 bitmap（不只 ART/DISPLAY_ICON）。
+                // 实测矩阵：c0+bitmap(无论数量)→原子端封面降为 1x1 平均色（v12-v18）；
+                // 原子对 http URI 走自己 Glide 下载显示（kgka c0+无bitmap+http 已验证）。
+                // bitmap 路径在 vivo 上根本坏，必须全剥让原子走纯 URI 路径。
+                continue;
+              }
+              // MD3Music fork v16 修复：bitmap 键必须按 Bitmap 复制（v14/v15 的循环把
+              // ALBUM_ART 先 getString(=null) 再 putLong → IllegalArgumentException
+              // "ALBUM_ART key cannot be used to put a long" → 整个 strip 静默失败，
+              // 多 bitmap metadata 一直原样下发，单 bitmap 假设从未被真正测试过）。
+              android.graphics.Bitmap b = fwkMetadata.getBitmap(k);
+              if (b != null) {
+                stripped.putBitmap(k, b);
+                continue;
+              }
+              String s = fwkMetadata.getString(k);
+              if (s != null) {
+                stripped.putString(k, s);
+                continue;
+              }
+              android.media.Rating r = fwkMetadata.getRating(k);
+              if (r != null) {
+                stripped.putRating(k, r);
+                continue;
+              }
+              stripped.putLong(k, fwkMetadata.getLong(k));
+            }
+            fwkMetadata = stripped.build();
+            android.util.Log.i("MD3CarLyrics", "artwork bitmaps stripped (uri-only, http kgka-style), uri="
+                + fwkMetadata.getString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI));
+          }
+        } catch (Throwable t) {
+          android.util.Log.i("MD3CarLyrics", "artwork strip failed: " + t);
+        }
+      }
+      // MD3Music fork: 把 extras 里的 Vivo 车载歌词键提升到 framework MediaMetadata 顶层。
+      // media3 的 MediaMetadata.extras 在 compat.getMediaMetadata() 转换时不会展开为
+      // framework 顶层键，而 ucar 车机读的是顶层键（酷我做法）。无歌词时不写任何字段
+      // （负状态 = 车机永久退回单行），绝不写 LYRICS_LINE。
+      if (metadata != null && metadata.getBundle() != null) {
+        try {
+          Bundle extrasBundle = metadata.getBundle();
+          String wholeLrc = extrasBundle.getString(UCAR_LYRICS_WHOLE);
+          // MD3Music fork: 诊断日志（抓 logcat 过滤 MD3CarLyrics 验证注入链路；
+          // Log.i：vivo 等设备默认屏蔽 D 级日志，看不到不代表没触发）
+          android.util.Log.i("MD3CarLyrics", "setMetadata hook: lrc="
+              + (wholeLrc == null ? "null" : wholeLrc.length() + "chars")
+              + " bundleKeys=" + extrasBundle.keySet().size());
+          // MD3Music fork v17：support_event=31 必须写进所有 metadata 更新（不只歌词
+          // 更新）。y2 的 o 控制器读 metadata 的 support_event 直接存入 b3.a（无
+          // fallback，缺失=0）：只在歌词更新写 31 时，原子处理到无该键的过渡更新会把
+          // b3.a 覆盖成 0 → 歌词(bit8)/进度(bit16) 全灭（v15 歌词丢失根因）。
+          {
+            MediaMetadata.Builder fwkBuilder = new MediaMetadata.Builder(fwkMetadata);
+            fwkBuilder.putLong(VMM_SUPPORT_EVENT, VMM_SUPPORT_EVENT_VALUE);
+            fwkMetadata = fwkBuilder.build();
+          }
+          // MD3Music fork v18：metadata 不再携带整段歌词（UCAR_LYRICS_WHOLE/LYRICS_STATUS
+          // 移除）。对照音哩音哩（metadata 1 bitmap + 11 键无大字符串，封面完整到达），
+          // 我们的 metadata bitmap+歌词大字符串 → 原子端封面被降为 1x1 平均色（v12-v17
+          // 全部实测）。歌词照走 lrc_change extras 事件（c0 控制器消费，已验证）。
+          if (false && wholeLrc != null && !wholeLrc.isEmpty()) {
+            // v18：metadata 歌词键停用（见上方注释）。保留分支结构便于回滚。
+            MediaMetadata.Builder fwkBuilder = new MediaMetadata.Builder(fwkMetadata);
+            fwkBuilder.putString(UCAR_LYRICS_WHOLE, wholeLrc);
+            fwkBuilder.putLong(UCAR_LYRICS_STATUS, 0L);
+            fwkMetadata = fwkBuilder.build();
+            // 同步发送原子随身听（vivomusicmix）lrc_change extras（framework extras，
+            // 字段照抄 vivo 官方拼写错误 meida / meidia）。歌词变化立即发，相同则 25s 节流。
+            if (shouldSendVivoLrcChange(wholeLrc)) {
+              Bundle atomicExtras = new Bundle();
+              atomicExtras.putString(
+                  VMM_ACTION_KEY, "vivomusicmix.extra.lrc_change");
+              String mediaIdFwk = fwkMetadata.getString(MediaMetadata.METADATA_KEY_MEDIA_ID);
+              if (mediaIdFwk != null && !mediaIdFwk.isEmpty()) {
+                atomicExtras.putString(VMM_MEDIA_ID_KEY, mediaIdFwk);
+              }
+              atomicExtras.putString(VMM_LYRIC_KEY, wholeLrc);
+              setExtras(atomicExtras);
+              // MD3Music fork: 诊断 lrc_change 发送内容（meidia_id 匹配是原子显示歌词的关键）
+              android.util.Log.i("MD3CarLyrics", "lrc_change sent: mediaId=" + mediaIdFwk
+                  + " lrcLen=" + wholeLrc.length()
+                  + " head=" + wholeLrc.substring(0, Math.min(40, wholeLrc.length())).replace('\n', '|'));
+            }
+          }
+        } catch (Throwable t) {
+          // 车载歌词注入失败不影响原 metadata 下发
+        }
+      }
+      mSessionFwk.setMetadata(fwkMetadata);
     }
 
     @Override

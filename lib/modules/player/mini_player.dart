@@ -37,7 +37,7 @@ class MiniPlayer extends StatefulWidget {
 }
 
 class _MiniPlayerState extends State<MiniPlayer>
-    with SingleTickerProviderStateMixin {
+    with TickerProviderStateMixin {
   // 拖动期间内容水平偏移（px），实时跟随手指
   double _dragOffset = 0.0;
   // 切歌方向：1=下一首(向左滑)，-1=上一首(向右滑)；驱动 AnimatedSwitcher 进出场方向
@@ -45,6 +45,16 @@ class _MiniPlayerState extends State<MiniPlayer>
   // 回弹归位动画控制器
   late final AnimationController _snapController;
   Animation<double>? _snapAnim;
+
+  // MiniPlayer「从无到有」入场动画控制器（底部弹出 + 背景色遮罩 morph 到本体）
+  late final AnimationController _entranceController;
+  late final CurvedAnimation _entranceAnim;
+  // 记录本实例是否已处于「有歌」状态：只在 null→有歌 的转变时播放一次入场动画，
+  // 页面切换重建（进来即有歌）不触发
+  late bool _hadSong;
+  // 内容（封面/标题/歌手）是否已首次显示：首次不播放 AnimatedSwitcher 淡入，
+  // 避免启动期 ticker 不稳使淡入卡在半透明导致内容发灰
+  bool _contentShownOnce = false;
 
   // 拖动触发阈值
   static const double _velocityThreshold = 400.0; // px/s
@@ -57,6 +67,19 @@ class _MiniPlayerState extends State<MiniPlayer>
       vsync: this,
       duration: const Duration(milliseconds: 250),
     );
+    _entranceController = AnimationController(
+      vsync: this,
+      duration: M3ExpressiveMotion.defaultDuration, // 400ms
+    );
+    _entranceAnim = CurvedAnimation(
+      parent: _entranceController,
+      curve: M3ExpressiveMotion.emphasizedEasing,
+    );
+    // 进来即有歌（如页面切换重建）→ 直接满显示、不弹；进来无歌 → 归零待触发
+    _hadSong = context.read<PlayerProvider>().currentSong != null;
+    _entranceController.value = _hadSong ? 1.0 : 0.0;
+    // 已有歌直接满显示，消费掉冷启动恢复标记，避免残留误伤后续点歌
+    if (_hadSong) kMiniPlayerSkipNextEntrance = false;
     // 从本地持久化读取「滑动切歌」开关，覆盖默认值（默认开启）
     _loadSwipeSwitchSetting();
   }
@@ -70,6 +93,7 @@ class _MiniPlayerState extends State<MiniPlayer>
   @override
   void dispose() {
     _snapController.dispose();
+    _entranceController.dispose();
     super.dispose();
   }
 
@@ -206,6 +230,9 @@ class _MiniPlayerState extends State<MiniPlayer>
     // 注意：不在此重置 _dragActivated——up 之后竞技场 sweep 仍会触发
     // onHorizontalDragEnd，必须保持上滑守卫，直到下一次手势开始（_onRawDown）
     if (!_dragActivated) return;
+    // 上滑流程已接管手势，水平切歌的 onHorizontalDragEnd 被守卫跳过，
+    // 此处归零 _dragOffset，避免进入 FullPlayer 后返回时封面/标题错位残留
+    if (_dragOffset != 0.0) setState(() => _dragOffset = 0.0);
     final expand = shouldExpandPlayer(
       dragDistance: _dragDistance,
       screenHeight: MediaQuery.sizeOf(context).height,
@@ -226,6 +253,8 @@ class _MiniPlayerState extends State<MiniPlayer>
     _activePointer = null;
     // 手势被系统打断：收起覆盖层（同样保持守卫到下一次 down）
     if (_dragActivated) {
+      // 同 _onRawUp：上滑接管后归零水平偏移，防止错位残留
+      if (_dragOffset != 0.0) setState(() => _dragOffset = 0.0);
       playerDragActive.value = false;
       playerExpansion.value = 0.0;
     }
@@ -277,11 +306,68 @@ class _MiniPlayerState extends State<MiniPlayer>
     final playerProvider = context.watch<PlayerProvider>();
     final currentSong = playerProvider.currentSong;
 
-    if (currentSong == null) return const SizedBox.shrink();
+    if (currentSong == null) {
+      _hadSong = false; // 清空后再次播放可重弹
+      return const SizedBox.shrink();
+    }
 
     final colorScheme = Theme.of(context).colorScheme;
     // 公开版偏好：启用自定义背景时，MiniPlayer 用半透明背景透出背景图
     final useBackgroundImage = context.watch<ThemeProvider>().useBackgroundImage;
+
+    // 仅在本实例观察到 null→有歌 的转变时播放入场动画；
+    // 页面切换重建（_hadSong 初始 true）不触发
+    if (!_hadSong) {
+      _hadSong = true;
+      if (kMiniPlayerSkipNextEntrance) {
+        // 冷启动恢复播放：直接满显示、不弹，避免启动期遮罩偶发残留导致内容偏灰
+        kMiniPlayerSkipNextEntrance = false;
+        _entranceController.value = 1.0;
+      } else {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) _entranceController.forward(from: 0.0);
+        });
+      }
+    }
+
+    // 可交互本体：滑动切歌开关 + 上滑展开手势 + 点击展开 + 内容
+    final interactable = ValueListenableBuilder<bool>(
+      // 滑动切歌开关关闭时，不注册水平拖动回调，仅保留点击展开
+      valueListenable: miniPlayerSwipeSwitchEnabled,
+      builder: (context, swipeEnabled, _) => Listener(
+        // 上滑展开：手势期间不 push（push 会切断事件流），
+        // 由 Navigator 之上的覆盖层跟手显示，松手后再 push 路由
+        behavior: HitTestBehavior.opaque,
+        onPointerDown: _onRawDown,
+        onPointerMove: _onRawMove,
+        onPointerUp: _onRawUp,
+        onPointerCancel: _onRawCancel,
+        child: GestureDetector(
+          // 点击展开 FullPlayer（栈顶已有播放器路由时不重复 push）
+          onTap: () {
+            // 上滑展开识别后（含 up 后 sweep 阶段）不响应点击
+            if (_dragActivated) return;
+            if (activePlayerRoute?.isCurrent ?? false) return;
+            Navigator.of(context).push(fullPlayerRoute(context));
+          },
+          // 水平滑动切歌（受设置开关控制）
+          onHorizontalDragStart: swipeEnabled ? _onHorizontalDragStart : null,
+          onHorizontalDragUpdate: swipeEnabled ? _onHorizontalDragUpdate : null,
+          onHorizontalDragEnd: swipeEnabled ? _onHorizontalDragEnd : null,
+          behavior: HitTestBehavior.opaque,
+          // P0: 进度条在 _buildContent 内部用 ValueListenableBuilder 仅订阅
+          // positionNotifier（高频 200ms），本层静态构建，避免封面/标题/按钮
+          // 随每次进度刷新重建。
+          child: _buildContent(
+            context,
+            playerProvider,
+            currentSong,
+            colorScheme,
+            useBackgroundImage,
+          ),
+        ),
+      ),
+    );
 
     return ValueListenableBuilder<double>(
       valueListenable: playerExpansion,
@@ -294,44 +380,43 @@ class _MiniPlayerState extends State<MiniPlayer>
           child: Opacity(opacity: opacity, child: child),
         );
       },
-      child: ValueListenableBuilder<bool>(
-        // 滑动切歌开关关闭时，不注册水平拖动回调，仅保留点击展开
-        valueListenable: miniPlayerSwipeSwitchEnabled,
-        builder: (context, swipeEnabled, _) => Listener(
-          // 上滑展开：手势期间不 push（push 会切断事件流），
-          // 由 Navigator 之上的覆盖层跟手显示，松手后再 push 路由
-          behavior: HitTestBehavior.opaque,
-          onPointerDown: _onRawDown,
-          onPointerMove: _onRawMove,
-          onPointerUp: _onRawUp,
-          onPointerCancel: _onRawCancel,
-          child: GestureDetector(
-            // 点击展开 FullPlayer（栈顶已有播放器路由时不重复 push）
-            onTap: () {
-              // 上滑展开识别后（含 up 后 sweep 阶段）不响应点击
-              if (_dragActivated) return;
-              if (activePlayerRoute?.isCurrent ?? false) return;
-              Navigator.of(context).push(fullPlayerRoute(context));
-            },
-            // 水平滑动切歌（受设置开关控制）
-            onHorizontalDragStart:
-                swipeEnabled ? _onHorizontalDragStart : null,
-            onHorizontalDragUpdate:
-                swipeEnabled ? _onHorizontalDragUpdate : null,
-            onHorizontalDragEnd: swipeEnabled ? _onHorizontalDragEnd : null,
-            behavior: HitTestBehavior.opaque,
-            // P0: 进度条在 _buildContent 内部用 ValueListenableBuilder 仅订阅
-            // positionNotifier（高频 200ms），本层静态构建，避免封面/标题/按钮
-            // 随每次进度刷新重建。
-            child: _buildContent(
-              context,
-              playerProvider,
-              currentSong,
-              colorScheme,
-              useBackgroundImage,
+      // 入场动画层：外层 expansion-opacity 不变，内层叠加「底部弹出 + 背景色遮罩 morph」
+      child: AnimatedBuilder(
+        animation: _entranceAnim,
+        child: interactable,
+        builder: (context, child) {
+          final t = _entranceAnim.value; // 0→1
+          return SizeTransition(
+            // 底部对齐、向上展开：消除主布局 Column 里 MiniPlayer 占位 0→H 的内容瞬间压缩
+            axis: Axis.vertical,
+            alignment: Alignment.bottomCenter,
+            sizeFactor: _entranceAnim,
+            child: SlideTransition(
+              // 从屏幕下方一个自身高度处滑入到位
+              position: Tween<Offset>(
+                begin: const Offset(0.0, 1.0),
+                end: Offset.zero,
+              ).animate(_entranceAnim),
+              child: Stack(
+                children: [
+                  // 本体撑满宽度（Stack 对非定位子给 loose 约束，需显式撑满）
+                  SizedBox(width: double.infinity, child: child),
+                  // 背景色遮罩：t=0 完全盖住本体（只见纯色块），t=1 淡出露出本体
+                  Positioned.fill(
+                    child: IgnorePointer(
+                      child: Opacity(
+                        opacity: (1.0 - t).clamp(0.0, 1.0),
+                        child: ColoredBox(
+                          color: colorScheme.surfaceContainerHigh,
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
             ),
-          ),
-        ),
+          );
+        },
       ),
     );
   }
@@ -392,6 +477,13 @@ class _MiniPlayerState extends State<MiniPlayer>
                         switchInCurve: M3ExpressiveMotion.expressiveEasing,
                         switchOutCurve: Curves.easeIn,
                         transitionBuilder: (child, animation) {
+                          // 初次出现不播放淡入：内容直接显示（显现交给入场 morph），
+                          // 避免启动期 ticker 不稳使淡入卡在半透明导致封面/标题/歌手发灰。
+                          // 本 SDK 的 AnimatedSwitcher 无 animateFirstChild 参数，用实例标志实现。
+                          if (!_contentShownOnce) {
+                            _contentShownOnce = true;
+                            return child;
+                          }
                           // isEntering 判定：新 child 的 key == 当前歌曲 id
                           final isEntering =
                               child.key == ValueKey(currentSong.id);

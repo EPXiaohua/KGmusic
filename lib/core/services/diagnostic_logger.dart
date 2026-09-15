@@ -149,10 +149,51 @@ class DiagnosticLogger {
     }
   }
 
-  Future<void> _writePending() async {
+  /// 关闭当前日志文件句柄（供清空日志流程使用）。
+  ///
+  /// 必须先关句柄再删除 app.log：否则后续写入会进已删除的 inode，
+  /// app.log 在下次进程重启前永久消失（历轮诊断报告缺 app.log 的根因）。
+  Future<void> closeSinkForClearing() async {
     try {
-      final chunk = _pending.toString();
-      _pending.clear();
+      await flush();
+    } catch (_) {}
+    try {
+      await _sink?.close();
+    } catch (_) {}
+    _sink = null;
+  }
+
+  /// 重新打开当前日志文件（清空日志删除文件后调用）。
+  void reopenSinkAfterClearing() {
+    if (!_initialized || _logDir == null || _sink != null) return;
+    try {
+      _openCurrentFile();
+    } catch (_) {}
+  }
+
+  Future<void> _writePending() async {
+    final chunk = _pending.toString();
+    _pending.clear();
+    if (await _tryWrite(chunk)) return;
+    // 写入失败自愈：句柄可能失效（文件被外部删除/占用）——重开一次再写；
+    // 仍失败才静默放弃（诊断日志不得影响主流程）。
+    try {
+      await _sink?.flush();
+    } catch (_) {}
+    try {
+      await _sink?.close();
+    } catch (_) {}
+    _sink = null;
+    try {
+      _openCurrentFile();
+      await _tryWrite(chunk);
+    } catch (_) {}
+  }
+
+  /// 单次写盘（含滚动检查），成功返回 true。
+  Future<bool> _tryWrite(String chunk) async {
+    try {
+      if (_sink == null) return false;
       final bytes = utf8.encode(chunk);
       if (_currentSize + bytes.length > _maxFileSize) {
         await _rotate();
@@ -160,8 +201,9 @@ class DiagnosticLogger {
       _sink!.write(chunk);
       await _sink!.flush();
       _currentSize += bytes.length;
+      return true;
     } catch (_) {
-      // 写入失败静默忽略：诊断日志不得影响主流程
+      return false;
     }
   }
 

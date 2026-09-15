@@ -1678,8 +1678,15 @@ public final class DefaultAudioSink implements AudioSink {
   /**
    * MD3Music fork: 是否实际请求 float 输出 = 构建期的 {@code enableFloatOutput} 与
    * 32bit 播放开关（实时静态标志）取或。开关开启后下一首歌 configure 即生效，无需重建播放器。
+   *
+   * <p>MD3Music fork: USB 独占时强制禁用 float —— 独占直写路径中 float 无收益
+   * （native 仍需转 DAC 位深），且部分设备 float 解码输出异常（噪音/变速，见
+   * AudioPlayer 的 setEnableAudioFloatOutput(false) 注释）。独占恒走整数 RAW 路径。
    */
   private boolean floatOutputRequested() {
+    if (UsbAudioSinkController.isEnabled()) {
+      return false;
+    }
     return enableFloatOutput || UsbAudioSinkController.isFloatOutputEnabled();
   }
 

@@ -410,6 +410,54 @@ void main() {
   });
 
   group('AppleLyricsView 省电模式：拖动歌词后立即锁回 60fps', () {
+    testWidgets('挂载即建立 eco 限帧：不拨开关、不依赖 _onTick 自我纠正也应锁 60fps',
+        (tester) async {
+      // 复现「升级后经 headless 引擎（无 Surface / Ticker 被 mute）拉起」场景：
+      // eco 偏好为开时，initState 必须直接起 60fps eco Timer，而不是等满帧 Ticker
+      // 的第一帧 _onTick 才自我纠正——后者在无 vsync 时永不发生，导致页面停在 120Hz，
+      // 必须拨动开关才恢复（正是本 bug）。
+      SharedPreferences.setMockInitialValues({'lyric_eco_mode': true});
+      await LyricPreferences.instance.setEcoMode(true);
+      addTearDown(() => LyricPreferences.instance.reset());
+      expect(LyricPreferences.instance.ecoMode, isTrue);
+
+      final lines = <LyricLine>[
+        LyricLine(
+          startTime: 0,
+          duration: 60000,
+          text: '逐字歌词行',
+          words: const [
+            LyricWord(startTime: 0, duration: 60000, text: '逐字歌词行'),
+          ],
+        ),
+      ];
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SizedBox(
+              width: 400,
+              height: 600,
+              child: AppleLyricsView(
+                lines: lines,
+                currentTimeMs: 0,
+                isPlaying: true,
+              ),
+            ),
+          ),
+        ),
+      );
+
+      // 关键：pumpWidget 仅推进到 t=0（eco Timer 尚未触发任何 tick，_onTick 从未运行），
+      // 但驱动源已在 initState 内确定为 eco Timer、Ticker 未启动。
+      // 旧实现（initState 裸起 Ticker）此刻 _isTickerRunning=true、_ecoTimer=null，
+      // 本断言会失败——即本 bug 的回归护栏。
+      final state = (tester.state(find.byType(AppleLyricsView)) as dynamic);
+      expect(state.ecoDriverIsTimerForTest, isTrue,
+          reason: '挂载即应以 60fps eco Timer 为驱动源，不依赖 _onTick 自我纠正');
+      expect(state.ecoUnlockedForTest, isFalse,
+          reason: '初始非滚动态应处于锁定');
+    });
+
     testWidgets('松手后的等待回弹期歌词静止，应立即锁回（不得等满 3s 回弹倒计时）',
         (tester) async {
       SharedPreferences.setMockInitialValues({});

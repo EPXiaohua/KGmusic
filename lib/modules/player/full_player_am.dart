@@ -431,6 +431,7 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
       _dragRoute = null;
       applyImmersiveForOrientation();
       _systemUiModified = true;
+      _syncLandscapeImmersiveFlag();
     }
   }
 
@@ -464,6 +465,15 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
       _tryStartSpectrum(isPlaying: true);
     }
     SpectrumService.instance.setPlaying(player.isPlaying);
+    // 切歌重建会经 AnnotatedRegion 重新调用 setSystemUIOverlayStyle，
+    // 在 Android 上把 Zen/横屏沉浸的状态栏重新唤出；本帧结束后再隐藏一次。
+    if (_zenMode || _isLandscapeNow()) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && (_zenMode || _isLandscapeNow())) {
+          SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+        }
+      });
+    }
   }
 
   @override
@@ -483,7 +493,18 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
       } else {
         applyImmersiveForOrientation();
       }
+      _syncLandscapeImmersiveFlag();
     });
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // 亮屏/回前台：Android 可能清除 sticky 标志，Zen 或横屏沉浸中需重新隐藏系统栏。
+    if (state == AppLifecycleState.resumed &&
+        mounted &&
+        (_zenMode || _isLandscapeNow())) {
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    }
   }
 
   @override
@@ -516,6 +537,9 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
       _onSpectrumSimulated,
     );
     _stopSpectrum();
+    // 播放器卸载：若仍在 Zen 中，清除全局标志，避免主界面 _SystemUiUpdater 被永久短路
+    if (_zenMode) kPlayerZenImmersiveActive.value = false;
+    kPlayerLandscapeImmersiveActive.value = false;
     // 退出播放器时恢复系统栏；若仍处于封面流页横屏沉浸（从封面流进入播放器后返回），
     // 则保持沉浸，避免返回后状态栏闪现。
     // 拖拽覆盖层（非路由）从未修改系统栏，无需恢复
@@ -529,12 +553,25 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
     super.dispose();
   }
 
+  /// 当前是否横屏（物理尺寸判定，与 applyImmersiveForOrientation 口径一致）。
+  bool _isLandscapeNow() {
+    final view = WidgetsBinding.instance.platformDispatcher.views.first;
+    return view.physicalSize.width > view.physicalSize.height;
+  }
+
+  /// 同步全局「横屏沉浸生效」标志：仅非 Zen 横屏为 true，供主界面 _SystemUiUpdater 短路。
+  void _syncLandscapeImmersiveFlag() {
+    kPlayerLandscapeImmersiveActive.value = !_zenMode && _isLandscapeNow();
+  }
+
   /// 进入 Zen 沉浸模式：隐藏顶栏、控件、系统栏，拓宽歌词/封面视图。
   void _enterZenMode() {
     if (_zenMode) return;
     setState(() => _zenMode = true);
     _zenController.forward();
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    kPlayerZenImmersiveActive.value = true;
+    _syncLandscapeImmersiveFlag();
   }
 
   /// 退出 Zen 沉浸模式：恢复所有 UI 元素和系统栏。
@@ -542,7 +579,9 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
     if (!_zenMode) return;
     setState(() => _zenMode = false);
     _zenController.reverse();
+    kPlayerZenImmersiveActive.value = false;
     applyImmersiveForOrientation();
+    _syncLandscapeImmersiveFlag();
   }
 
   /// 长按专辑封面 [_zenPressDuration] 切换 Zen 模式（未进入则进入，已进入则退出）。
@@ -1090,6 +1129,7 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
     if (status != AnimationStatus.completed) return;
     applyImmersiveForOrientation();
     _systemUiModified = true;
+    _syncLandscapeImmersiveFlag();
     _dragRoute?.controller.removeStatusListener(_onDragRouteStatus);
     _dragRoute = null;
     if (mounted) setState(() {});
@@ -1351,13 +1391,15 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
         body: Stack(
           children: [
             // 1. 模糊封面背景层（Apple Music 风格，带淡入淡出）
+            //    开启动态流光时不渲染模糊层，只保留流光层（省 GPU 且画面更纯净）
             // RepaintBoundary 隔离：tab 切换/控制栏 setState/评论透传这类整页重建不再连坐本层重绘
-            RepaintBoundary(
-              child: _buildCrossfadeBlurredBackground(
-                currentSong.artworkUri,
-                fallbackFilePath: currentSong.localPath,
+            if (!LyricPreferences.instance.useFlowingBackground)
+              RepaintBoundary(
+                child: _buildCrossfadeBlurredBackground(
+                  currentSong.artworkUri,
+                  fallbackFilePath: currentSong.localPath,
+                ),
               ),
-            ),
             // 2. 动态流光背景层（可选，从专辑封面提取色彩流动）
             if (LyricPreferences.instance.useFlowingBackground)
               FlowingBackground(
@@ -1508,6 +1550,8 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                                     return rawMs > offset ? rawMs - offset : 0;
                                   },
                                   isPlaying: playerProvider.isPlaying,
+                                  playbackNotReady:
+                                      playerProvider.isPlaybackNotReady,
                                   forceDarkBackground: true,
                                   // 本地歌曲 + LRC 逐行歌词：禁用间奏点（节奏点）
                                   enableInterludeDots:
@@ -1679,6 +1723,8 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                                           positionListenable:
                                               playerProvider.positionNotifier,
                                           isPlaying: playerProvider.isPlaying,
+                                  playbackNotReady:
+                                      playerProvider.isPlaybackNotReady,
                                           forceDarkBackground: true,
                                           // 本地歌曲 + LRC 逐行歌词：禁用间奏点（节奏点）
                                           enableInterludeDots:
@@ -1859,6 +1905,8 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                                           positionListenable:
                                               playerProvider.positionNotifier,
                                           isPlaying: playerProvider.isPlaying,
+                                  playbackNotReady:
+                                      playerProvider.isPlaybackNotReady,
                                           forceDarkBackground: true,
                                           // 本地歌曲 + LRC 逐行歌词：禁用间奏点（节奏点）
                                           enableInterludeDots:
@@ -3599,9 +3647,9 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                       ),
                       title: Text(name),
                       subtitle: Text('$songCount 首'),
-                      onTap: () async {
+                      onTap: () {
                         Navigator.pop(dialogContext);
-                        await _addSongToPlaylist(context, song, playlist);
+                        _addSongToPlaylist(song, playlist);
                       },
                     );
                   },
@@ -3664,8 +3712,13 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
     return playlists;
   }
 
+  /// 将歌曲添加到指定歌单。
+  ///
+  /// 不依赖对话框的 BuildContext：调用时对话框刚被 pop，其子树会在退出动画
+  /// 结束后卸载；若用该 context 做 mounted 检查，await 网络请求后必然
+  /// 提前 return，导致"第一次点击没反应"（issue #66）。
+  /// showToast 为全局 Fluttertoast，API 调用为后台异步，均无需挂载中的 context。
   Future<void> _addSongToPlaylist(
-    BuildContext context,
     dynamic song,
     Map<String, dynamic> playlist,
   ) async {
@@ -3678,12 +3731,10 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
         '';
 
     if (listid.isEmpty) {
-      if (!context.mounted) return;
       showToast('歌单ID无效', long: true);
       return;
     }
 
-    if (!context.mounted) return;
     final name = (playlist['name'] ?? playlist['specialname'] ?? '未知歌单')
         .toString();
 
@@ -3700,7 +3751,7 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
         final songHash = song.id?.toString().toLowerCase() ?? '';
         final already = existing.any((s) => s.hash.toLowerCase() == songHash);
         if (already) {
-          if (context.mounted) showToast('已在歌单「$name」中');
+          showToast('已在歌单「$name」中');
           return;
         }
       }
@@ -3709,7 +3760,6 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
     }
 
     // 乐观更新：立即显示成功，后台同步到酷狗服务器
-    if (!context.mounted) return;
     showToast('已添加到「$name」');
 
     // 构造歌曲数据 — 酷狗API要求的格式：歌名|hash|albumId|albumAudioId
@@ -3722,9 +3772,7 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
         .then((result) {
           // 同步失败时提示用户（静默失败，不影响已显示的乐观更新）
           if (result == null) {
-            if (context.mounted) {
-              showToast('同步到服务器失败，将在下次启动时重试', long: true);
-            }
+            showToast('同步到服务器失败，将在下次启动时重试', long: true);
           }
         })
         .catchError((_) {

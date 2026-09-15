@@ -11,6 +11,7 @@ import 'package:share_plus/share_plus.dart';
 import '../../services/kugou_server.dart';
 import 'diagnostic_logger.dart';
 import 'media_store_service.dart';
+import 'usb_audio_service.dart';
 
 /// 诊断报告构建与导出。
 ///
@@ -40,15 +41,34 @@ class DiagnosticExporter {
     if (logDir != null && logDir.existsSync()) {
       for (final entity in logDir.listSync()) {
         if (entity is File) {
-          entity.copySync('${workDir.path}/${_baseName(entity.path)}');
+          try {
+            entity.copySync('${workDir.path}/${_baseName(entity.path)}');
+          } catch (_) {
+            // 单文件复制失败（占用/轮转竞争）不中断其余日志收集
+          }
         }
       }
     }
 
-    // 3. 生成设备/应用概览
+    // 2.5 USB 独占链路内部日志（app 侧内存环形 + logcat 自读过滤，
+    // 覆盖 just_audio 模块与 native 传输层），写入 usb.log 随报告导出。
+    if (!kIsWeb && Platform.isAndroid) {
+      try {
+        final usbLogs = await UsbAudioService.instance.getUsbLogs();
+        if (usbLogs.isNotEmpty) {
+          File('${workDir.path}/usb.log').writeAsStringSync(usbLogs,
+              flush: true);
+        }
+      } catch (_) {
+        // USB 日志导出失败不影响整体诊断报告
+      }
+    }
+
+    // 3. 生成设备/应用概览 + 日志文件清单（缺 app.log 时可直接定位原因）
     final infoText = await _collectInfoText();
+    final logInventory = _collectLogInventory(logDir);
     File('${workDir.path}/diagnostic_info.txt')
-        .writeAsStringSync(infoText, flush: true);
+        .writeAsStringSync('$infoText\n$logInventory', flush: true);
 
     // 4. 打包 zip 并清理工作目录
     final zip = await packageZip(
@@ -73,8 +93,13 @@ class DiagnosticExporter {
   }
 
   /// 清空全部诊断日志（Dart 日志 + 原生崩溃文件）。
+  ///
+  /// 必须先关闭日志文件句柄再删除：否则后续写入会进已删除的 inode，
+  /// app.log 在下次进程重启前永久消失（历轮报告缺 app.log 的根因）。
   static Future<void> clearLogs() async {
-    final logDir = DiagnosticLogger.instance.logDir;
+    final logger = DiagnosticLogger.instance;
+    await logger.closeSinkForClearing();
+    final logDir = logger.logDir;
     if (logDir != null && logDir.existsSync()) {
       for (final entity in logDir.listSync()) {
         try {
@@ -82,7 +107,33 @@ class DiagnosticExporter {
         } catch (_) {}
       }
     }
-    DiagnosticLogger.instance.i('诊断日志已被用户清空');
+    logger.reopenSinkAfterClearing();
+    logger.i('诊断日志已被用户清空');
+  }
+
+  /// 生成日志目录清单文本（文件名 + 字节数），随 diagnostic_info.txt 导出。
+  static String _collectLogInventory(Directory? logDir) {
+    final buffer = StringBuffer()
+      ..writeln('')
+      ..writeln('[日志文件清单]');
+    if (logDir == null || !logDir.existsSync()) {
+      buffer.writeln('日志目录不可用（DiagnosticLogger 未初始化或初始化失败）');
+      return buffer.toString();
+    }
+    buffer.writeln('目录: ${logDir.path}');
+    final files = logDir.listSync().whereType<File>().toList()
+      ..sort((a, b) => _baseName(a.path).compareTo(_baseName(b.path)));
+    if (files.isEmpty) {
+      buffer.writeln('（目录为空）');
+    }
+    for (final f in files) {
+      var size = 0;
+      try {
+        size = f.lengthSync();
+      } catch (_) {}
+      buffer.writeln('${_baseName(f.path)}: $size 字节');
+    }
+    return buffer.toString();
   }
 
   /// 生成诊断信息文本（白名单字段，测试可见）。
