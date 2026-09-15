@@ -1,16 +1,174 @@
 import Flutter
 import UIKit
+import PhotosUI
+import UniformTypeIdentifiers
 
 @main
-@objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate {
+@objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate,
+    UIDocumentPickerDelegate, PHPickerViewControllerDelegate {
+  /// 待回复的 FlutterResult（两个选择器互斥，同一时间只允许一个）
+  private var pendingResult: FlutterResult?
+  private var channelsConfigured = false
+
   override func application(
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
   ) -> Bool {
-    return super.application(application, didFinishLaunchingWithOptions: launchOptions)
+    let ok = super.application(application, didFinishLaunchingWithOptions: launchOptions)
+    configureChannelsIfPossible()
+    return ok
   }
 
   func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
     GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
+    configureChannelsIfPossible()
+  }
+
+  // MARK: - MethodChannel 注册
+
+  /// Android 端由 MainActivity.kt 实现同名 channel；iOS 在此补齐。
+  /// 场景建立后 window.rootViewController 才是 FlutterViewController，
+  /// 因此 didFinishLaunching / 引擎初始化 / SceneDelegate 连接三处都尝试注册。
+  func configureChannelsIfPossible() {
+    guard !channelsConfigured else { return }
+    guard let controller = window?.rootViewController as? FlutterViewController else { return }
+    let messenger = controller.binaryMessenger
+
+    FlutterMethodChannel(name: "com.md3music.md3music/font_picker", binaryMessenger: messenger)
+      .setMethodCallHandler { [weak self] call, result in
+        guard call.method == "pickFontFile" else {
+          result(FlutterMethodNotImplemented)
+          return
+        }
+        self?.pickFontFile(result: result)
+      }
+
+    FlutterMethodChannel(name: "com.md3music.md3music/background_picker", binaryMessenger: messenger)
+      .setMethodCallHandler { [weak self] call, result in
+        guard call.method == "pickBackgroundImage" else {
+          result(FlutterMethodNotImplemented)
+          return
+        }
+        self?.pickBackgroundImage(result: result)
+      }
+
+    channelsConfigured = true
+  }
+
+  /// 当前可用于 present 的最顶层控制器
+  private var presenter: UIViewController? {
+    var base = window?.rootViewController
+    while let presented = base?.presentedViewController {
+      base = presented
+    }
+    return base
+  }
+
+  // MARK: - 字体文件选择（对齐 Android SAF：拷贝到 Documents/fonts/ 后返回路径）
+
+  private func pickFontFile(result: @escaping FlutterResult) {
+    guard pendingResult == nil else {
+      result(nil)  // 已有选择器在运行，直接视为取消
+      return
+    }
+    pendingResult = result
+    let picker = UIDocumentPickerViewController(
+      forOpeningContentTypes: [.truetypeFont, .openTypeFont], asCopy: true)
+    picker.delegate = self
+    picker.allowsMultipleSelection = false
+    presenter?.present(picker, animated: true)
+  }
+
+  func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+    guard let result = pendingResult else { return }
+    pendingResult = nil
+    guard let src = urls.first else {
+      result(nil)
+      return
+    }
+    do {
+      let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+      let dir = docs.appendingPathComponent("fonts", isDirectory: true)
+      try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+      let ext = src.pathExtension.isEmpty ? "ttf" : src.pathExtension
+      let dst = dir.appendingPathComponent("user_custom.\(ext)")
+      if FileManager.default.fileExists(atPath: dst.path) {
+        try FileManager.default.removeItem(at: dst)
+      }
+      try FileManager.default.copyItem(at: src, to: dst)
+      result(dst.path)
+    } catch {
+      result(FlutterError(code: "FONT_COPY_FAILED", message: error.localizedDescription, details: nil))
+    }
+  }
+
+  func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+    guard let result = pendingResult else { return }
+    pendingResult = nil
+    result(nil)
+  }
+
+  // MARK: - 背景图片选择（对齐 Android SAF：拷贝到 Documents/background/ 后返回路径）
+
+  private func pickBackgroundImage(result: @escaping FlutterResult) {
+    guard pendingResult == nil else {
+      result(nil)
+      return
+    }
+    pendingResult = result
+    var config = PHPickerConfiguration()
+    config.filter = .images
+    config.selectionLimit = 1
+    let picker = PHPickerViewController(configuration: config)
+    picker.delegate = self
+    presenter?.present(picker, animated: true)
+  }
+
+  func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+    picker.dismiss(animated: true)
+    guard let result = pendingResult else { return }
+    guard let provider = results.first?.itemProvider,
+          provider.canLoadObject(ofClass: UIImage.self) else {
+      pendingResult = nil
+      result(nil)
+      return
+    }
+    // loadObject 回调在任意队列，FlutterResult 必须回主线程
+    provider.loadObject(ofClass: UIImage.self) { [weak self] obj, _ in
+      guard let self = self else { return }
+      guard let image = obj as? UIImage else {
+        DispatchQueue.main.async {
+          self.pendingResult = nil
+          result(nil)
+        }
+        return
+      }
+      do {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let dir = docs.appendingPathComponent("background", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dst = dir.appendingPathComponent("background.jpg")
+        if FileManager.default.fileExists(atPath: dst.path) {
+          try FileManager.default.removeItem(at: dst)
+        }
+        guard let data = image.jpegData(compressionQuality: 0.95) else {
+          DispatchQueue.main.async {
+            self.pendingResult = nil
+            result(nil)
+          }
+          return
+        }
+        try data.write(to: dst)
+        DispatchQueue.main.async {
+          self.pendingResult = nil
+          result(dst.path)
+        }
+      } catch {
+        DispatchQueue.main.async {
+          self.pendingResult = nil
+          result(FlutterError(code: "BG_COPY_FAILED", message: error.localizedDescription, details: nil))
+        }
+      }
+    }
   }
 }
