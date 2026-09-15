@@ -61,12 +61,12 @@ class SettingsPage extends StatefulWidget {
   /// 可选扩展：设置页分类列表的额外分类（默认关闭，由私有构建注入，
   /// 用于补充私有功能设置项）。
   static List<(String, IconData, Widget Function(ColorScheme))>?
-      extraCategories;
+  extraCategories;
 
   /// 可选扩展：设置搜索索引的额外条目（默认关闭，由私有构建注入，
   /// 与 [extraCategories] 配套，保证私有分类可被搜索命中）。
   static List<({String label, String category, String aliases})>?
-      extraSearchIndexEntries;
+  extraSearchIndexEntries;
 
   const SettingsPage({super.key});
 
@@ -124,6 +124,7 @@ class _SettingsPageState extends State<SettingsPage>
   bool _showQualityDowngradeToast = false;
   // 设备 Android SDK 版本（SuperLyricApi 3.4 要求 API 26+，低于此禁用该协议选项）
   int? _androidSdkVersion;
+
   /// SuperLyric 是否受支持：API 26+（Android 8.0+）。未知时默认放行，避免误禁用。
   bool get _superLyricSupported =>
       _androidSdkVersion == null || _androidSdkVersion! >= 26;
@@ -141,7 +142,8 @@ class _SettingsPageState extends State<SettingsPage>
   int _crossfadeSeconds = SettingsRepository.kCrossfadeDefaultSeconds;
   // 音量均衡（响度归一）
   bool _volumeNormalizationEnabled = false;
-  double _volumeNormalizationLufs = VolumeNormalizationService.defaultReferenceLufs;
+  double _volumeNormalizationLufs =
+      VolumeNormalizationService.defaultReferenceLufs;
   // 播放时保持屏幕常亮开关
   bool _keepScreenOn = false;
   // 忽略音频焦点开关（默认开启：允许与其他应用同时播放音频）
@@ -256,7 +258,9 @@ class _SettingsPageState extends State<SettingsPage>
     );
     if (protocol == 'lyricon') {
       try {
-        await LyriconProviderService.instance.setDisplayTranslation(translation);
+        await LyriconProviderService.instance.setDisplayTranslation(
+          translation,
+        );
         await LyriconProviderService.instance.setDisplayRoma(roma);
       } catch (_) {}
     }
@@ -334,10 +338,10 @@ class _SettingsPageState extends State<SettingsPage>
     final pauseFadeEnabled = await _settingsRepository.getPauseFadeEnabled();
     final crossfadeEnabled = await _settingsRepository.getCrossfadeEnabled();
     final crossfadeSeconds = await _settingsRepository.getCrossfadeSeconds();
-    final volumeNormalizationEnabled =
-        await _settingsRepository.getVolumeNormalizationEnabled();
-    final volumeNormalizationLufs =
-        await _settingsRepository.getVolumeNormalizationReferenceLufs();
+    final volumeNormalizationEnabled = await _settingsRepository
+        .getVolumeNormalizationEnabled();
+    final volumeNormalizationLufs = await _settingsRepository
+        .getVolumeNormalizationReferenceLufs();
     final keepScreenOn = await _settingsRepository.getKeepScreenOn();
     final ignoreAudioFocus = await _settingsRepository.getIgnoreAudioFocus();
     final audioFocusInterruptionMode = await _settingsRepository
@@ -347,22 +351,25 @@ class _SettingsPageState extends State<SettingsPage>
     final spectrumStyle = await _settingsRepository.getSpectrumStyle();
     final spectrumBgOpacity = await _settingsRepository.getSpectrumBgOpacity();
     final spectrumBgHeight = await _settingsRepository.getSpectrumBgHeight();
-    final spectrumBarOpacity = await _settingsRepository.getSpectrumBarOpacity();
-    final spectrumCurveOpacity = await _settingsRepository.getSpectrumCurveOpacity();
-    final spectrumDynamicColor = await _settingsRepository.getSpectrumDynamicColor();
+    final spectrumBarOpacity = await _settingsRepository
+        .getSpectrumBarOpacity();
+    final spectrumCurveOpacity = await _settingsRepository
+        .getSpectrumCurveOpacity();
+    final spectrumDynamicColor = await _settingsRepository
+        .getSpectrumDynamicColor();
     final miniPlayerSwipeSwitch = await _settingsRepository
         .getMiniPlayerSwipeSwitchEnabled();
     final sortCollectedByLatestClick = await _settingsRepository
         .getSortCollectedByLatestClick();
-    final uploadListeningDuration =
-        await _settingsRepository.getUploadListeningDuration();
+    final uploadListeningDuration = await _settingsRepository
+        .getUploadListeningDuration();
     final zenCoverLongPress = await _settingsRepository.getZenCoverLongPress();
-    final landscapeImmersiveEnabled =
-        await _settingsRepository.getLandscapeImmersiveEnabled();
+    final landscapeImmersiveEnabled = await _settingsRepository
+        .getLandscapeImmersiveEnabled();
     final showQualityDowngradeToast = await _settingsRepository
         .getShowQualityDowngradeToast();
-    final closeLocalMusicComments =
-        await _settingsRepository.getCloseLocalMusicComments();
+    final closeLocalMusicComments = await _settingsRepository
+        .getCloseLocalMusicComments();
 
     setState(() {
       _wifiQuality = wifiQuality;
@@ -500,7 +507,9 @@ class _SettingsPageState extends State<SettingsPage>
             child: inSubpage
                 ? ListView(
                     children: [
-                      _buildSettingsCard(_buildActiveSectionContent(colorScheme)),
+                      _buildSettingsCard(
+                        _buildActiveSectionContent(colorScheme),
+                      ),
                       const SizedBox(height: 32),
                     ],
                   )
@@ -558,29 +567,25 @@ class _SettingsPageState extends State<SettingsPage>
 
   /// 分类条目：图标 + 标题 + 二级页面内容构建器
   List<(String, IconData, Widget Function(ColorScheme))> get _categories => [
-        ('外观', Icons.palette_outlined, _buildAppearanceSection),
-        ('播放页样式', Icons.music_note_outlined, _buildPlayerStyleSection),
-        ('歌词', Icons.lyrics_outlined, _buildLyricSection),
-        ('播放', Icons.play_circle_outline, _buildPlaybackSection),
-        (
-          'USB 独占',
-          Icons.usb,
-          (colorScheme) => UsbExclusiveSection(
-            onAutoPause: () => context.read<PlayerProvider>().pause(),
-          ),
-        ),
-        ('主页管理', Icons.tab_outlined, _buildTabManagementSection),
-        (
-          '桌面快捷方式',
-          Icons.bolt_outlined,
-          _buildDesktopShortcutSection,
-        ),
-        ('在线音乐', Icons.cloud_outlined, _buildOnlineMusicSection),
-        ('缓存与数据', Icons.storage_outlined, _buildCacheSection),
-        ('关于', Icons.info_outline, _buildAboutSection),
-        // 可选扩展：私有构建注入的额外分类（默认无）
-        ...?SettingsPage.extraCategories,
-      ];
+    ('外观', Icons.palette_outlined, _buildAppearanceSection),
+    ('播放页样式', Icons.music_note_outlined, _buildPlayerStyleSection),
+    ('歌词', Icons.lyrics_outlined, _buildLyricSection),
+    ('播放', Icons.play_circle_outline, _buildPlaybackSection),
+    (
+      'USB 独占',
+      Icons.usb,
+      (colorScheme) => UsbExclusiveSection(
+        onAutoPause: () => context.read<PlayerProvider>().pause(),
+      ),
+    ),
+    ('主页管理', Icons.tab_outlined, _buildTabManagementSection),
+    ('桌面快捷方式', Icons.bolt_outlined, _buildDesktopShortcutSection),
+    ('在线音乐', Icons.cloud_outlined, _buildOnlineMusicSection),
+    ('缓存与数据', Icons.storage_outlined, _buildCacheSection),
+    ('关于', Icons.info_outline, _buildAboutSection),
+    // 可选扩展：私有构建注入的额外分类（默认无）
+    ...?SettingsPage.extraCategories,
+  ];
 
   /// 二级页面内容：根据 _activeSection 匹配分类构建器
   Widget _buildActiveSectionContent(ColorScheme colorScheme) {
@@ -717,9 +722,9 @@ class _SettingsPageState extends State<SettingsPage>
         alignment: Alignment.centerLeft,
         child: Text(
           text,
-          style: Theme.of(context).textTheme.titleSmall?.copyWith(
-            color: colorScheme.onSurfaceVariant,
-          ),
+          style: Theme.of(
+            context,
+          ).textTheme.titleSmall?.copyWith(color: colorScheme.onSurfaceVariant),
         ),
       ),
     );
@@ -742,14 +747,14 @@ class _SettingsPageState extends State<SettingsPage>
             isExpanded: true,
             decoration: const InputDecoration(
               isDense: true,
-              contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              contentPadding: EdgeInsets.symmetric(
+                horizontal: 12,
+                vertical: 10,
+              ),
               border: OutlineInputBorder(),
             ),
             items: [
-              const DropdownMenuItem(
-                value: 'none',
-                child: Text('关闭'),
-              ),
+              const DropdownMenuItem(value: 'none', child: Text('关闭')),
               const DropdownMenuItem(
                 value: 'lyricon',
                 child: Text('Lyricon 词幕'),
@@ -821,13 +826,12 @@ class _SettingsPageState extends State<SettingsPage>
               ? const Text('LyricInfo 仅支持翻译，不支持罗马音')
               : null,
           value: _lyricPushRoma,
-          onChanged:
-              protocolActive && _lyricPushProtocol != 'lyric_info'
-                  ? (value) {
-                      // ignore: discarded_futures
-                      _setLyricPushRoma(value);
-                    }
-                  : null,
+          onChanged: protocolActive && _lyricPushProtocol != 'lyric_info'
+              ? (value) {
+                  // ignore: discarded_futures
+                  _setLyricPushRoma(value);
+                }
+              : null,
         ),
         // search: 优先 翻译
         SwitchListTile(
@@ -836,13 +840,12 @@ class _SettingsPageState extends State<SettingsPage>
               ? const Text('LyricInfo 仅支持翻译，无罗马音可选')
               : null,
           value: _lyricPushPreferTranslation,
-          onChanged:
-              protocolActive && _lyricPushProtocol != 'lyric_info'
-                  ? (value) {
-                      // ignore: discarded_futures
-                      _setLyricPushPreferTranslation(value);
-                    }
-                  : null,
+          onChanged: protocolActive && _lyricPushProtocol != 'lyric_info'
+              ? (value) {
+                  // ignore: discarded_futures
+                  _setLyricPushPreferTranslation(value);
+                }
+              : null,
         ),
         // ② 桌面歌词：悬浮窗锁定后点击穿透（无法点击自身解锁），
         // 且无法下拉通知栏时，可在此一键解锁悬浮窗。
@@ -1032,7 +1035,6 @@ class _SettingsPageState extends State<SettingsPage>
     );
   }
 
-
   Widget _buildAppearanceSection(ColorScheme colorScheme) {
     final themeProvider = context.read<ThemeProvider>();
     // 仅 ThemeMode.light 时禁用 OLED 开关；dark 与 system 均可勾选。
@@ -1129,11 +1131,11 @@ class _SettingsPageState extends State<SettingsPage>
               themeProvider.useCoverSeedColor
                   ? '跟随歌曲封面取色'
                   : ((themeProvider.useBackgroundImage &&
-                          themeProvider.useBackgroundMonet)
-                      ? '跟随背景图片取色'
-                      : (themeProvider.useDynamicColor
-                          ? '跟随系统壁纸取色'
-                          : '手动选择种子色')),
+                            themeProvider.useBackgroundMonet)
+                        ? '跟随背景图片取色'
+                        : (themeProvider.useDynamicColor
+                              ? '跟随系统壁纸取色'
+                              : '手动选择种子色')),
             ),
             trailing: Container(
               width: 24,
@@ -1187,9 +1189,7 @@ class _SettingsPageState extends State<SettingsPage>
               NavigationDestinationLabelBehavior.alwaysShow,
               NavigationDestinationLabelBehavior.onlyShowSelected,
               NavigationDestinationLabelBehavior.alwaysHide,
-            ].indexOf(
-              context.watch<ThemeProvider>().navLabelBehavior,
-            ),
+            ].indexOf(context.watch<ThemeProvider>().navLabelBehavior),
             onSelectedIndexChanged: (index) {
               if (index == null) return;
               const behaviors = [
@@ -1372,9 +1372,7 @@ class _SettingsPageState extends State<SettingsPage>
         SwitchListTile(
           title: const Text('文字阴影'),
           // 开关被置灰时才说明原因，可用状态下标题已表意
-          subtitle: _useBackgroundImage
-              ? null
-              : const Text('需先启用自定义背景图片'),
+          subtitle: _useBackgroundImage ? null : const Text('需先启用自定义背景图片'),
           value: _useTextShadow,
           onChanged: _useBackgroundImage
               ? (v) {
@@ -1435,8 +1433,18 @@ class _SettingsPageState extends State<SettingsPage>
   Future<void> _pickBackgroundImage() async {
     final path = await BackgroundImageLoader.pickBackgroundImage();
     if (path == null || path.isEmpty || !mounted) return;
+    final themeProvider = context.read<ThemeProvider>();
+    var force = false;
+    if (themeProvider.backgroundImagePath == path) {
+      // 原生端覆盖同一文件时路径不变，ImageCache 按路径做键会继续
+      // 命中旧解码结果；此处整体清缓存并强制刷新，保证立即换图。
+      PaintingBinding.instance.imageCache
+        ..clear()
+        ..clearLiveImages();
+      force = true;
+    }
     setState(() => _backgroundImagePath = path);
-    await context.read<ThemeProvider>().setBackgroundImagePath(path);
+    await themeProvider.setBackgroundImagePath(path, force: force);
     showToast('背景图片已设置，已自动莫奈取色', long: true);
   }
 
@@ -1521,7 +1529,9 @@ class _SettingsPageState extends State<SettingsPage>
           ListTile(
             title: const Text('写真背景透明度'),
             subtitle: M3ESlider(
-              decoration: const M3ESliderDecoration(haptic: M3EHapticFeedback.medium),
+              decoration: const M3ESliderDecoration(
+                haptic: M3EHapticFeedback.medium,
+              ),
               value: _artistPhotoOpacity,
               min: 0.0,
               max: 0.95,
@@ -1610,7 +1620,8 @@ class _SettingsPageState extends State<SettingsPage>
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
           child: M3ESlider(
             decoration: const M3ESliderDecoration(
-                haptic: M3EHapticFeedback.medium),
+              haptic: M3EHapticFeedback.medium,
+            ),
             value: _glowThresholdFactor,
             min: LyricPreferences.minGlowThresholdFactor,
             max: LyricPreferences.maxGlowThresholdFactor,
@@ -1664,9 +1675,7 @@ class _SettingsPageState extends State<SettingsPage>
         SwitchListTile(
           title: const Text('音乐频谱环绕'),
           // 平台不支持导致开关置灰时才提示，支持时无需额外说明
-          subtitle: Platform.isAndroid
-              ? null
-              : const Text('仅 Android 设备支持'),
+          subtitle: Platform.isAndroid ? null : const Text('仅 Android 设备支持'),
           value: _spectrumEnabled,
           onChanged: Platform.isAndroid
               ? (v) {
@@ -1746,7 +1755,9 @@ class _SettingsPageState extends State<SettingsPage>
             ListTile(
               title: const Text('频谱柱状图透明度'),
               subtitle: M3ESlider(
-                decoration: const M3ESliderDecoration(haptic: M3EHapticFeedback.medium),
+                decoration: const M3ESliderDecoration(
+                  haptic: M3EHapticFeedback.medium,
+                ),
                 value: _spectrumBarOpacity,
                 min: 0.1,
                 max: 1.0,
@@ -1766,7 +1777,9 @@ class _SettingsPageState extends State<SettingsPage>
             ListTile(
               title: const Text('频谱曲线透明度'),
               subtitle: M3ESlider(
-                decoration: const M3ESliderDecoration(haptic: M3EHapticFeedback.medium),
+                decoration: const M3ESliderDecoration(
+                  haptic: M3EHapticFeedback.medium,
+                ),
                 value: _spectrumCurveOpacity,
                 min: 0.1,
                 max: 1.0,
@@ -1787,7 +1800,9 @@ class _SettingsPageState extends State<SettingsPage>
           ListTile(
             title: const Text('频谱背景透明度'),
             subtitle: M3ESlider(
-              decoration: const M3ESliderDecoration(haptic: M3EHapticFeedback.medium),
+              decoration: const M3ESliderDecoration(
+                haptic: M3EHapticFeedback.medium,
+              ),
               value: _spectrumBgOpacity,
               min: 0.1,
               max: 0.8,
@@ -1806,7 +1821,9 @@ class _SettingsPageState extends State<SettingsPage>
           ListTile(
             title: const Text('频谱背景高度'),
             subtitle: M3ESlider(
-              decoration: const M3ESliderDecoration(haptic: M3EHapticFeedback.medium),
+              decoration: const M3ESliderDecoration(
+                haptic: M3EHapticFeedback.medium,
+              ),
               value: _spectrumBgHeight,
               min: 0.2,
               max: 0.8,
@@ -1961,9 +1978,12 @@ class _SettingsPageState extends State<SettingsPage>
         M3EToggleButtonGroupAction(label: Text('Hi-Res')),
       ],
       // 高音质码是 '320'（KuGou 合法值）；遗留 'hq' 归一化到 '320'
-      selectedIndex: const ['128', '320', 'flac', 'high'].indexOf(
-        value == 'hq' ? '320' : value,
-      ),
+      selectedIndex: const [
+        '128',
+        '320',
+        'flac',
+        'high',
+      ].indexOf(value == 'hq' ? '320' : value),
       onSelectedIndexChanged: (index) {
         if (index == null) return;
         const q = ['128', '320', 'flac', 'high'];
@@ -2016,32 +2036,23 @@ class _SettingsPageState extends State<SettingsPage>
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text(
-                '网络音质',
-                style: Theme.of(context).textTheme.titleMedium,
-              ),
+              Text('网络音质', style: Theme.of(context).textTheme.titleMedium),
               const SizedBox(height: 4),
               Text(
                 '分别设置 WiFi 与移动网络下的播放音质，随当前网络自动生效',
                 style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                      color: colorScheme.onSurfaceVariant,
-                    ),
+                  color: colorScheme.onSurfaceVariant,
+                ),
               ),
               const SizedBox(height: 16),
-              Text(
-                'WiFi 网络下',
-                style: Theme.of(context).textTheme.bodyMedium,
-              ),
+              Text('WiFi 网络下', style: Theme.of(context).textTheme.bodyMedium),
               const SizedBox(height: 8),
               _buildNetworkQualityGroup(
                 _wifiQuality,
                 (q) => _onNetworkQualityPicked(true, q),
               ),
               const SizedBox(height: 16),
-              Text(
-                '移动网络下',
-                style: Theme.of(context).textTheme.bodyMedium,
-              ),
+              Text('移动网络下', style: Theme.of(context).textTheme.bodyMedium),
               const SizedBox(height: 8),
               _buildNetworkQualityGroup(
                 _mobileQuality,
@@ -2135,8 +2146,9 @@ class _SettingsPageState extends State<SettingsPage>
           ListTile(
             title: const Text('参考响度'),
             subtitle: M3ESlider(
-              decoration:
-                  const M3ESliderDecoration(haptic: M3EHapticFeedback.medium),
+              decoration: const M3ESliderDecoration(
+                haptic: M3EHapticFeedback.medium,
+              ),
               value: _volumeNormalizationLufs,
               min: -20,
               max: -8,
@@ -2228,12 +2240,14 @@ class _SettingsPageState extends State<SettingsPage>
           ListTile(
             title: const Text('淡出时长'),
             subtitle: M3ESlider(
-              decoration:
-                  const M3ESliderDecoration(haptic: M3EHapticFeedback.medium),
+              decoration: const M3ESliderDecoration(
+                haptic: M3EHapticFeedback.medium,
+              ),
               value: _crossfadeSeconds.toDouble(),
               min: SettingsRepository.kCrossfadeMinSeconds.toDouble(),
               max: SettingsRepository.kCrossfadeMaxSeconds.toDouble(),
-              divisions: SettingsRepository.kCrossfadeMaxSeconds -
+              divisions:
+                  SettingsRepository.kCrossfadeMaxSeconds -
                   SettingsRepository.kCrossfadeMinSeconds,
               label: '$_crossfadeSeconds 秒',
               onChanged: (v) {
@@ -2267,10 +2281,7 @@ class _SettingsPageState extends State<SettingsPage>
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               // 与「默认音质」一致的标题排版
-              Text(
-                '失去音频焦点时',
-                style: Theme.of(context).textTheme.titleMedium,
-              ),
+              Text('失去音频焦点时', style: Theme.of(context).textTheme.titleMedium),
               const SizedBox(height: 8),
               // 与「默认音质」同款 M3E 按钮组；横排 + xs 尺寸 + 紧凑密度，文字过长省略
               M3EToggleButtonGroup(
@@ -2303,20 +2314,22 @@ class _SettingsPageState extends State<SettingsPage>
                 direction: Axis.horizontal,
                 size: M3EButtonSize.xs,
                 density: M3EButtonGroupDensity.compact,
-                selectedIndex: AudioFocusInterruptionMode.values
-                    .indexOf(_audioFocusInterruptionMode),
+                selectedIndex: AudioFocusInterruptionMode.values.indexOf(
+                  _audioFocusInterruptionMode,
+                ),
                 onSelectedIndexChanged: (index) {
                   if (index == null) return;
                   _onAudioFocusModeChanged(
-                      AudioFocusInterruptionMode.values[index]);
+                    AudioFocusInterruptionMode.values[index],
+                  );
                 },
               ),
               const SizedBox(height: 8),
               Text(
                 _audioFocusModeDescription(_audioFocusInterruptionMode),
                 style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                      color: colorScheme.onSurfaceVariant,
-                    ),
+                  color: colorScheme.onSurfaceVariant,
+                ),
               ),
             ],
           ),
@@ -2355,7 +2368,10 @@ class _SettingsPageState extends State<SettingsPage>
             final enabled = snapshot.data ?? false;
             // search: 画中画 pip 悬浮
             return SwitchListTile(
-              secondary: Icon(Icons.picture_in_picture_alt, color: colorScheme.primary),
+              secondary: Icon(
+                Icons.picture_in_picture_alt,
+                color: colorScheme.primary,
+              ),
               title: const Text('播放 MV 时自动画中画'),
               value: enabled,
               onChanged: (v) async {
@@ -2444,7 +2460,10 @@ class _SettingsPageState extends State<SettingsPage>
                   ),
                 )
               : Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 8,
+                    vertical: 4,
+                  ),
                   decoration: BoxDecoration(
                     color: colorScheme.primaryContainer,
                     borderRadius: BorderRadius.circular(12),
@@ -2478,7 +2497,9 @@ class _SettingsPageState extends State<SettingsPage>
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('重启本地 API 服务器'),
-        content: Text('确定要重启本地 Rust API 服务器吗？\n当前端口：$port\n重启后将重新分配随机端口。\n如果你遇到了玄学问题，那就重启一下试试吧（）'),
+        content: Text(
+          '确定要重启本地 Rust API 服务器吗？\n当前端口：$port\n重启后将重新分配随机端口。\n如果你遇到了玄学问题，那就重启一下试试吧（）',
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.of(ctx).pop(false),
@@ -2498,10 +2519,10 @@ class _SettingsPageState extends State<SettingsPage>
       final ok = await KugouApiServer.restart();
       if (!mounted) return;
       setState(() {});
-      showToast(ok
-          ? '已重启，新端口：${KugouApiServer.currentPort}'
-          : '重启失败，服务器未就绪',
-          long: true);
+      showToast(
+        ok ? '已重启，新端口：${KugouApiServer.currentPort}' : '重启失败，服务器未就绪',
+        long: true,
+      );
     } catch (e) {
       if (!mounted) return;
       setState(() {});
@@ -2606,8 +2627,9 @@ class _SettingsPageState extends State<SettingsPage>
         FutureBuilder<String>(
           future: _readCurrentRenderEngine(),
           builder: (context, snap) {
-            final engine =
-                snap.data == null ? 'skia' : (snap.data == 'impeller' ? 'Impeller' : 'Skia');
+            final engine = snap.data == null
+                ? 'skia'
+                : (snap.data == 'impeller' ? 'Impeller' : 'Skia');
             return ListTile(
               leading: Icon(
                 Icons.high_quality_outlined,
@@ -2623,8 +2645,8 @@ class _SettingsPageState extends State<SettingsPage>
           child: Text(
             '渲染引擎在应用构建时确定，运行中无法切换。\n· Skia 版：兼容性优先，适用于 32 位/老旧设备\n· Impeller 版：图形更流畅，适用于新设备\n如需切换，请安装对应构建版本。',
             style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                  color: colorScheme.onSurfaceVariant,
-                ),
+              color: colorScheme.onSurfaceVariant,
+            ),
           ),
         ),
         // ② 帮助
@@ -2990,46 +3012,46 @@ class _TabManagementPanel extends StatelessWidget {
             final isHidden = hiddenTabs.contains(tab.id);
             // search: -
             return ListTile(
-                    key: ValueKey(tab.id),
-                    leading: Icon(
-                      _tabIconForId(tab.id),
-                      color: isHidden
-                          ? colorScheme.onSurfaceVariant
-                          : colorScheme.primary,
-                    ),
-                    title: Text(
-                      tab.label,
+              key: ValueKey(tab.id),
+              leading: Icon(
+                _tabIconForId(tab.id),
+                color: isHidden
+                    ? colorScheme.onSurfaceVariant
+                    : colorScheme.primary,
+              ),
+              title: Text(
+                tab.label,
+                style: TextStyle(
+                  color: isHidden ? colorScheme.onSurfaceVariant : null,
+                ),
+              ),
+              subtitle: !tab.isRemovable
+                  ? Text(
+                      '必显示',
                       style: TextStyle(
-                        color: isHidden ? colorScheme.onSurfaceVariant : null,
+                        fontSize: 12,
+                        color: colorScheme.onSurfaceVariant,
                       ),
+                    )
+                  : null,
+              trailing: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (tab.isRemovable)
+                    Switch(
+                      value: !isHidden,
+                      onChanged: (_) {
+                        HapticFeedback.lightImpact();
+                        tabConfig.toggleTabVisibility(tab.id);
+                      },
                     ),
-                    subtitle: !tab.isRemovable
-                        ? Text(
-                            '必显示',
-                            style: TextStyle(
-                              fontSize: 12,
-                              color: colorScheme.onSurfaceVariant,
-                            ),
-                          )
-                        : null,
-                    trailing: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        if (tab.isRemovable)
-                          Switch(
-                            value: !isHidden,
-                            onChanged: (_) {
-                              HapticFeedback.lightImpact();
-                              tabConfig.toggleTabVisibility(tab.id);
-                            },
-                          ),
-                        Icon(
-                          Icons.drag_handle,
-                          size: 20,
-                          color: colorScheme.onSurfaceVariant,
-                        ),
-                      ],
-                    ),
+                  Icon(
+                    Icons.drag_handle,
+                    size: 20,
+                    color: colorScheme.onSurfaceVariant,
+                  ),
+                ],
+              ),
             );
           },
         ),
@@ -3143,36 +3165,36 @@ class _DesktopShortcutPanel extends StatelessWidget {
             final isHidden = hiddenIds.contains(shortcut.id);
             // search: -
             return ListTile(
-                    key: ValueKey(shortcut.id),
-                    leading: Icon(
-                      _tabIconForId(shortcut.id),
-                      color: isHidden
-                          ? colorScheme.onSurfaceVariant
-                          : colorScheme.primary,
-                    ),
-                    title: Text(
-                      shortcut.label,
-                      style: TextStyle(
-                        color: isHidden ? colorScheme.onSurfaceVariant : null,
-                      ),
-                    ),
-                    trailing: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Switch(
-                          value: !isHidden,
-                          onChanged: (_) {
-                            HapticFeedback.lightImpact();
-                            shortcutConfig.toggleShortcutVisibility(shortcut.id);
-                          },
-                        ),
-                        Icon(
-                          Icons.drag_handle,
-                          size: 20,
-                          color: colorScheme.onSurfaceVariant,
-                        ),
-                      ],
-                    ),
+              key: ValueKey(shortcut.id),
+              leading: Icon(
+                _tabIconForId(shortcut.id),
+                color: isHidden
+                    ? colorScheme.onSurfaceVariant
+                    : colorScheme.primary,
+              ),
+              title: Text(
+                shortcut.label,
+                style: TextStyle(
+                  color: isHidden ? colorScheme.onSurfaceVariant : null,
+                ),
+              ),
+              trailing: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Switch(
+                    value: !isHidden,
+                    onChanged: (_) {
+                      HapticFeedback.lightImpact();
+                      shortcutConfig.toggleShortcutVisibility(shortcut.id);
+                    },
+                  ),
+                  Icon(
+                    Icons.drag_handle,
+                    size: 20,
+                    color: colorScheme.onSurfaceVariant,
+                  ),
+                ],
+              ),
             );
           },
         ),
@@ -3620,7 +3642,10 @@ class _DisplayScaleTileState extends State<_DisplayScaleTile> {
   Widget build(BuildContext context) {
     final colorScheme = Theme.of(context).colorScheme;
     final applied = context.watch<ThemeProvider>().displayScale;
-    final value = (_pending ?? applied).clamp(kMinDisplayScale, kMaxDisplayScale);
+    final value = (_pending ?? applied).clamp(
+      kMinDisplayScale,
+      kMaxDisplayScale,
+    );
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [

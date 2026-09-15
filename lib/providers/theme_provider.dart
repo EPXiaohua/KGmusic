@@ -579,8 +579,10 @@ class ThemeProvider extends ChangeNotifier {
   ///
   /// 路径变化时清空旧取色结果，由 app.dart 桥接异步重新提取并调用
   /// [setBackgroundSeedColor]。传 null 表示清除背景图。
-  Future<void> setBackgroundImagePath(String? path) async {
-    if (_backgroundImagePath == path) return;
+  /// [force] 为 true 时即使路径相同也通知刷新（配合 imageCache 清除，
+  /// 兼容原生端覆盖同一文件的实现）。
+  Future<void> setBackgroundImagePath(String? path, {bool force = false}) async {
+    if (!force && _backgroundImagePath == path) return;
     _backgroundImagePath = path;
     _backgroundSeedColor = null;
     notifyListeners();
