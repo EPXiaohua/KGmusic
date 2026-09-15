@@ -8,11 +8,7 @@ import 'package:flutter/services.dart';
 /// - [FontSource.bundled]：已废弃（内置 SimHei 已移除，仅保留枚举值以稳定
 ///   `fontSource.index` 的原生契约 0=system 1=bundled 2=custom），行为等同 system
 /// - [FontSource.custom]：使用用户通过 SAF 选择的 TTF/OTF 文件
-enum FontSource {
-  system,
-  bundled,
-  custom,
-}
+enum FontSource { system, bundled, custom }
 
 /// 自定义字体加载与选择服务。
 ///
@@ -28,6 +24,9 @@ class CustomFontLoader {
   /// 注册到 Flutter 的自定义字体 family 名前缀（每次加载追加计数器）
   static const String customFontFamily = 'UserCustomFont';
   static int _loadCounter = 0;
+
+  /// 最近一次 loadIfAvailable 失败的原因（供 UI 提示，诊断用）
+  static String? lastLoadError;
 
   static const String _channel = 'com.md3music.md3music/font_picker';
 
@@ -53,10 +52,15 @@ class CustomFontLoader {
   /// - path 为 null / 文件不存在 / 不是 TTF
   /// - FontLoader.load() 抛异常
   static Future<String?> loadIfAvailable(String? fontPath) async {
-    if (fontPath == null || fontPath.isEmpty) return null;
+    lastLoadError = null;
+    if (fontPath == null || fontPath.isEmpty) {
+      lastLoadError = '路径为空';
+      return null;
+    }
     final file = File(fontPath);
     if (!file.existsSync()) {
       print('[CustomFontLoader] 字体文件不存在: $fontPath');
+      lastLoadError = '文件不存在';
       return null;
     }
     try {
@@ -70,6 +74,7 @@ class CustomFontLoader {
       return familyName;
     } catch (e) {
       print('[CustomFontLoader] 字体加载失败: $e');
+      lastLoadError = e.toString();
       return null;
     }
   }
@@ -83,8 +88,7 @@ class CustomFontLoader {
     try {
       final channel = MethodChannel(_channel);
       return await channel.invokeMethod<String>('pickFontFile');
-    } catch (e) {
-      print('[CustomFontLoader] pick error: $e');
+    } catch (_) {
       return null;
     }
   }

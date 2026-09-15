@@ -119,7 +119,9 @@ class ThemeProvider extends ChangeNotifier {
     if (_useCoverSeedColor && _coverSeedColor != null) {
       return _coverSeedColor!;
     }
-    if (_useBackgroundImage && _useBackgroundMonet && _backgroundSeedColor != null) {
+    if (_useBackgroundImage &&
+        _useBackgroundMonet &&
+        _backgroundSeedColor != null) {
       return _backgroundSeedColor!;
     }
     if (_useDynamicColor && _systemSeedColor != null) {
@@ -161,7 +163,9 @@ class ThemeProvider extends ChangeNotifier {
   Future<void> _loadThemeMode() async {
     final prefs = await SharedPreferences.getInstance();
     final savedIndex = prefs.getInt(_key);
-    if (savedIndex != null && savedIndex >= 0 && savedIndex < ThemeMode.values.length) {
+    if (savedIndex != null &&
+        savedIndex >= 0 &&
+        savedIndex < ThemeMode.values.length) {
       _themeMode = ThemeMode.values[savedIndex];
       notifyListeners();
     }
@@ -421,7 +425,9 @@ class ThemeProvider extends ChangeNotifier {
   }
 
   /// 设置底部导航栏文字显示行为并持久化。
-  Future<void> setNavLabelBehavior(NavigationDestinationLabelBehavior value) async {
+  Future<void> setNavLabelBehavior(
+    NavigationDestinationLabelBehavior value,
+  ) async {
     if (_navLabelBehavior == value) return;
     _navLabelBehavior = value;
     notifyListeners();
@@ -575,13 +581,16 @@ class ThemeProvider extends ChangeNotifier {
     await prefs.setDouble(_textShadowBlurKey, clamped);
   }
 
-  /// 设置背景图片路径（原生端拷贝到 filesDir 后的真实路径）。
+  /// 设置背景图片路径（原生端拷贝到沙盒后返回的真实路径）。
   ///
   /// 路径变化时清空旧取色结果，由 app.dart 桥接异步重新提取并调用
   /// [setBackgroundSeedColor]。传 null 表示清除背景图。
   /// [force] 为 true 时即使路径相同也通知刷新（配合 imageCache 清除，
   /// 兼容原生端覆盖同一文件的实现）。
-  Future<void> setBackgroundImagePath(String? path, {bool force = false}) async {
+  Future<void> setBackgroundImagePath(
+    String? path, {
+    bool force = false,
+  }) async {
     if (!force && _backgroundImagePath == path) return;
     _backgroundImagePath = path;
     _backgroundSeedColor = null;

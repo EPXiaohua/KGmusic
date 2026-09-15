@@ -128,11 +128,17 @@ import UniformTypeIdentifiers
       let dir = docs.appendingPathComponent("fonts", isDirectory: true)
       try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
       let ext = src.pathExtension.isEmpty ? "ttf" : src.pathExtension
-      let dst = dir.appendingPathComponent("user_custom.\(ext)")
-      if FileManager.default.fileExists(atPath: dst.path) {
-        try FileManager.default.removeItem(at: dst)
-      }
+      // 关键：时间戳唯一命名（对齐背景图 bg_<ts> 实现）。固定文件名 user_custom.ttf
+      // 会让 Dart 端 setCustomFontPath 判定路径未变化而跳过重新加载，第二次换字体不生效。
+      let name = "font_\(Int(Date().timeIntervalSince1970 * 1000)).\(ext)"
+      let dst = dir.appendingPathComponent(name)
       try FileManager.default.copyItem(at: src, to: dst)
+      // 清理旧字体文件，只保留刚拷贝的一份
+      if let files = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) {
+        for old in files where old.isFileURL && old.path != dst.path {
+          try? FileManager.default.removeItem(at: old)
+        }
+      }
       result(dst.path)
     } catch {
       result(FlutterError(code: "FONT_COPY_FAILED", message: error.localizedDescription, details: nil))
