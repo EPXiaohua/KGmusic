@@ -133,9 +133,14 @@ import UniformTypeIdentifiers
       let name = "font_\(Int(Date().timeIntervalSince1970 * 1000)).\(ext)"
       let dst = dir.appendingPathComponent(name)
       try FileManager.default.copyItem(at: src, to: dst)
-      // 清理旧字体文件，只保留刚拷贝的一份
+      // 清理旧字体文件，只保留刚拷贝的一份。
+      // 注意：必须用 lastPathComponent（文件名）比较，contentsOfDirectory 返回的
+      // 路径拼写（/private 前缀等）与 dst.path 可能不同，整条路径比较会把
+      // 刚写入的文件误判为旧文件删除掉。
       if let files = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) {
-        for old in files where old.isFileURL && old.path != dst.path {
+        for old in files where old.isFileURL
+            && old.lastPathComponent != dst.lastPathComponent
+            && (old.lastPathComponent.hasPrefix("font_") || old.lastPathComponent.hasPrefix("user_custom")) {
           try? FileManager.default.removeItem(at: old)
         }
       }
@@ -206,9 +211,12 @@ import UniformTypeIdentifiers
           return
         }
         try data.write(to: dst)
-        // 写入成功后清理旧背景文件，避免累积（只保留刚写的一份）
+        // 写入成功后清理旧背景文件，避免累积（只保留刚写的一份）。
+        // 同字体清理：必须用文件名比较，整条路径比较会误删刚写入的文件。
         if let files = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) {
-          for old in files where old.isFileURL && old.path != dst.path {
+          for old in files where old.isFileURL
+              && old.lastPathComponent != dst.lastPathComponent
+              && (old.lastPathComponent.hasPrefix("bg_") || old.lastPathComponent == "background.jpg") {
             try? FileManager.default.removeItem(at: old)
           }
         }
