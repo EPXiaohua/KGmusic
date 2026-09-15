@@ -72,8 +72,14 @@ import UniformTypeIdentifiers
       return
     }
     pendingResult = result
+    // UTType 没有字体静态成员，用标准 UTI 构造：ttf / otf / 通用字体
+    let fontTypes = [
+      UTType("public.truetype-ttf"),
+      UTType("public.opentype-font"),
+      UTType("public.font"),
+    ].compactMap { $0 }
     let picker = UIDocumentPickerViewController(
-      forOpeningContentTypes: [.truetypeFont, .openTypeFont], asCopy: true)
+      forOpeningContentTypes: fontTypes, asCopy: true)
     picker.delegate = self
     picker.allowsMultipleSelection = false
     presenter?.present(picker, animated: true)
