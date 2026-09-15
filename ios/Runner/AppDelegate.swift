@@ -188,10 +188,10 @@ import UniformTypeIdentifiers
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         let dir = docs.appendingPathComponent("background", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let dst = dir.appendingPathComponent("background.jpg")
-        if FileManager.default.fileExists(atPath: dst.path) {
-          try FileManager.default.removeItem(at: dst)
-        }
+        // 关键：时间戳唯一命名（对齐 Android 端 bg_<ts> 实现）。
+        // 固定文件名会让 Flutter Image.file 按路径命中旧缓存，更换图片后仍显示第一张。
+        let name = "bg_\(Int(Date().timeIntervalSince1970 * 1000)).jpg"
+        let dst = dir.appendingPathComponent(name)
         guard let data = image.jpegData(compressionQuality: 0.95) else {
           DispatchQueue.main.async {
             self.pendingResult = nil
@@ -200,6 +200,12 @@ import UniformTypeIdentifiers
           return
         }
         try data.write(to: dst)
+        // 写入成功后清理旧背景文件，避免累积（只保留刚写的一份）
+        if let files = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) {
+          for old in files where old.isFile && old.absolutePath != dst.path {
+            try? FileManager.default.removeItem(at: old)
+          }
+        }
         DispatchQueue.main.async {
           self.pendingResult = nil
           result(dst.path)
