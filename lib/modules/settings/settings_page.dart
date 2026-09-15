@@ -1445,10 +1445,7 @@ class _SettingsPageState extends State<SettingsPage>
     }
     setState(() => _backgroundImagePath = path);
     await themeProvider.setBackgroundImagePath(path, force: force);
-    // 临时诊断：显示实际返回的文件名与文件状态，定位换图不生效问题后移除
-    final fileName = path.split('/').last;
-    final fileOk = File(path).existsSync();
-    showToast('背景图片已设置: $fileName (${fileOk ? "文件OK" : "文件缺失!"})', long: true);
+    showToast('背景图片已设置，已自动莫奈取色', long: true);
   }
 
   /// 清除背景图片：删除本地文件并回到内置默认壁纸（开关保持开启，
@@ -1967,17 +1964,7 @@ class _SettingsPageState extends State<SettingsPage>
     await themeProvider.setFontSource(FontSource.custom);
     if (!mounted) return;
     final loaded = themeProvider.effectiveFontFamily != null;
-    if (loaded) {
-      showToast('已应用自定义字体', long: true);
-    } else {
-      // 临时诊断：显示文件状态与加载失败原因，定位问题后移除
-      final f = File(path);
-      final state = f.existsSync() ? '${f.lengthSync()}B' : '文件缺失';
-      showToast(
-        '字体加载失败: ${CustomFontLoader.lastLoadError ?? "未知"} ($state)',
-        long: true,
-      );
-    }
+    showToast(loaded ? '已应用自定义字体' : '字体加载失败，已降级为系统字体', long: true);
   }
 
   /// 单个网络的音质四选一按钮组（WiFi / 移动网络共用）。

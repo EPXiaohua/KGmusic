@@ -25,9 +25,6 @@ class CustomFontLoader {
   static const String customFontFamily = 'UserCustomFont';
   static int _loadCounter = 0;
 
-  /// 最近一次 loadIfAvailable 失败的原因（供 UI 提示，诊断用）
-  static String? lastLoadError;
-
   static const String _channel = 'com.md3music.md3music/font_picker';
 
   /// 从持久化的字符串名还原 [FontSource]，无效时回退到 [FontSource.system]
@@ -52,15 +49,10 @@ class CustomFontLoader {
   /// - path 为 null / 文件不存在 / 不是 TTF
   /// - FontLoader.load() 抛异常
   static Future<String?> loadIfAvailable(String? fontPath) async {
-    lastLoadError = null;
-    if (fontPath == null || fontPath.isEmpty) {
-      lastLoadError = '路径为空';
-      return null;
-    }
+    if (fontPath == null || fontPath.isEmpty) return null;
     final file = File(fontPath);
     if (!file.existsSync()) {
       print('[CustomFontLoader] 字体文件不存在: $fontPath');
-      lastLoadError = '文件不存在';
       return null;
     }
     try {
@@ -74,7 +66,6 @@ class CustomFontLoader {
       return familyName;
     } catch (e) {
       print('[CustomFontLoader] 字体加载失败: $e');
-      lastLoadError = e.toString();
       return null;
     }
   }
