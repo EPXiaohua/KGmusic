@@ -26,6 +26,8 @@ libc = "0.2"
 qrcode = { version = "0.14.0", features = ["image"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 # log 为日志门面：Android 由 android_logger 输出到 logcat；桌面未接 logger 时宏为 no-op
+# 注意：必须放在全平台依赖里——playlist.rs 等模块直接调用 log::info!，
+# 若只声明在 android target 下，iOS / 桌面构建会报 unresolved crate `log`
 log = "0.4"
 
 # jni 仅 Android 需要（JNI 导出符号），桌面构建不引入，避免无谓编译与符号污染

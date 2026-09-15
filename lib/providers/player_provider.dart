@@ -65,10 +65,6 @@ const _legacyQualityMap = <String, String>{
   'hires': 'high',
 };
 
-/// 冷启动恢复播放状态时置 true：让 MiniPlayer 首次出现「直接满显示、不播放入场动画」，
-/// 避免启动期入场动画偶发未完整淡出、背景色遮罩残留导致内容偏灰。由 MiniPlayer 消费后清零。
-bool kMiniPlayerSkipNextEntrance = false;
-
 class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
   // 播放源开始/停止时的旁路回调。公开构建不注入，均为空操作。
   static Future<String?> Function(String hash, String quality)?
@@ -185,12 +181,6 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
   Song? get currentSong => _currentSong;
   bool get isPlaying => _isPlaying;
 
-  /// 播放流未就绪（processingState != ready，含 loading/buffering）。
-  /// 切歌加载走 loading 而非 buffering，故必须用 != ready 判定，
-  /// 否则切歌加载期间歌词逐字动画会"前进→回吸"锯齿抽搐。
-  bool get isPlaybackNotReady => _playbackNotReady;
-  bool _playbackNotReady = false;
-
   /// audio_service 实例（歌曲信息页读取源格式用）。
   dynamic get audioService => _audioService;
 
@@ -289,8 +279,6 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
   StreamSubscription<bool>? _playingSubscription;
   StreamSubscription<just_audio.PlayerState>? _playerStateSubscription;
   StreamSubscription<just_audio.SequenceState?>? _sequenceStateSubscription;
-  /// 播放器错误订阅（进诊断日志，App 生命周期级）。
-  StreamSubscription<dynamic>? _playerErrorSubscription;
   StreamSubscription<double>? _speedSubscription;
 
   dynamic _audioService;
@@ -637,8 +625,6 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       }
 
       _currentSong = state.currentSong;
-      // 冷启动恢复出上次播放的歌：标记让 MiniPlayer 首次出现直接满显示、不弹入场动画
-      if (_currentSong != null) kMiniPlayerSkipNextEntrance = true;
       _playlist = List.from(state.playlist);
       _originalPlaylist = List.from(state.playlist);
       _currentIndex = state.currentIndex;
@@ -821,32 +807,10 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
         }
       }, onError: (e) {});
 
-      // ExoPlayer/播放器错误进诊断日志（app.log 随诊断报告导出）；
-      // 192k 等超能力格式的 renderer 停喂/error 状态定位依赖此日志
-      try {
-        _playerErrorSubscription =
-            _audioService.player.errorStream.listen((e) {
-          debugPrint(
-              '[UsbDiag] player error: code=${e.code} message="${e.message}"');
-        });
-      } catch (_) {
-        // 动态类型模块无 player/errorStream 时忽略
-      }
-
       _playerStateSubscription = _audioService.playerStateStream.listen((
         playerState,
       ) {
         try {
-          // 播放流未就绪跟踪：loading/buffering 期间 position 冻结且不可靠，
-          // 歌词逐字动画冻结（语义对齐暂停）。processingState 变化必发
-          // playerState 事件（→ready 无残留），无需在切歌路径手动重置。
-          final bool notReady =
-              playerState.processingState !=
-              just_audio.ProcessingState.ready;
-          if (notReady != _playbackNotReady) {
-            _playbackNotReady = notReady;
-            notifyListeners();
-          }
           if (playerState.processingState ==
               just_audio.ProcessingState.completed) {
             _handlePlaybackCompleted();
@@ -2456,20 +2420,16 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       PlayerProvider.onPlaybackSourceStopped?.call(_currentSong!.id);
     }
 
-    // 已到末尾且非列表循环,停止播放(不静默跳到下一首)。
-    // 单曲循环例外：手动"下一首"必须能切歌（自动重播由 _handlePlaybackCompleted
-    // 负责，这里不再拦截）——多首歌时经下方循环绕回队首，仅一首时重播当前曲，
-    // 与"上一首"按钮的绕回行为对称
+    if (_loopMode == AppLoopMode.one) {
+      await seek(Duration.zero);
+      if (autoPlay) await _audioService?.play();
+      return;
+    }
+
+    // 已到末尾且非列表循环,停止播放(不静默跳到下一首)
     if (_currentIndex >= _playlist.length - 1 && _loopMode != AppLoopMode.all) {
-      if (_loopMode != AppLoopMode.one) {
-        await _audioService?.pause();
-        return;
-      }
-      if (_playlist.length == 1) {
-        await seek(Duration.zero);
-        if (autoPlay) await _audioService?.play();
-        return;
-      }
+      await _audioService?.pause();
+      return;
     }
 
     final startIndex = _currentIndex;
@@ -3625,7 +3585,6 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     _playingSubscription?.cancel();
     _playerStateSubscription?.cancel();
     _sequenceStateSubscription?.cancel();
-    _playerErrorSubscription?.cancel();
     _speedSubscription?.cancel();
     _sleepTimerTicker?.cancel();
     _sleepTimerTicker = null;

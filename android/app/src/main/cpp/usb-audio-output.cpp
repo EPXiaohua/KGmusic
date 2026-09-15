@@ -16,11 +16,9 @@
 #include <android/log.h>
 #include <cerrno>
 #include <cmath>
-#include <cstdarg>
 #include <cstdlib>
 #include <cstring>
 #include <new>
-#include <pthread.h>
 #include <unistd.h>
 #include <time.h>
 #include <sys/ioctl.h>
@@ -31,39 +29,9 @@
 #endif
 
 #define TAG "UsbAudioOutput"
-
-// ── 内部环形日志（诊断导出） ─────────────────────────────────
-// 用户无法抓 logcat 时，通过 JNI 把最近 N 条 native 日志导出到诊断面板。
-// LOGI/LOGW/LOGE 宏双写：logcat 行为不变，同时写入内存环形缓冲。
-#define USB_LOG_LINES 500
-#define USB_LOG_LINE_LEN 192
-static char usbLogRing[USB_LOG_LINES][USB_LOG_LINE_LEN];
-static int usbLogHead = 0;
-static int usbLogCount = 0;
-static pthread_mutex_t usbLogMutex = PTHREAD_MUTEX_INITIALIZER;
-
-static void usbLog(const char *fmt, ...) {
-    char line[USB_LOG_LINE_LEN];
-    va_list args;
-    va_start(args, fmt);
-    vsnprintf(line, sizeof(line), fmt, args);
-    va_end(args);
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    struct tm tmBuf;
-    char stamp[16];
-    strftime(stamp, sizeof(stamp), "%H:%M:%S", localtime_r(&ts.tv_sec, &tmBuf));
-    pthread_mutex_lock(&usbLogMutex);
-    snprintf(usbLogRing[usbLogHead], USB_LOG_LINE_LEN, "%s.%03ld %s",
-             stamp, ts.tv_nsec / 1000000, line);
-    usbLogHead = (usbLogHead + 1) % USB_LOG_LINES;
-    if (usbLogCount < USB_LOG_LINES) usbLogCount++;
-    pthread_mutex_unlock(&usbLogMutex);
-}
-
-#define LOGI(...) do { __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__); usbLog(__VA_ARGS__); } while (0)
-#define LOGW(...) do { __android_log_print(ANDROID_LOG_WARN,  TAG, __VA_ARGS__); usbLog(__VA_ARGS__); } while (0)
-#define LOGE(...) do { __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__); usbLog(__VA_ARGS__); } while (0)
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
 // 鈹€鈹€ Float 鈫?PCM conversion 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
@@ -110,19 +78,15 @@ static void convertFloatToInt32(const float *src, uint8_t *dst, int n) {
 // 鈹€鈹€ Ring buffer management 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 /**
- * Allocate URB slots in the ring buffer.
+ * Allocate all URB slots in the ring buffer.
  * Called once at stream creation. All memory stays alive until destroy.
- * 每槽缓冲动态分配：full-speed 下每 URB = 8 packets × maxPacket（如 96k/24bit 立体声
- * = 8×576 = 4608B > 静态 4096），必须按 maxPacket 计算，避免 memcpy 溢出。
  */
 static bool allocRing(UsbAudioContext *ctx) {
     size_t urbStructSize = sizeof(struct usbdevfs_urb) +
                            USB_AUDIO_PACKETS_PER_URB * sizeof(struct usbdevfs_iso_packet_desc);
-    size_t bufSize = (size_t)ctx->maxPacketSize * USB_AUDIO_PACKETS_PER_URB;
-    if (bufSize < USB_AUDIO_URB_BUFFER_SIZE) bufSize = USB_AUDIO_URB_BUFFER_SIZE;
-    for (int i = 0; i < ctx->numUrbs; i++) {
+    for (int i = 0; i < USB_AUDIO_NUM_URBS; i++) {
         ctx->ring[i].urb = (struct usbdevfs_urb *)calloc(1, urbStructSize);
-        ctx->ring[i].buffer = (uint8_t *)malloc(bufSize);
+        ctx->ring[i].buffer = (uint8_t *)malloc(USB_AUDIO_URB_BUFFER_SIZE);
         ctx->ring[i].dataLength = 0;
         if (!ctx->ring[i].urb || !ctx->ring[i].buffer) {
             LOGE("allocRing: OOM at slot %d", i);
@@ -130,8 +94,6 @@ static bool allocRing(UsbAudioContext *ctx) {
             for (int j = 0; j <= i; j++) {
                 free(ctx->ring[j].urb);
                 free(ctx->ring[j].buffer);
-                ctx->ring[j].urb = nullptr;
-                ctx->ring[j].buffer = nullptr;
             }
             return false;
         }
@@ -145,7 +107,7 @@ static bool allocRing(UsbAudioContext *ctx) {
  */
 static void freeRing(UsbAudioContext *ctx) {
     if (!ctx->ringAllocated) return;
-    for (int i = 0; i < ctx->numUrbs; i++) {
+    for (int i = 0; i < USB_AUDIO_NUM_URBS; i++) {
         free(ctx->ring[i].urb);
         free(ctx->ring[i].buffer);
         ctx->ring[i].urb = nullptr;
@@ -243,8 +205,7 @@ static void handleFeedbackCompletion(UsbAudioContext *ctx) {
         double newFpmf = raw / 65536.0;
 
         // Sanity check: feedback should be within 卤1% of nominal
-        // nominal = 每 ISO packet 的帧数（full-speed 1ms 帧 / high-speed 125µs microframe）
-        double nominal = ctx->sampleRate / (ctx->fullSpeed ? 1000.0 : 8000.0);
+        double nominal = ctx->sampleRate / 8000.0;
         if (newFpmf > nominal * 0.99 && newFpmf < nominal * 1.01) {
             ctx->calibratedFpmf = newFpmf;
             // Log only every 10000th feedback 鈥?logging in the audio path is expensive
@@ -293,7 +254,7 @@ static int submitRingUrb(UsbAudioContext *ctx, const int *pktSizes, int numPacke
         return -1;
     }
 
-    ctx->submitIdx = (ctx->submitIdx + 1) % ctx->numUrbs;
+    ctx->submitIdx = (ctx->submitIdx + 1) % USB_AUDIO_NUM_URBS;
     ctx->urbsInFlight++;
     return 0;
 }
@@ -380,7 +341,7 @@ static int drainAllUrbs(UsbAudioContext *ctx) {
         // Phase 2: DISCARD all remaining URBs first
         int toDiscard = ctx->urbsInFlight;
         for (int i = 0; i < toDiscard; i++) {
-            int slotIdx = (ctx->reapIdx + i) % ctx->numUrbs;
+            int slotIdx = (ctx->reapIdx + i) % USB_AUDIO_NUM_URBS;
             ioctl(ctx->fd, USBDEVFS_DISCARDURB, ctx->ring[slotIdx].urb);
         }
 
@@ -437,10 +398,9 @@ extern "C" {
 JNIEXPORT jlong JNICALL
 Java_com_md3music_md3music_UsbAudioStream_nativeUsbAudioCreate(
         JNIEnv *, jobject, jint fd, jint ifId, jint epOut, jint epFb,
-        jint rate, jint ch, jint bits, jint maxPkt, jboolean fullSpeed) {
-    LOGI("Create: fd=%d ep=0x%02x rate=%d ch=%d bits=%d maxPkt=%d %s",
-         fd, epOut, rate, ch, bits, maxPkt,
-         fullSpeed == JNI_TRUE ? "full-speed" : "high-speed");
+        jint rate, jint ch, jint bits, jint maxPkt) {
+    LOGI("Create: fd=%d ep=0x%02x rate=%d ch=%d bits=%d maxPkt=%d",
+         fd, epOut, rate, ch, bits, maxPkt);
     auto *ctx = new(std::nothrow) UsbAudioContext();
     if (!ctx) return 0;
     ctx->fd = fd;
@@ -453,10 +413,6 @@ Java_com_md3music_md3music_UsbAudioStream_nativeUsbAudioCreate(
     ctx->bytesPerSample = bits / 8;
     ctx->bytesPerFrame = (bits / 8) * ch;
     ctx->maxPacketSize = maxPkt;
-    // 设备速度决定包调度语义：full-speed 每 1ms 帧 1 个 ISO packet（帧数 = rate/1000），
-    // high-speed 每 125µs microframe 1 packet（帧数 = rate/8000）。装错速度 → 数据率差 8 倍。
-    ctx->fullSpeed = (fullSpeed == JNI_TRUE);
-    ctx->numUrbs = ctx->fullSpeed ? USB_AUDIO_NUM_URBS_FULLSPEED : USB_AUDIO_NUM_URBS;
     ctx->running.store(false);
     ctx->transferBuffer = nullptr;
     ctx->transferBufferCapacity = 0;
@@ -467,7 +423,7 @@ Java_com_md3music_md3music_UsbAudioStream_nativeUsbAudioCreate(
     ctx->urbsInFlight = 0;
     ctx->ringAllocated = false;
     ctx->frameAccumulator = 0.0;
-    ctx->calibratedFpmf = rate / (ctx->fullSpeed ? 1000.0 : 8000.0);
+    ctx->calibratedFpmf = rate / 8000.0;
     ctx->residualBytes = 0;
     memset(ctx->residualBuffer, 0, sizeof(ctx->residualBuffer));
     memset(ctx->ring, 0, sizeof(ctx->ring));
@@ -526,11 +482,7 @@ Java_com_md3music_md3music_UsbAudioStream_nativeUsbAudioStart(
 
     // Initial calibration from the DAC's async feedback endpoint.
     // Pipeline is empty here, so REAPURBNDELAY can only return the feedback URB.
-    // 标称 fpmf = 每 ISO packet 的帧数（full-speed 1ms 帧 / high-speed 125µs microframe）。
-    // 注意：此处在 Start 时重置 Create 的初值——除数必须按设备速度分支，
-    // 否则 full-speed 设备数据供给率只有需求的 1/8（噪音根因）。
-    const double hzPerFpmf = ctx->fullSpeed ? 1000.0 : 8000.0;
-    double nominalFpmf = ctx->sampleRate / hzPerFpmf;
+    double nominalFpmf = ctx->sampleRate / 8000.0;
     ctx->calibratedFpmf = nominalFpmf;
 
     if (ctx->endpointFeedback > 0) {
@@ -538,7 +490,7 @@ Java_com_md3music_md3music_UsbAudioStream_nativeUsbAudioStart(
         if (fb > 0) {
             ctx->calibratedFpmf = fb;
             LOGI("Start: initial feedback=%.4f fpmf (%.1f Hz), nominal=%.4f (%.1f Hz)",
-                 fb, fb * hzPerFpmf, nominalFpmf, nominalFpmf * hzPerFpmf);
+                 fb, fb * 8000.0, nominalFpmf, nominalFpmf * 8000.0);
         } else {
             LOGW("Start: feedback not responding, using nominal %.4f fpmf", nominalFpmf);
         }
@@ -550,10 +502,9 @@ Java_com_md3music_md3music_UsbAudioStream_nativeUsbAudioStart(
         submitFeedbackUrb(ctx);
     }
 
-    LOGI("Start: rate=%d ch=%d bits=%d %s ring=%d slots脳%dpkt fpmf=%.4f feedback=%s",
+    LOGI("Start: rate=%d ch=%d bits=%d ring=%d slots脳%dpkt fpmf=%.4f feedback=%s",
          ctx->sampleRate, ctx->channelCount, ctx->bitDepth,
-         ctx->fullSpeed ? "full-speed" : "high-speed",
-         ctx->numUrbs, USB_AUDIO_PACKETS_PER_URB,
+         USB_AUDIO_NUM_URBS, USB_AUDIO_PACKETS_PER_URB,
          ctx->calibratedFpmf,
          ctx->feedbackInFlight ? "continuous" : "one-shot");
     return JNI_TRUE;
@@ -611,8 +562,7 @@ Java_com_md3music_md3music_UsbAudioStream_nativeUsbAudioWrite(
     if (ctx->framesWritten % ctx->sampleRate < (int64_t)totalFrames) {
         LOGI("Write: %lld frames (~%.0f sec) inflight=%d fpmf=%.4f (%.1f Hz)",
              (long long)ctx->framesWritten, (double)ctx->framesWritten/ctx->sampleRate,
-             ctx->urbsInFlight, ctx->calibratedFpmf,
-             ctx->calibratedFpmf * (ctx->fullSpeed ? 1000.0 : 8000.0));
+             ctx->urbsInFlight, ctx->calibratedFpmf, ctx->calibratedFpmf * 8000.0);
     }
 }
 
@@ -679,30 +629,6 @@ Java_com_md3music_md3music_UsbAudioStream_nativeGetFramesWritten(
     auto *ctx = reinterpret_cast<UsbAudioContext *>(h);
     if (!ctx) return 0;
     return (jlong)ctx->framesWritten;
-}
-
-/** 导出 native 环形日志（诊断导出用）。 */
-JNIEXPORT jstring JNICALL
-Java_com_md3music_md3music_UsbAudioStream_nativeGetRecentLogs(JNIEnv *env, jclass) {
-    pthread_mutex_lock(&usbLogMutex);
-    size_t total = 1;
-    for (int k = 0; k < usbLogCount; k++) {
-        int idx = (usbLogHead - usbLogCount + k + USB_LOG_LINES) % USB_LOG_LINES;
-        total += strlen(usbLogRing[idx]) + 1;
-    }
-    char *buf = (char *)malloc(total);
-    if (buf) {
-        buf[0] = '\0';
-        for (int k = 0; k < usbLogCount; k++) {
-            int idx = (usbLogHead - usbLogCount + k + USB_LOG_LINES) % USB_LOG_LINES;
-            strcat(buf, usbLogRing[idx]);
-            strcat(buf, "\n");
-        }
-    }
-    pthread_mutex_unlock(&usbLogMutex);
-    jstring result = env->NewStringUTF(buf ? buf : "");
-    free(buf);
-    return result;
 }
 
 JNIEXPORT jint JNICALL
@@ -839,43 +765,6 @@ void padInt24ToInt32(const uint8_t *src, uint8_t *dst, int numSamples) {
     }
 }
 
-// 16-bit → 24-bit packed: 左对齐填充（无损，用于强制 24bit 输出时输入 16bit）
-static void padInt16ToInt24(const uint8_t *src, uint8_t *dst, int numSamples) {
-    for (int i = 0; i < numSamples; i++) {
-        int32_t s = (int16_t)(src[i*2] | (src[i*2+1] << 8));
-        int32_t v = s << 8;
-        dst[i*3] = v & 0xFF; dst[i*3+1] = (v>>8) & 0xFF; dst[i*3+2] = (v>>16) & 0xFF;
-    }
-}
-
-// 24-bit packed → 16-bit: 截断低 8 位（有损，仅强制 16bit 输出时输入 24bit）
-static void truncInt24ToInt16(const uint8_t *src, uint8_t *dst, int numSamples) {
-    auto *out = reinterpret_cast<int16_t *>(dst);
-    for (int i = 0; i < numSamples; i++) {
-        int32_t s = src[i*3] | (src[i*3+1] << 8) | (src[i*3+2] << 16);
-        if (s & 0x800000) s |= 0xFF000000;
-        out[i] = (int16_t)(s >> 8);
-    }
-}
-
-// 32-bit LE 容器（sign-extended 24 或真 32 位）→ 24-bit packed LE：取高 3 字节
-static void truncInt32ToInt24(const uint8_t *src, uint8_t *dst, int numSamples) {
-    for (int i = 0; i < numSamples; i++) {
-        dst[i*3]   = src[i*4+1];
-        dst[i*3+1] = src[i*4+2];
-        dst[i*3+2] = src[i*4+3];
-    }
-}
-
-// 32-bit LE → 16-bit LE：取高 16 位（byte2..3）
-static void truncInt32ToInt16(const uint8_t *src, uint8_t *dst, int numSamples) {
-    auto *out = reinterpret_cast<int16_t *>(dst);
-    for (int i = 0; i < numSamples; i++) {
-        int32_t s = (int32_t)(src[i*4] | (src[i*4+1] << 8) | (src[i*4+2] << 16) | (src[i*4+3] << 24));
-        out[i] = (int16_t)(s >> 16);
-    }
-}
-
 // 鈹€鈹€ Shared URB submission logic 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 /**
@@ -918,19 +807,6 @@ void submitPcmToUrbs(UsbAudioContext *ctx, const uint8_t *pcmData, int totalByte
             int frames = (int)ctx->frameAccumulator;
             ctx->frameAccumulator -= frames;
             int b = frames * ctx->bytesPerFrame;
-            // 防御：packet 不得超过端点 maxPacket（FS ISO 规范上限 1023B）。
-            // 正常路径由应用侧能力降级保证；此处 clamp 防止槽缓冲堆溢出崩溃
-            // （日志出现即说明上游降级失效，需排查 clampToDacRate）。
-            if (b > (int)ctx->maxPacketSize) {
-                static std::atomic<bool> warned{false};
-                if (!warned.exchange(true)) {
-                    LOGE("packet %d B exceeds maxPacket %d B (rate=%d) — clamping",
-                         b, (int)ctx->maxPacketSize, ctx->sampleRate);
-                }
-                // 丢弃超出部分对应的帧数，避免 frameAccumulator 累积漂移
-                ctx->frameAccumulator += (double)(b - (int)ctx->maxPacketSize) / ctx->bytesPerFrame;
-                b = (int)ctx->maxPacketSize;
-            }
 
             if (b > remaining) {
                 // Not enough data for a full packet 鈥?don't truncate.
@@ -958,7 +834,7 @@ void submitPcmToUrbs(UsbAudioContext *ctx, const uint8_t *pcmData, int totalByte
             break;
         }
 
-        if (ctx->urbsInFlight >= ctx->numUrbs) {
+        if (ctx->urbsInFlight >= USB_AUDIO_NUM_URBS) {
             int result = reapOldestUrb(ctx, 200);
             if (result == -2) {
                 LOGE("submitPcmToUrbs: reap timeout, inflight=%d", ctx->urbsInFlight);
@@ -1033,18 +909,9 @@ Java_com_md3music_md3music_UsbAudioStream_nativeUsbAudioWriteRaw(
     } else if (inputBitDepth == 24 && ctx->bitDepth == 32) {
         // 24-bit packed (3 bytes/sample) 鈫?32-bit: sign-extend + shift left 8
         padInt24ToInt32((uint8_t *)rawData, ctx->transferBuffer, totalSamples);
-    } else if (inputBitDepth == 16 && ctx->bitDepth == 24) {
-        padInt16ToInt24((uint8_t *)rawData, ctx->transferBuffer, totalSamples);
-    } else if (inputBitDepth == 24 && ctx->bitDepth == 16) {
-        truncInt24ToInt16((uint8_t *)rawData, ctx->transferBuffer, totalSamples);
     } else if (inputBitDepth == 32 && ctx->bitDepth == 32) {
         // libFLAC 24-bit 鈫?PCM_32BIT (sign-extended): shift left 8 to fill 32-bit range
         shiftInt32From24((uint8_t *)rawData, ctx->transferBuffer, totalSamples);
-    } else if (inputBitDepth == 32 && ctx->bitDepth == 24) {
-        // 32-bit 容器（sign-extended 24 或真 32 位）→ 24-bit packed：取高 3 字节
-        truncInt32ToInt24((uint8_t *)rawData, ctx->transferBuffer, totalSamples);
-    } else if (inputBitDepth == 32 && ctx->bitDepth == 16) {
-        truncInt32ToInt16((uint8_t *)rawData, ctx->transferBuffer, totalSamples);
     } else {
         LOGE("WriteRaw: unsupported bit-depth conversion %d 鈫?%d", inputBitDepth, ctx->bitDepth);
         env->ReleaseByteArrayElements(pcm, rawData, JNI_ABORT);

@@ -23,14 +23,13 @@
 
 /**
  * Number of URBs in the ring buffer.
- * High-speed (默认): 80 URBs × 8 packets × 125µs ≈ 80 ms of in-flight audio.
- * Full-speed 设备（UAC1，每 1ms 帧仅 1 个 ISO packet）按 16 URBs × 8 packets × 1ms
- * = 128 ms 队列（对齐 Salt Player），避免 640ms 的过长延迟。
+ * 80 URBs ≈ 80 ms of in-flight audio at 44.1 kHz, which empirically gives
+ * the xHCI host controller enough scheduling headroom to maintain
+ * continuous isochronous output without underruns on commodity Android
+ * SoCs. Smaller pipelines (< ~64 URBs at 44.1 kHz) trigger glitches as
+ * the ring drains faster than the URB submit/reap cycle can refill it.
  */
 #define USB_AUDIO_NUM_URBS 80
-
-/** Full-speed 设备的有效 URB 数（16 × 8 packets × 1ms = 128ms）。 */
-#define USB_AUDIO_NUM_URBS_FULLSPEED 16
 
 /**
  * Max bytes per URB data buffer.
@@ -74,10 +73,6 @@ struct UsbAudioContext {
     int32_t bytesPerSample;
     int32_t bytesPerFrame;
     int32_t maxPacketSize;
-    /** USB 总线速度：true=full-speed（每 ISO packet 对应 1ms 帧）。 */
-    bool fullSpeed;
-    /** 有效 URB 环形大小：full-speed → 16，high-speed → 80（ring 数组仍按 80 分配）。 */
-    int numUrbs;
 
     std::atomic<bool> running;
 

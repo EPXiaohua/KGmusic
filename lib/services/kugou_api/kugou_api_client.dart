@@ -1432,13 +1432,8 @@ class KugouApiClient {
     String? lyricId;
     String? lyricAccesskey;
     Map<String, dynamic>? searchResult;
-    // 收集所有候选歌词。酷狗的翻译版（如 TME 中文翻译）是独立的歌词 id，
-    // 主候选（官方推荐，按 score 排序）可能只有罗马音没有翻译，需保留完整
-    // 候选列表供主候选无翻译时做翻译回退。
-    final List<Map<String, dynamic>> lyricCandidates = [];
 
-    // 从 /search/lyric 响应的 candidates 中取第一个候选，解析 lyricId/accesskey，
-    // 并保存全部候选供后续翻译回退扫描。
+    // 从 /search/lyric 响应的 candidates 中取第一个候选，解析 lyricId/accesskey。
     void resolveCandidate(Map<String, dynamic>? result) {
       if (result == null) return;
       final candidates = result['candidates'];
@@ -1446,17 +1441,14 @@ class KugouApiClient {
         final first = candidates.first as Map<String, dynamic>;
         lyricId = first['id']?.toString();
         lyricAccesskey = first['accesskey']?.toString();
-        lyricCandidates.addAll(candidates.cast<Map<String, dynamic>>());
       }
     }
 
-    // man=yes 才会返回带翻译/罗马音的完整候选列表；man=no 只返回官方主版本，
-    // 对只有罗马音、翻译另存为独立 id 的歌曲会丢失中文翻译。
     // 1) 有 hash 时先精确搜索（在线歌曲通常直接命中官方歌词）
     if (hash.isNotEmpty) {
       final byHash = await _get(
         KugouEndpoints.searchLyric,
-        queryParameters: {'hash': hash.toLowerCase(), 'man': 'yes'},
+        queryParameters: {'hash': hash.toLowerCase()},
       );
       if (byHash != null && _hasCandidates(byHash)) {
         searchResult = byHash;
@@ -1484,7 +1476,7 @@ class KugouApiClient {
     if (lyricId == null && songName != null && songName.isNotEmpty) {
       searchResult = await _get(
         KugouEndpoints.searchLyric,
-        queryParameters: {'keywords': songName, 'man': 'yes'},
+        queryParameters: {'keywords': songName},
       );
       resolveCandidate(searchResult);
     }
@@ -1508,23 +1500,7 @@ class KugouApiClient {
       ]);
       final lrcJson = results[0];
       final krcJson = results[1];
-      final merged = mergeLyricResponses(lrcJson, krcJson);
-      if (merged == null) return null;
-      // 主候选无翻译（官方推荐可能只有罗马音，翻译是独立 id）→ 从其他候选回退补翻译
-      final trans = merged.translatedContent;
-      if (trans == null || trans.trim().isEmpty) {
-        final fallback = await _resolveTranslationFallback(lyricCandidates);
-        if (fallback.translation != null) {
-          return KugouLyric(
-            content: merged.content,
-            decodedContent: merged.decodedContent,
-            decodedKrcContent: merged.decodedKrcContent,
-            translatedContent: fallback.translation,
-            romaContent: merged.romaContent ?? fallback.roma,
-          );
-        }
-      }
-      return merged;
+      return mergeLyricResponses(lrcJson, krcJson);
     }
 
     // 单请求路径（显式 fmt=krc 等非 lrc 场景）
@@ -1577,7 +1553,7 @@ class KugouApiClient {
       if (correctHash.isEmpty) return null;
       final lyricSearch = await _get(
         KugouEndpoints.searchLyric,
-        queryParameters: {'hash': correctHash.toLowerCase(), 'man': 'yes'},
+        queryParameters: {'hash': correctHash.toLowerCase()},
       );
       if (lyricSearch != null) {
         final candidates = lyricSearch['candidates'];
@@ -1593,42 +1569,6 @@ class KugouApiClient {
       return null;
     }
     return null;
-  }
-
-  /// 主歌词候选无中文翻译时的翻译回退。
-  ///
-  /// 酷狗的中文翻译（如 TME 翻译版）是独立于官方主版本的歌词 id：
-  /// 官方推荐版本（score 最高）可能只带罗马音，翻译另存为其他候选。本方法
-  /// 从候选中依次拉取 KRC，解析其 [language:] 是否含整行翻译，找到第一个
-  /// 带翻译的候选即返回其翻译与罗马音，供与主歌词按时间戳合并。
-  ///
-  /// 返回 `(translation, roma)`，翻译为 null 表示所有候选均无翻译。
-  Future<({String? translation, String? roma})> _resolveTranslationFallback(
-    List<Map<String, dynamic>> candidates,
-  ) async {
-    if (candidates.length < 2) return (translation: null, roma: null);
-    final seen = <String>{};
-    for (final c in candidates.skip(1)) {
-      final id = c['id']?.toString();
-      if (id == null || !seen.add(id)) continue;
-      final acc = c['accesskey']?.toString();
-      try {
-        final krcJson = await _fetchLyricContent(id, acc, 'krc', true);
-        if (krcJson == null) continue;
-        final krcContent =
-            krcJson['decodeContent']?.toString() ??
-            krcJson['decoded_krc_content']?.toString() ??
-            krcJson['krcContent']?.toString();
-        if (krcContent == null) continue;
-        final extracted = _extractTranslationFromKrc(krcContent);
-        if (extracted.translation != null && extracted.translation!.isNotEmpty) {
-          return extracted;
-        }
-      } catch (_) {
-        // 单个候选失败不影响继续扫描其他候选
-      }
-    }
-    return (translation: null, roma: null);
   }
 
   /// 合并 LRC 与 KRC 两个响应，构造同时携带两种明文的 KugouLyric。

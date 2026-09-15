@@ -235,27 +235,8 @@ jobs:
             --build-name=${{ steps.version.outputs.version }} \
             --build-number=${{ steps.version.outputs.versionCode }}
 
-      # 原子随身听按包名识别合作应用：额外构建一个 arm64-v8a 兼容包。
-      # 只覆盖 applicationId，namespace / Kotlin 包路径 / MethodChannel 均保持原样。
-      - name: Flutter build Apple Music package APK (arm64-v8a)
-        run: |
-          set -euo pipefail
-          apk_dir="build/app/outputs/flutter-apk"
-          standard_apk="$apk_dir/app-arm64-v8a-release.apk"
-          standard_backup="$RUNNER_TEMP/app-arm64-v8a-release.apk"
-          cp "$standard_apk" "$standard_backup"
-          flutter build apk --release --split-per-abi \
-            --target-platform android-arm64 \
-            --android-project-arg=md3ApplicationId=com.apple.android.music \
-            --dart-define=APP_VERSION=${{ steps.version.outputs.version }} \
-            --build-name=${{ steps.version.outputs.version }} \
-            --build-number=${{ steps.version.outputs.versionCode }}
-          mv "$standard_apk" "$apk_dir/app-apple-music-arm64-v8a-release.apk"
-          mv "$standard_backup" "$standard_apk"
-
       - name: Verify APKs
         run: |
-          set -euo pipefail
           ls -lh build/app/outputs/flutter-apk/
           for f in build/app/outputs/flutter-apk/*.apk; do
             echo ""
@@ -268,11 +249,6 @@ jobs:
               exit 1
             fi
           done
-          aapt2="$ANDROID_HOME/build-tools/36.0.0/aapt2"
-          standard_id="$("$aapt2" dump badging build/app/outputs/flutter-apk/app-arm64-v8a-release.apk | sed -n "s/^package: name='\([^']*\)'.*/\1/p")"
-          apple_id="$("$aapt2" dump badging build/app/outputs/flutter-apk/app-apple-music-arm64-v8a-release.apk | sed -n "s/^package: name='\([^']*\)'.*/\1/p")"
-          test "$standard_id" = "com.md3music.md3music"
-          test "$apple_id" = "com.apple.android.music"
 
       # ============================================================
       # 7. 生成更新日志
@@ -326,7 +302,6 @@ jobs:
             echo "- **app-arm64-v8a-release.apk** — 推荐：大多数现代 Android 设备"
             echo "- **app-armeabi-v7a-release.apk** — 较旧的 32 位设备"
             echo "- **app-x86_64-release.apk** — Android 模拟器"
-            echo "- **app-apple-music-arm64-v8a-release.apk** — Vivo 原子随身听兼容包（包名 \`com.apple.android.music\`）"
             echo ""
             echo "### Commits (${RANGE:-最近 20 条})"
             echo ""
@@ -367,7 +342,6 @@ jobs:
             build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk
             build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
             build/app/outputs/flutter-apk/app-x86_64-release.apk
-            build/app/outputs/flutter-apk/app-apple-music-arm64-v8a-release.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

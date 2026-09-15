@@ -40,11 +40,6 @@
         android:icon="@mipmap/ic_launcher"
         android:allowBackup="false"
         android:networkSecurityConfig="@xml/network_security_config">
-        <!-- MD3Music fork: 原子随身听（vivomusicmix）合作应用认证 meta-data（照抄酷我 12.0.8.0）。
-             原子可能据此识别合作控制器（c0 路径）。token 为酷我的，若与包名绑定则无效。 -->
-        <meta-data android:name="support_vivo_musicwidgetmix_value" android:value="1001" />
-        <meta-data android:name="support_vivo_musicwidgetmix_token" android:value="81ed19dacbe2c11fa52a129e3815037c62abc5aee1d5a39f9240c35a09e07eb2" />
-        <meta-data android:name="support_vivo_musicwidgetmix_logo_color" android:value="\#00FFFF\#FFFFFF" />
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -103,16 +98,9 @@
         <service
             android:name=".MD3MusicMediaSessionService"
             android:foregroundServiceType="mediaPlayback"
-            android:exported="true">
+            android:exported="false">
             <intent-filter>
                 <action android:name="androidx.media3.session.MediaSessionService" />
-            </intent-filter>
-            <!-- MD3Music fork v19：c0 + 全剥 bitmap + http:/480 URI（完全复刻 kgka
-                 c0+无bitmap+http 的已验证配置）。v18 c0+单bitmap+httpURI 封面仍 1x1
-                 （bitmap 存在则原子强制走坏 bitmap 路径）。无 bitmap 时原子走自己的
-                 Glide 下载（kgka 实测正常，不写 covers/ 直接显示）。 -->
-            <intent-filter>
-                <action android:name="com.vivo.musicwidgetmix.support.service" />
             </intent-filter>
         </service>
         <service

@@ -257,9 +257,7 @@ class SettingsRepository {
   /// 当前选中的推送协议：'none' / 'lyricon' / 'super_lyric' / 'lyric_info'。
   Future<String> getLyricPushProtocol() async {
     final prefs = await SharedPreferences.getInstance();
-    // MD3Music fork: 默认 lyric_info（Vivo 车载歌词依赖此链路推送整首歌词；
-    // 原默认 none 导致 lyricInfo 不推，原子随身听缺 8/16 能力位、车机无歌词）。
-    return prefs.getString('lyric_push_protocol') ?? 'lyric_info';
+    return prefs.getString('lyric_push_protocol') ?? 'none';
   }
 
   Future<void> setLyricPushProtocol(String v) async {

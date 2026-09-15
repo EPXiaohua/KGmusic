@@ -89,20 +89,6 @@ class LineRenderer {
   /// 翻译副行向下偏移而与下一行歌词重叠——因此用该行数反推压缩高度。
   int _lastMultiLineRowCount = 0;
 
-  /// 翻译副行展开进度（0→1 副行"长出"，1→0 收回）。由 AppleLyricsView 注入。
-  ///
-  /// - 当前行（LRC/纯文本整行模式）：跟随全局展开进度，与 WordRenderer
-  ///   （KRC 当前行）一致的长出动画；
-  /// - 收起中的退场行：注入 1 - 收起进度，副行从当前位置平滑缩回主行底。
-  /// 默认 0：非当前行且未注入时副行位于隐藏位（配合 fade=0 不绘制）。
-  double translationExpand = 0.0;
-
-  /// 翻译副行显隐 alpha 进度（0→1 渐显，1→0 渐隐）。由 AppleLyricsView 注入。
-  ///
-  /// 当前实现与 [translationExpand] 同值注入（alpha 与位置同进度，
-  /// 淡入淡出贯穿整个过渡时长，速率随行时长自适应）。
-  double translationFade = 0.0;
-
   /// KRC 行 word 宽度缓存（与 WordRenderer._wordWidths 同口径：同 TextStyle 单字 layout）。
   ///
   /// **换行一致性**：measureLineHeight 与 WordRenderer（当前行）都用"word 累加"
@@ -393,22 +379,14 @@ class LineRenderer {
           maxWidth, viewportWidth, textColorValue);
     }
 
-    // 辅助副行（翻译或罗马音）：有内容 + 渐显进度 > 0 时绘制。
-    // 根据 displayMode 选择显示 translation 还是 roma。
-    // - 当前行：expand/fade 由 AppleLyricsView 注入全局进度，与 WordRenderer
-    //   （KRC 当前行）同一长出/渐显动画（此前固定位置固定 alpha，行切换瞬间出现）；
-    // - 收起中的退场行：注入收起进度（expand = 1-c、fade = 1-c），副行从当前
-    //   位置平滑缩回主行底并渐隐，消除切行时副行瞬间消失的硬切；
-    // - 其余非当前行：两值默认 0 → alpha=0 不绘制，行为与旧版一致。
-    // **不读 showTranslation 做立即短路**：关闭翻译时注入进度衰减到 0、
-    // alpha 平滑渐隐至消失——若在此短路，关闭瞬间副行直接消失无动画。
-    // 副行字号为主行 70%，alpha = translationOpacity × translationFade。
+    // 辅助副行（翻译或罗马音）：仅当前行 + 开关开启 + 有内容时绘制
+    // 根据 displayMode 选择显示 translation 还是 roma
+    // 副行字号为主行 70%，alpha 固定 translationOpacity（不随主行动画变化）
     final auxText = LyricPreferences.instance.displayMode == LyricDisplayMode.roma
         ? line.roma
         : line.translation;
-    final double transAlpha =
-        LyricLayout.translationOpacity * translationFade;
-    if (transAlpha > 0.001 &&
+    if (_isActive &&
+        LyricPreferences.instance.showTranslation &&
         auxText != null &&
         auxText.isNotEmpty) {
       final transFontSize = LyricLayout.translationFontSize(fontSize);
@@ -423,19 +401,12 @@ class LineRenderer {
                   LyricLayout.lineHeight *
                   LyricLayout.wrapLineHeightFactor
           : _painter.height;
-      // 副行"长出/收回"偏移：expand=0 时贴主行底（隐藏位），=1 时到正常位。
-      // 偏移量 = 副行高 × (expand - 1)，与 measureLineHeight 副行预留口径一致
-      // （与 WordRenderer 当前行副行同式）。
-      final double subH = transFontSize * LyricLayout.translationLineHeight +
-          transFontSize * 0.3;
-      final double transY = offset.dy +
-          mainHeight +
-          transFontSize * 0.3 +
-          subH * (translationExpand - 1.0);
+      // 主副行间留 0.3em 间隙，与 measureLineHeight 计算保持一致
+      final transY = offset.dy + mainHeight + transFontSize * 0.3;
       _translationPainter.text = TextSpan(
         text: auxText,
         style: TextStyle(
-          color: Color.fromRGBO(textRed, textGreen, textBlue, transAlpha),
+          color: Color.fromRGBO(textRed, textGreen, textBlue, LyricLayout.translationOpacity),
           fontSize: transFontSize,
           height: LyricLayout.translationLineHeight,
           fontFamily: LyricLayout.fontFamily,

@@ -18,7 +18,6 @@ import 'core/theme/motion_constants.dart';
 import 'core/utils/artwork_color_extractor.dart';
 import 'core/utils/app_toast.dart';
 import 'core/widgets/app_background.dart';
-import 'core/widgets/safe_insets_guard.dart';
 import 'data/models/playlist.dart';
 import 'services/kugou_api/kugou_api_client.dart';
 import 'main.dart'
@@ -29,7 +28,6 @@ import 'main.dart'
         shortcutTabRequest;
 import 'modules/discover/discover_page.dart';
 import 'modules/coverflow/coverflow_page.dart';
-import 'utils/landscape_immersive.dart';
 import 'modules/charts/charts_page.dart';
 import 'modules/ip/ip_page.dart';
 import 'modules/user/user_center_page.dart';
@@ -360,19 +358,17 @@ class _AppViewState extends State<_AppView> {
         // 底部弹层 / 菜单）、DLNA 与拖拽覆盖层都在作用域内。
         return DisplayScaleScope(
           scale: context.watch<ThemeProvider>().displayScale,
-          child: SafeInsetsGuard(
-            child: _SystemUiUpdater(
-              child: Stack(
-                children: [
-                  // 全局背景层（主页/底层背景）：复用 AppBackground 组件。
-                  // 二级页面由路由过渡内嵌 AppBackground，随页面位移入场。
-                  Positioned.fill(child: AppBackground()),
-                  child!,
-                  const DlnaCastingOverlay(),
-                  // 上滑拖拽跟手覆盖层（在 Navigator 之上，拖拽期间显示预览）
-                  const PlayerDragOverlay(),
-                ],
-              ),
+          child: _SystemUiUpdater(
+            child: Stack(
+              children: [
+                // 全局背景层（主页/底层背景）：复用 AppBackground 组件。
+                // 二级页面由路由过渡内嵌 AppBackground，随页面位移入场。
+                Positioned.fill(child: AppBackground()),
+                child!,
+                const DlnaCastingOverlay(),
+                // 上滑拖拽跟手覆盖层（在 Navigator 之上，拖拽期间显示预览）
+                const PlayerDragOverlay(),
+              ],
             ),
           ),
         );
@@ -564,11 +560,6 @@ class _SystemUiUpdaterState extends State<_SystemUiUpdater>
     // 不覆盖系统栏模式（否则方向变化等 rebuild 会冲掉沉浸设置）。
     // 用「实际生效」标志：用户请求沉浸但切到其他 tab/竖屏时仍需恢复系统栏样式。
     if (kCoverFlowImmersiveActive.value) return;
-    // 播放器 Zen 沉浸生效中：保留 immersiveSticky，不被主界面 edgeToEdge 覆盖
-    // （否则亮屏 resumed 会把状态栏重新显示出来）。
-    if (kPlayerZenImmersiveActive.value) return;
-    // 播放器横屏沉浸（非 Zen）生效中：同 Zen，保留 immersiveSticky 不被覆盖。
-    if (kPlayerLandscapeImmersiveActive.value) return;
     final brightness = Theme.of(context).brightness;
     final isDark = brightness == Brightness.dark;
 

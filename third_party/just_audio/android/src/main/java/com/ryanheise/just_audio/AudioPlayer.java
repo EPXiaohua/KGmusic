@@ -502,27 +502,6 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
 
     @Override
     public void onPlayerError(PlaybackException error) {
-        // MD3Music fork: 完整异常信息写入 USB 日志环（随诊断 usb.log 导出）。
-        // 仅向 Dart 传 getMessage() 会丢 cause 链/堆栈（如 32bit FLAC code=2
-        // TYPE_UNEXPECTED 无法定位）。截断到 3000 字符防止环形缓冲刷屏。
-        try {
-            StringBuilder sb = new StringBuilder();
-            sb.append("onPlayerError: ").append(error.getClass().getName())
-              .append(" errorCode=").append(error.errorCode)
-              .append(" msg=").append(error.getMessage());
-            Throwable cause = error.getCause();
-            int depth = 0;
-            while (cause != null && depth < 6) {
-                sb.append("\n  caused by: ").append(cause.getClass().getName())
-                  .append(": ").append(cause.getMessage());
-                cause = cause.getCause();
-                depth++;
-            }
-            String stack = android.util.Log.getStackTraceString(error);
-            if (stack.length() > 3000) stack = stack.substring(0, 3000) + "\n…(truncated)";
-            sb.append('\n').append(stack);
-            UsbAudioSinkController.logE("ExoPlayerError", sb.toString());
-        } catch (Exception ignored) { }
         if (error instanceof ExoPlaybackException) {
             final ExoPlaybackException exoError = (ExoPlaybackException)error;
             switch (exoError.type) {
@@ -990,11 +969,6 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
             };
             ExoPlayer.Builder builder = new ExoPlayer.Builder(context, renderersFactory);
             builder.setUseLazyPreparation(useLazyPreparation);
-            // MD3Music fork: 启用拔耳机（有线拔出 / 蓝牙断开）自动暂停。
-            // 默认 handleAudioBecomingNoisy=false，不会注册 ACTION_AUDIO_BECOMING_NOISY
-            // 广播接收器 → ExoPlayer 收不到 becomingNoisy 事件，拔耳机无法暂停。
-            // 这里在构建期统一开启，主/辅（交叉淡化）播放器均生效。
-            builder.setHandleAudioBecomingNoisy(true);
             if (loadControl != null) {
                 builder.setLoadControl(loadControl);
             }
@@ -1002,23 +976,6 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
                 builder.setLivePlaybackSpeedControl(livePlaybackSpeedControl);
             }
             player = builder.build();
-            // MD3Music fork: 渲染器停喂自愈 —— USB 独占下渲染循环一旦停喂（实测
-            // hbCount 冻结且无错误抛出），USB 队列持续空转无声。从 sink 侧唯一能
-            // 唤醒渲染器的手段是 seek（onPositionReset → 重新预滚）。seek 必须经
-            // 主线程分发（ExoPlayer 线程约定）；STATE_READY 门禁避免在切歌/结束
-            // 过渡期误触发。控制器侧已有 2.5s 阈值 + 8s 冷却 + 3 次上限。
-            UsbAudioSinkController.setStallRecoveryListener(() -> {
-                Handler main = new Handler(Looper.getMainLooper());
-                main.post(() -> {
-                    ExoPlayer p = player;
-                    if (p == null || p.getPlaybackState() != Player.STATE_READY) return;
-                    try {
-                        p.seekTo(Math.max(0, p.getCurrentPosition()));
-                    } catch (RuntimeException e) {
-                        android.util.Log.w("UsbAudioSinkCtrl", "stall recovery seek failed: " + e);
-                    }
-                });
-            });
             // MD3Music fork: 固定 audioSessionId，使 Media3 MediaSession 与 AudioTrack
             // 关联。系统（小米等）按「AudioTrack 的 audioSessionId 是否与 MediaSession
             // 关联」判定播放器可识别性（hasUid）：未关联时独占型中断（如 B 站视频
@@ -1407,10 +1364,6 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
                 || expectedMediaId.equals(item.mediaId)) {
             return true;
         }
-        // MD3Music fork: 蓝牙歌词场景 item 无业务 mediaId（hash=0）。expectedMediaId 由
-        // showNotification 每次切歌同步为当前歌、generation 单调递增防旧，直接信任放行；
-        // 否则 title 已被歌词行改写、与真实歌名不符，会被误判为串歌而丢弃。
-        if (item.mediaId == null || item.mediaId.isEmpty()) return true;
         // just_audio / ExoPlayer may retain an internal MediaItem.mediaId even when the player
         // tag carries the business Song.id. The public protocol permits title+artist fallback.
         MediaMetadata metadata = item.mediaMetadata;
@@ -1444,36 +1397,6 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
     // MediaItem.mediaMetadata.extras 同样携带该字段，为后续移除自定义会话做准备。
     private static final String SESSION_LYRIC_INFO_KEY = "lyricInfo";
 
-    // ==== MD3Music fork: Vivo 车载歌词注入（ucar 车联投屏 + vivomusicmix 原子随身听） ====
-    // 随 lyricInfo 一起写进 MediaItem.mediaMetadata.extras。media3 会把 extras 原样
-    // 并入 framework MediaMetadataCompat，车机按 PlaybackState 进度自行滚动整段 LRC。
-    // 铁律（VIVO_CAR_LYRICS_GUIDE）：无歌词时不写任何字段（负状态 = 车机永久单行），
-    // 绝不写 LYRICS_LINE（单行模式信号）。
-    private static final String UCAR_LYRICS_WHOLE = "ucar.media.metadata.LYRICS_WHOLE";
-    private static final String UCAR_LYRICS_STATUS = "ucar.media.metadata.LYRICS_STATUS";
-    private static final String VMM_SUPPORT_EVENT = "vivomusicmix.media.metadata.support_event";
-
-    /**
-     * 从 lyricInfo JSON 提取可用于 Vivo 车机的整段 LRC：
-     * 取 "lyric" 字段，并把 ELRC 词级时间标签 {@code <mm:ss.xxx>} 过滤成纯行级 LRC
-     * （车机 LRC 解析器会把词级标签当文本渲染）。无歌词返回 null。
-     */
-    public static String extractCarLyricsFromLyricInfo(String lyricInfo) {
-        if (lyricInfo == null || lyricInfo.isEmpty()) return null;
-        try {
-            org.json.JSONObject json = new org.json.JSONObject(lyricInfo);
-            String lyric = json.optString("lyric", null);
-            if (lyric == null || lyric.isEmpty()) return null;
-            // 去词级时间标签：<mm:ss.xxx> / <m:ss.x> 等
-            String lrc = lyric.replaceAll("<\\d{1,2}:\\d{1,2}(?:\\.\\d{1,3})?>", "");
-            return lrc.trim().isEmpty() ? null : lrc.trim();
-        } catch (Exception e) {
-            Log.w("AudioFocusFork", "extractCarLyricsFromLyricInfo failed: " + e);
-            return null;
-        }
-    }
-
-
     /// 根因3修复：一次 replaceMediaItem 同时更新 标题/艺术家 与 extras.lyricInfo，
     /// 消除 performMetadataRefresh 的两次紧邻提交（OPlus 防抖窗口会丢弃第二次，
     /// 日志表现为 "within debounce period, ignore"，导致首曲 hasLyric=false）。
@@ -1482,13 +1405,11 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
             long generation,
             String title,
             String artist,
-            String lyricInfo,
-            String btTitle,
-            String btArtist) {
+            String lyricInfo) {
         AudioPlayer p = sActivePlayer;
         if (p != null) {
             p.applySessionTitleArtistAndLyricInfo(
-                    expectedMediaId, generation, title, artist, lyricInfo, btTitle, btArtist);
+                    expectedMediaId, generation, title, artist, lyricInfo);
         } else {
             Log.w("AudioFocusFork", "updateActiveSessionTitleArtistAndLyricInfo: no active AudioPlayer");
         }
@@ -1611,16 +1532,14 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
             final long generation,
             final String title,
             final String artist,
-            final String lyricInfo,
-            final String btTitle,
-            final String btArtist) {
+            final String lyricInfo) {
         try {
             final androidx.media3.common.Player p = player;
             if (p == null) return;
             Handler handler = new Handler(p.getApplicationLooper());
             if (!registerExternalMetadataGeneration(generation)) return;
             handler.post(() -> doApplySessionTitleArtistAndLyricInfo(
-                    expectedMediaId, generation, title, artist, lyricInfo, btTitle, btArtist));
+                    expectedMediaId, generation, title, artist, lyricInfo));
         } catch (Exception e) {
             Log.w("AudioFocusFork", "applySessionTitleArtistAndLyricInfo dispatch failed: " + e);
         }
@@ -1633,9 +1552,7 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
             long generation,
             String title,
             String artist,
-            String lyricInfo,
-            String btTitle,
-            String btArtist) {
+            String lyricInfo) {
         try {
             if (!isExternalMetadataGenerationCurrent(generation)) return;
             MediaItem cur = player.getCurrentMediaItem();
@@ -1647,22 +1564,20 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
             MediaMetadata m = cur.mediaMetadata;
             String curTitle = m.title != null ? m.title.toString() : null;
             String curArtist = m.artist != null ? m.artist.toString() : null;
-            String writeTitle = (btTitle != null && !btTitle.isEmpty()) ? btTitle : title;
-            String writeArtist = (btArtist != null && !btArtist.isEmpty()) ? btArtist : artist;
             android.os.Bundle currentExtras = m.extras;
             String currentLyric = currentExtras != null
                     ? currentExtras.getString(SESSION_LYRIC_INFO_KEY) : null;
             String incomingLyric = (lyricInfo == null || lyricInfo.isEmpty()) ? null : lyricInfo;
 
             boolean titleChanged =
-                    !(equalsOrBothNull(curTitle, writeTitle) && equalsOrBothNull(curArtist, writeArtist));
+                    !(equalsOrBothNull(curTitle, title) && equalsOrBothNull(curArtist, artist));
             boolean lyricChanged = !((incomingLyric == null && currentLyric == null)
                     || (incomingLyric != null && incomingLyric.equals(currentLyric)));
             if (!titleChanged && !lyricChanged) return;
 
             MediaMetadata.Builder mb = m.buildUpon();
-            if (writeTitle != null && !writeTitle.isEmpty()) mb.setTitle(writeTitle);
-            if (writeArtist != null && !writeArtist.isEmpty()) mb.setArtist(writeArtist);
+            if (title != null && !title.isEmpty()) mb.setTitle(title);
+            if (artist != null && !artist.isEmpty()) mb.setArtist(artist);
             android.os.Bundle newExtras = currentExtras != null
                     ? new android.os.Bundle(currentExtras)
                     : new android.os.Bundle();
@@ -1670,18 +1585,6 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
                 newExtras.remove(SESSION_LYRIC_INFO_KEY);
             } else {
                 newExtras.putString(SESSION_LYRIC_INFO_KEY, incomingLyric);
-            }
-            // MD3Music fork: Vivo 车载歌词注入（随 lyricInfo 同步写入）。
-            // 无整段歌词时移除字段（铁律：不写负状态，否则车机永久退回单行）。
-            String carLrc = extractCarLyricsFromLyricInfo(incomingLyric);
-            if (carLrc == null || carLrc.isEmpty()) {
-                newExtras.remove(UCAR_LYRICS_WHOLE);
-                newExtras.remove(UCAR_LYRICS_STATUS);
-                newExtras.remove(VMM_SUPPORT_EVENT);
-            } else {
-                newExtras.putString(UCAR_LYRICS_WHOLE, carLrc);
-                newExtras.putLong(UCAR_LYRICS_STATUS, 0L);
-                newExtras.putLong(VMM_SUPPORT_EVENT, 31L);
             }
             MediaMetadata updated = mb.setExtras(newExtras).build();
             player.replaceMediaItem(
@@ -1717,18 +1620,7 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
             if (artist != null && !artist.isEmpty()) mb.setArtist(artist);
             // MD3Music fork：注入 artworkUri（Lyricon autoSync / 外部读取封面用），
             // 通知栏封面仍用 artworkData（bitmap，稳定，避免 artUri 异步加载闪烁）。
-            // MD3Music fork v18：反向替换 https:// → http://（撤销 v11）。
-            // 实测修正：原子 networkSecurityConfig 允许明文（cleartextTrafficPermitted=true），
-            // kgka 传给原子的是 kugou API 原生 http:// URL（封面显示正常）；v13 实测
-            // https URI 原子不消费（不下载不显示）。酷狗 CDN 同时支持 http/https。
             if (artUri != null && !artUri.isEmpty()) {
-                if (artUri.startsWith("https://")) {
-                    artUri = "http://" + artUri.substring(8);
-                }
-                // MD3Music fork v19：/400/ → /480/，与 kgka 的 kugou flexible_cover {size}=480
-                // 完全一致（原子 p.q kugou 分支 replaceFirst("/480/","/800/") 期望 /480/）。
-                // kugou stdmusic CDN 同图支持 /400/ 与 /480/ 目录尺寸。
-                artUri = artUri.replaceFirst("/400/", "/480/");
                 mb.setArtworkUri(android.net.Uri.parse(artUri));
             }
             if (art != null) {
@@ -1985,11 +1877,9 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
                     m.put("channelCount", f.channelCount > 0 ? f.channelCount : 0);
                     m.put("bitrate", f.bitrate > 0 ? f.bitrate : 0);
                     m.put("pcmEncoding", f.pcmEncoding);
-                    // 编码短名（FLAC/MP3/AAC/…），供 USB 独占格式链「源文件」行展示
-                    m.put("codec", codecShortName(f.sampleMimeType, f.codecs));
                     Log.i(TAG, "getSourceFormat: rate=" + f.sampleRate + " ch=" + f.channelCount
                             + " bitrate=" + f.bitrate + " pcmEnc=" + f.pcmEncoding
-                            + " mime=" + f.sampleMimeType + " codec=" + m.get("codec"));
+                            + " mime=" + f.sampleMimeType);
                     break;
                 }
             }
@@ -1997,30 +1887,6 @@ public class AudioPlayer implements MethodCallHandler, Player.Listener, Metadata
             Log.e(TAG, "getSourceFormat failed: " + e.getMessage());
         }
         return m;
-    }
-
-    /**
-     * sampleMimeType → 编码短名（FLAC/MP3/AAC/OPUS/…），供 UI「源文件」行展示。
-     * OGG 容器内用 codecs 字符串区分 Opus/Vorbis；无法识别时回退 mime 原值。
-     */
-    private static String codecShortName(String mime, String codecs) {
-        if (mime == null || mime.isEmpty()) return "";
-        final String m = mime.toLowerCase();
-        final String cs = codecs != null ? codecs.toLowerCase() : "";
-        if (m.contains("flac")) return "FLAC";
-        if (m.contains("mpeg") || m.contains("mp3")) return "MP3";
-        if (m.contains("mp4a") || m.contains("aac")) return "AAC";
-        if (m.contains("opus")) return "OPUS";
-        if (m.contains("vorbis") || m.equals("audio/ogg") || m.contains("application/ogg")) {
-            return cs.contains("opus") ? "OPUS" : "OGG";
-        }
-        if (m.contains("alac")) return "ALAC";
-        if (m.contains("ape") || m.contains("monkey")) return "APE";
-        if (m.contains("wav") || m.contains("wave") || m.contains("pcm")) return "WAV";
-        if (m.contains("ec-3") || m.contains("ac3") || m.contains("eac3")) return "AC3";
-        if (m.contains("amr")) return "AMR";
-        if (m.contains("dsd") || m.contains("dsf") || m.contains("dff")) return "DSD";
-        return mime;
     }
 
     public void setSpeed(final float speed) {

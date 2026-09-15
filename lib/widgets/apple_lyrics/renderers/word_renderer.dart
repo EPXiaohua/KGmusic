@@ -379,10 +379,7 @@ class WordRenderer {
   /// progress=0 时副行贴主行底（隐藏位），progress=1 时到正常副行位置。
   double translationExpand = 0.0;
 
-  /// 翻译副行显隐 alpha 进度（0→1 渐显，1→0 渐隐）。由 AppleLyricsView 注入。
-  ///
-  /// 当前实现与 [translationExpand] 同值注入（alpha 与位置同进度，
-  /// 淡入淡出贯穿整个过渡时长，速率随行时长自适应）。
+  /// 翻译副行显隐 alpha 进度（0→1 渐显，1→0 渐隐）。同注入。
   double translationFade = 0.0;
 
   // ============== 动画推进 ==============
@@ -942,15 +939,14 @@ class WordRenderer {
     // 辅助副行（翻译或罗马音）：WordRenderer 仅在当前行（KRC）被调用，故无需再判 _isActive。
     // 根据 displayMode 选择显示 translation 还是 roma。
     // 副行字号为主行 70%；alpha = translationOpacity × translationFade（渐显渐隐），
-    // 位置随 translationExpand 从主行底平滑浮出（占位高度由动画进度动态叠加）。
-    // **不读 showTranslation 做立即短路**：关闭翻译时注入进度衰减到 0、
-    // alpha 平滑渐隐至消失——若在此短路，关闭瞬间副行直接消失无动画。
+    // 位置随 translationExpand 从主行底平滑浮出（恒定占位下副行高度始终预留）。
     final auxText = LyricPreferences.instance.displayMode == LyricDisplayMode.roma
         ? line.roma
         : line.translation;
     final double transAlpha =
         LyricLayout.translationOpacity * translationFade;
-    if (transAlpha > 0.001 &&
+    if (LyricPreferences.instance.showTranslation &&
+        transAlpha > 0.001 &&
         auxText != null &&
         auxText.isNotEmpty) {
       final transFontSize = LyricLayout.translationFontSize(fontSize);
