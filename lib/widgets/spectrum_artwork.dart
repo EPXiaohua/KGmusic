@@ -3,6 +3,8 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
+import '../core/services/player_frame_driver.dart';
+
 import '../core/services/spectrum_service.dart';
 import 'player_artwork_image.dart';
 
@@ -77,7 +79,8 @@ class _SpectrumArtworkState extends State<SpectrumArtwork>
   late final Animation<double> _rotationAnimation;
 
   /// 60fps 旋转步进定时器（替代 `repeat()`，避免 120Hz 屏保持 120fps 帧管线）。
-  Timer? _rotationTimer;
+  /// 是否已挂在共享 60fps 帧驱动上（见 [PlayerFrameDriver]）。
+  bool _rotationDriverBound = false;
 
   /// 频谱幅值数组（0..1）。驱动 CustomPainter 重绘，不触发 setState。
   late final ValueNotifier<List<double>> _bandsNotifier;
@@ -127,18 +130,21 @@ class _SpectrumArtworkState extends State<SpectrumArtwork>
   /// 帧生产由 16ms 定时器限制到 60fps（repeat 会让 120Hz 屏保持 120fps）。
   void _applyPlayingState() {
     if (widget.isPlaying) {
-      _rotationTimer ??= Timer.periodic(
-        const Duration(milliseconds: 16),
-        _onRotationTick,
-      );
-    } else {
-      _rotationTimer?.cancel();
-      _rotationTimer = null;
+      if (!_rotationDriverBound) {
+        // 与歌词共用同一个 60fps 节拍：两个独立 16ms Timer 相位错开会让
+        // 120Hz 屏整页跑到 ~120fps（实测），合并后整页回到 60fps，
+        // 而封面旋转本身的更新率不变（仍 60fps）。
+        PlayerFrameDriver.instance.addListener(_onRotationTick);
+        _rotationDriverBound = true;
+      }
+    } else if (_rotationDriverBound) {
+      PlayerFrameDriver.instance.removeListener(_onRotationTick);
+      _rotationDriverBound = false;
     }
   }
 
   /// 以 16ms 步进推进旋转角度（控制器值 0→1 循环，映射到 0→2π）。
-  void _onRotationTick(Timer timer) {
+  void _onRotationTick() {
     if (!mounted) return;
     // 每 16ms 推进的圈数比例：16ms / 转一圈时长
     final step = 16.0 / widget.rotationDuration.inMilliseconds;
@@ -167,7 +173,10 @@ class _SpectrumArtworkState extends State<SpectrumArtwork>
 
   @override
   void dispose() {
-    _rotationTimer?.cancel();
+    if (_rotationDriverBound) {
+      PlayerFrameDriver.instance.removeListener(_onRotationTick);
+      _rotationDriverBound = false;
+    }
     _subscription?.cancel();
     _rotationController.dispose();
     _bandsNotifier.dispose();

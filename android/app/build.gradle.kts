@@ -5,8 +5,6 @@ plugins {
     id("com.android.application")
     // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
     id("dev.flutter.flutter-gradle-plugin")
-    // Compose 编译器插件（Kotlin 2.x 内置，版本随 Kotlin）
-    id("org.jetbrains.kotlin.plugin.compose")
 }
 
 val keystoreProperties = Properties().apply {
@@ -45,6 +43,13 @@ android {
                 abiFilters("arm64-v8a", "armeabi-v7a", "x86_64", "x86")
             }
         }
+    }
+
+    // 2026-09-12：加入 libflacJNI.so（P0-5 flac 扩展）后 native libs 被改为 Stored
+    // （APK 153.6→191.2MB）。显式恢复未压缩打包默认（extractNativeLibs=false，
+    // 直接从 APK 页对齐加载，安装包最小、加载最快）。
+    packaging {
+        jniLibs.useLegacyPackaging = false
     }
 
     signingConfigs {
@@ -89,10 +94,6 @@ android {
         }
     }
 
-    buildFeatures {
-        // MiuixDiscoverActivity 使用 Compose + miuix 组件
-        compose = true
-    }
 }
 
 kotlin {
@@ -117,13 +118,8 @@ dependencies {
     // （fork 用 implementation 隐藏了传递依赖）。session/exoplayer 仍是 fork 本地源码，勿加 maven。
     implementation("androidx.media3:media3-common:1.4.1")
 
-    // ==================== Miuix 风格测试页（原生 Compose） ====================
-    // miuix-android 0.8.8：Kotlin 2.3.20 + Compose Foundation 1.10.3 编译，
-    // minCompileSdk=36，与当前工程（compileSdk 36 / Kotlin 2.3.20）完全匹配
-    implementation("top.yukonga.miuix.kmp:miuix-android:0.8.8")
-    // Compose 宿主（ComposeView）+ 图片加载（Coil）
-    implementation("androidx.activity:activity-compose:1.9.3")
-    implementation("io.coil-kt:coil-compose:2.7.0")
+    // USB 独占数据路径（UsbDither / UsbAudioStream.writeRaw）的 JVM 单元测试
+    testImplementation("junit:junit:4.13.2")
 }
 
 // MD3Music fork: 全局强制 media3 版本与本地 just_audio fork 的 exoplayer 源码一致（1.4.1）。

@@ -33,6 +33,7 @@ import 'package:md3music/widgets/apple_lyrics/models/lyric_line.dart';
 import '../widgets/apple_lyrics/parsers/lyric_parser_chain.dart';
 import 'favorites_provider.dart';
 import 'kugou_provider.dart';
+import 'position_rewind_gate.dart';
 import '../services/kugou_api/kugou_api_client.dart';
 import '../services/kugou_api/kugou_models.dart';
 
@@ -101,6 +102,10 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
   AudioQuality _audioQuality = AudioQuality.standard;
   // 音质降级提示开关（设置→播放→音质降级提示）。默认关闭。
   bool _showQualityDowngradeToast = false;
+
+  // 「关闭本地音乐评论区」开关（设置→播放→关闭本地音乐评论区）。默认开启：
+  // 开启时本地歌曲不显示播放器评论 tab，也不提供「看评论」入口。
+  bool _closeLocalMusicComments = true;
   // 当前网络是否为 WiFi（移动数据等非 Wi-Fi 视为 false）。默认 true：
   // 启动瞬间网络未就绪/桌面开发环境等无蜂窝网时按 WiFi 音质取，随后由
   // 网络探测/监听刷新。
@@ -200,6 +205,20 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
   /// 其它 widget 仅在 currentSong/isPlaying/duration 等低频字段变化时重建。
   final ValueNotifier<Duration> positionNotifier = ValueNotifier(Duration.zero);
 
+  /// 换源装载期间的「位置回退闸门」（见 [_updatePosition]、[PositionRewindGate]）。
+  final PositionRewindGate _positionRewindGate = PositionRewindGate();
+
+  /// 仅测试用：直接访问闸门，验证装载期间的回退采样被抑制、seek 落地后放行。
+  @visibleForTesting
+  PositionRewindGate get positionRewindGateForTest => _positionRewindGate;
+
+  /// 仅测试用：把一次位置采样喂给发布通道（等价于 positionStream 回调）。
+  ///
+  /// 测试环境没有音频平台实现，`seek()` 会挂在无实现的 MethodChannel 上，
+  /// 因此不通过真实音频链路，直接驱动 [_updatePosition] 验证闸门接线。
+  @visibleForTesting
+  void debugFeedPositionForTest(Duration value) => _updatePosition(value);
+
   Duration get position => _position;
   Duration? get duration => _duration;
   List<Song> get playlist => _playlist;
@@ -210,7 +229,13 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
 
   /// 更新播放位置并同步到 [positionNotifier]。
   /// 高频路径（positionStream ~200ms）只通知 positionNotifier，不触发全量 notifyListeners。
+  ///
+  /// **换源回退抑制**：`setUrl` 装载新源期间播放器位置会从 0 重新计数（直到
+  /// [seek] 落地），这段窗口里的采样是换源副作用而非真实跳转。[_positionRewindGate]
+  /// 开启时丢弃小于闸门下限的采样，避免进度条闪回 0:00、歌词滚回开头
+  /// （见 [PositionRewindGate] 与 docs/2026-09-11-pause-lyric-scroll-from-top-analysis.md）。
   void _updatePosition(Duration value) {
+    if (_positionRewindGate.shouldSuppress(value)) return;
     if (_position == value) return;
     _position = value;
     positionNotifier.value = value;
@@ -396,6 +421,14 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       // 恢复音质降级提示开关（重启后保留用户选择）
       _showQualityDowngradeToast =
           await SettingsRepository().getShowQualityDowngradeToast();
+      // 恢复「关闭本地音乐评论区」开关（重启后保留用户选择）。
+      // 加载后按需通知一次：播放器若已挂载，据此重建 tab 结构。
+      final closeLocalMusicComments =
+          await SettingsRepository().getCloseLocalMusicComments();
+      if (_closeLocalMusicComments != closeLocalMusicComments) {
+        _closeLocalMusicComments = closeLocalMusicComments;
+        notifyListeners();
+      }
       // 恢复上次播放状态
       await _restoreState();
     } catch (e) {}
@@ -592,6 +625,26 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     } catch (_) {}
   }
 
+  /// 「关闭本地音乐评论区」开关（默认开启）。
+  bool get closeLocalMusicComments => _closeLocalMusicComments;
+
+  /// 是否展示 [song] 的评论入口。
+  /// 消费方：全屏播放器评论 tab、歌曲长按菜单「看评论」、播放失败弹窗「看评论」。
+  /// 在线歌曲恒为 true；本地歌曲由 [closeLocalMusicComments] 决定。
+  bool showsCommentsFor(Song song) =>
+      song.isOnline || !_closeLocalMusicComments;
+
+  /// 设置「关闭本地音乐评论区」：更新内存 → 通知（已挂载的播放器据此重建
+  /// tab 结构）→ 持久化。
+  Future<void> setCloseLocalMusicComments(bool value) async {
+    if (_closeLocalMusicComments == value) return;
+    _closeLocalMusicComments = value;
+    notifyListeners();
+    try {
+      await SettingsRepository().setCloseLocalMusicComments(value);
+    } catch (_) {}
+  }
+
   Future<dynamic> _loadAudioService() async {
     return AudioServiceLoader.load();
   }
@@ -647,7 +700,12 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
         orElse: () => AppLoopMode.off,
       );
       _shuffleEnabled = state.shuffleEnabled;
-      _updatePosition(Duration.zero); // 先置零，等 setUrl 成功后 seek 到目标位置
+      // 以恢复出来的进度作为初始发布值（不再"先置零"）。
+      // 置零会让歌词视图/进度条在源装载完成前看到 0：歌词把行号判成第一行并
+      // 用掉"首次定位瞬移"，等下面 seek 到真实位置后再从开头长距离滚回当前行
+      //（用户看到"暂停后歌词从头滚到当前行"）。这里直接发布目标进度，
+      // 装载期间的回退采样由 [_positionRewindGate] 抑制。
+      _updatePosition(state.position);
 
       // 冷启动时清除在线歌曲的旧 URL（酷狗播放链接有时效性，上次会话的 URL 大概率已过期）
       // 强制 _resolveAndPlayCurrentSong 重新通过 API 获取有效链接
@@ -826,8 +884,12 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       try {
         _playerErrorSubscription =
             _audioService.player.errorStream.listen((e) {
+          // just_audio 0.10.x：code=10000000（kInterruptedErrorCode）表示「本次 load 被
+          // 下一次 setUrl 抢占而中止」，属良性信号，不是解码失败 —— 快速切歌时会高频出现。
+          // 保留日志但显式标注，避免在诊断导出里被误读成 32bit/格式解码失败。
+          final tag = e.code == 10000000 ? ' (良性：加载被切歌打断)' : '';
           debugPrint(
-              '[UsbDiag] player error: code=${e.code} message="${e.message}"');
+              '[UsbDiag] player error: code=${e.code} message="${e.message}"$tag');
         });
       } catch (_) {
         // 动态类型模块无 player/errorStream 时忽略
@@ -2126,32 +2188,52 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     // 诊断日志：setUrl
     // ignore: avoid_print
     print('[D切歌] setUrl → ${url.substring(0, url.length < 60 ? url.length : 60)}');
-    // 音量均衡：把当前歌曲的响度元数据带给播放器（无响度则旁路为 0 dB）。
-    await _audioService.setUrl(
-      url,
-      loudnessLufs: _currentSong?.loudnessLufs,
-      loudnessPeakDb: _currentSong?.loudnessPeakDb,
-    );
-    final deadline = DateTime.now().add(const Duration(seconds: 10));
-    while (DateTime.now().isBefore(deadline)) {
-      final state = _audioService.player.playerState;
-      if (state.processingState == just_audio.ProcessingState.ready) {
-        if (seekTo != null && seekTo > Duration.zero) {
-          await _audioService.seek(seekTo);
+    // 换源回退抑制：setUrl 之后播放器位置会从 0 重新计数，直到下面 seek 落地。
+    // 这段窗口里发布 0 会让进度条闪回 0:00、歌词滚回开头（见 [_updatePosition]）。
+    // 有明确 seek 目标时开启闸门，装载全程丢弃小于目标的采样，seek 后回填目标值。
+    final bool gateRewind = seekTo != null && seekTo > Duration.zero;
+    if (gateRewind) _positionRewindGate.arm(seekTo);
+    try {
+      // 音量均衡：把当前歌曲的响度元数据带给播放器（无响度则旁路为 0 dB）。
+      await _audioService.setUrl(
+        url,
+        loudnessLufs: _currentSong?.loudnessLufs,
+        loudnessPeakDb: _currentSong?.loudnessPeakDb,
+      );
+      final deadline = DateTime.now().add(const Duration(seconds: 10));
+      while (DateTime.now().isBefore(deadline)) {
+        final state = _audioService.player.playerState;
+        if (state.processingState == just_audio.ProcessingState.ready) {
+          if (seekTo != null && seekTo > Duration.zero) {
+            await _audioService.seek(seekTo);
+            if (gateRewind) {
+              // 闸门关闭 + 立即回填目标位置：UI 不等下一帧采样即可回到正确进度
+              _positionRewindGate.disarm();
+              _updatePosition(seekTo);
+            }
+          }
+          if (playAfter) {
+            await _audioService.play();
+          }
+          return;
         }
-        if (playAfter) {
-          await _audioService.play();
-        }
-        return;
+        await Future.delayed(const Duration(milliseconds: 100));
       }
-      await Future.delayed(const Duration(milliseconds: 100));
-    }
-    // 超时仍尝试 seek/play,避免完全卡住
-    if (seekTo != null && seekTo > Duration.zero) {
-      await _audioService.seek(seekTo);
-    }
-    if (playAfter) {
-      await _audioService.play();
+      // 超时仍尝试 seek/play,避免完全卡住
+      if (seekTo != null && seekTo > Duration.zero) {
+        await _audioService.seek(seekTo);
+        if (gateRewind) {
+          _positionRewindGate.disarm();
+          _updatePosition(seekTo);
+        }
+      }
+      if (playAfter) {
+        await _audioService.play();
+      }
+    } finally {
+      // 装载结束（含异常）一定释放闸门，防止位置被永久抑制；
+      // 若已在上面的 seek 分支释放则此处为幂等空操作。
+      _positionRewindGate.disarm();
     }
   }
 
@@ -3235,13 +3317,15 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
             },
             child: const Text('去看MV'),
           ),
-          TextButton(
-            onPressed: () {
-              Navigator.pop(dialogCtx);
-              showSongCommentsSheet(ctx, song);
-            },
-            child: const Text('看评论'),
-          ),
+          // 与列表长按菜单同一谓词：本地歌曲开启「关闭本地音乐评论区」时不提供入口
+          if (showsCommentsFor(song))
+            TextButton(
+              onPressed: () {
+                Navigator.pop(dialogCtx);
+                showSongCommentsSheet(ctx, song);
+              },
+              child: const Text('看评论'),
+            ),
         ],
       ),
     );

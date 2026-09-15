@@ -23,9 +23,6 @@
 -keep class com.md3music.md3music.UsbAudioAdapter { *; }
 -keep class com.ryanheise.just_audio.UsbAudioSinkController { *; }
 -keep class com.ryanheise.just_audio.UsbAudioSink { *; }
-
-# ── Miuix 组件（Compose Multiplatform，无自带 consumer rules，R8 需保留类结构） ──
--keep class top.yukonga.miuix.** { *; }
 # Proguard rules specific to the core module.
 
 # Constructors accessed via reflection in DefaultRenderersFactory
@@ -49,6 +46,15 @@
 -keepclassmembers class androidx.media3.decoder.flac.LibflacAudioRenderer {
   <init>(android.os.Handler, androidx.media3.exoplayer.audio.AudioRendererEventListener, androidx.media3.exoplayer.audio.AudioSink);
 }
+
+# ── libflac 扩展（源码本地化）：native 侧靠 GetMethodID/FindClass 按「字面名字+描述符」反射，
+#    R8 剥掉这些成员后 release 包下所有 FLAC 在 extractor 阶段即 Source error(3001)。
+#    media3 官方 consumer rules（libraries/decoder_flac/proguard-rules.txt，本仓参考副本在 tmp/media3-src/ 下）随源码引入而丢失，
+#    故在此补回；debug（不混淆）不复现，只影响 release。详见
+#    .trae/documents/2026-09-13-usb-exclusive-silence-flac-libflac-r8-analysis.md
+-keep class androidx.media3.decoder.flac.FlacDecoderJni { *; }
+-keep class androidx.media3.extractor.FlacStreamMetadata { *; }
+-keep class androidx.media3.extractor.metadata.flac.PictureFrame { *; }
 -dontnote androidx.media3.decoder.ffmpeg.FfmpegAudioRenderer
 -keepclassmembers class androidx.media3.decoder.ffmpeg.FfmpegAudioRenderer {
   <init>(android.os.Handler, androidx.media3.exoplayer.audio.AudioRendererEventListener, androidx.media3.exoplayer.audio.AudioSink);

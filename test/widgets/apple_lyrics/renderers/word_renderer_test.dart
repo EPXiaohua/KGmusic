@@ -1,5 +1,7 @@
+import 'dart:typed_data';
 import 'dart:ui' as ui;
 
+import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:md3music/widgets/apple_lyrics/layout/lyric_layout.dart';
 import 'package:md3music/widgets/apple_lyrics/models/lyric_line.dart';
@@ -478,4 +480,88 @@ void main() {
       );
     });
   });
+
+  // ==================== 翻译副行日历式翻转 ====================
+  group('翻译副行翻转', () {
+    // 带逐字时间戳的当前行（WordRenderer 的正常调用场景）+ 翻译副行
+    const krcLineWithTrans = LyricLine(
+      startTime: 0,
+      duration: 4000,
+      text: '短句',
+      words: [
+        LyricWord(startTime: 0, duration: 2000, text: '短'),
+        LyricWord(startTime: 2000, duration: 2000, text: '句'),
+      ],
+      translation: '译文',
+    );
+
+    double sublineHeight() {
+      const double fontSize = 20;
+      final int rows = LyricLayout.measureAuxRows('译文', fontSize, 200);
+      return rows *
+          LyricLayout.translationFontSize(fontSize) *
+          LyricLayout.translationLineHeight;
+    }
+
+    test('副行就位时不施加画布变换，但副行照常绘制', () {
+      renderer.setLineState(isActive: true, scale: LyricLayout.activeScale);
+      renderer.translationExpand = 1.0;
+      renderer.translationFade = 1.0;
+      renderer.translationExiting = false;
+      final canvas = RecordingCanvas();
+      renderer.paintLine(canvas, ui.Offset.zero, krcLineWithTrans, 20,
+          maxWidth: 200, viewportWidth: 200);
+      expect(canvas.transforms, isEmpty);
+      expect(canvas.drawParagraphOffsets, isNotEmpty);
+    });
+
+    test('入场中途绕副行底边翻转（锚线不动）', () {
+      renderer.setLineState(isActive: true, scale: LyricLayout.activeScale);
+      renderer.translationExpand = 0.5;
+      renderer.translationFade = 0.5;
+      renderer.translationExiting = false;
+      final canvas = RecordingCanvas();
+      renderer.paintLine(canvas, ui.Offset.zero, krcLineWithTrans, 20,
+          maxWidth: 200, viewportWidth: 200);
+      expect(canvas.transforms, hasLength(1));
+
+      final ui.Offset subOffset = canvas.drawParagraphOffsets.last;
+      final Matrix4 m = Matrix4.fromFloat64List(canvas.transforms.single);
+      // sublineWidth 传 0：本用例只校验锚线 y；锚点 x（透视投影中心）由
+      // lyric_layout_subline_flip_test 的锚点与左右对称用例覆盖。
+      final ui.Offset anchor = LyricLayout.sublineFlipAnchor(
+        transX: subOffset.dx,
+        sublineWidth: 0,
+        transY: subOffset.dy,
+        sublineHeight: sublineHeight(),
+        exiting: false,
+      );
+      final double anchorY = anchor.dy;
+      expect(anchorY, closeTo(subOffset.dy + sublineHeight(), 1e-6),
+          reason: '入场锚线 = 副行底边');
+      final ui.Offset fixed =
+          MatrixUtils.transformPoint(m, ui.Offset(50, anchorY));
+      expect(fixed.dy, closeTo(anchorY, 1e-6), reason: '锚线是不动点');
+    });
+  });
+}
+
+/// 记录 [ui.Canvas.drawParagraph] 位置与画布变换的测试画布（其余方法走 noSuchMethod 兜底）。
+class RecordingCanvas implements ui.Canvas {
+  final List<ui.Offset> drawParagraphOffsets = <ui.Offset>[];
+
+  /// 按调用顺序记录 `canvas.transform` 传入的 4x4 矩阵（column-major 副本）。
+  final List<Float64List> transforms = <Float64List>[];
+
+  @override
+  void drawParagraph(ui.Paragraph paragraph, ui.Offset offset) {
+    drawParagraphOffsets.add(offset);
+  }
+
+  @override
+  void transform(Float64List matrix4) =>
+      transforms.add(Float64List.fromList(matrix4));
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) => null;
 }

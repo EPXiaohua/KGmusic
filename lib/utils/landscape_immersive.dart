@@ -18,6 +18,12 @@ final ValueNotifier<bool> kPlayerZenImmersiveActive = ValueNotifier<bool>(false)
 /// 跳过覆盖，避免切歌/亮屏把横屏沉浸冲掉（与 Zen 同源问题）。参照 kCoverFlowImmersiveActive 模式。
 final ValueNotifier<bool> kPlayerLandscapeImmersiveActive = ValueNotifier<bool>(false);
 
+/// 全屏播放器「横屏自动隐藏系统栏」开关（设置 → 播放 → 横屏隐藏状态栏），默认开启。
+///
+/// 由 main.dart 启动引导从设置恢复、由设置页开关即时同步。
+/// 仅影响横屏自动沉浸；Zen 模式（用户长按封面主动进入）不受此开关影响。
+bool kLandscapeImmersiveEnabled = true;
+
 /// 全屏播放器竖屏下的系统栏样式。
 ///
 /// **重要**：[AmStyleFullPlayer._buildFullLayout] 中 AnnotatedRegion 的 value
@@ -48,7 +54,8 @@ SystemUiOverlayStyle mainPageOverlayStyle(BuildContext context) {
 
 /// 根据当前屏幕方向启用或禁用全屏沉浸模式。
 ///
-/// - 横屏（landscape）：启用 [SystemUiMode.immersiveSticky]，隐藏状态栏和导航栏。
+/// - 横屏（landscape）：[kLandscapeImmersiveEnabled] 开启时启用
+///   [SystemUiMode.immersiveSticky]，隐藏状态栏和导航栏；关闭时按竖屏处理。
 /// - 竖屏（portrait）：启用 [SystemUiMode.edgeToEdge]，导航栏透明，内容延伸到导航栏后面。
 ///
 /// 调用时机：
@@ -58,11 +65,11 @@ SystemUiOverlayStyle mainPageOverlayStyle(BuildContext context) {
 void applyImmersiveForOrientation() {
   final view = WidgetsBinding.instance.platformDispatcher.views.first;
   final isLandscape = view.physicalSize.width > view.physicalSize.height;
-  if (isLandscape) {
+  if (isLandscape && kLandscapeImmersiveEnabled) {
     // 横屏：完全沉浸，隐藏状态栏和导航栏
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
   } else {
-    // 竖屏：edgeToEdge，导航栏透明，内容延伸到导航栏后面。
+    // 竖屏 / 横屏但已关闭沉浸：edgeToEdge，导航栏透明，内容延伸到导航栏后面。
     // 先强制恢复系统栏显示：从 immersiveSticky（zen/横屏）切到 edgeToEdge 时，
     // 部分设备状态栏不会自动重新显示，必须先 manual 显式 show 再切 edgeToEdge。
     SystemChrome.setEnabledSystemUIMode(

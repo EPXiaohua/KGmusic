@@ -23,6 +23,7 @@ import 'package:flutter/scheduler.dart';
 import '../../core/utils/app_haptics.dart';
 import 'package:flutter/widgets.dart';
 
+import '../../core/services/player_frame_driver.dart';
 import 'controllers/lyric_scroll_controller.dart';
 import 'animation/spring.dart';
 import 'layout/duet_layout.dart';
@@ -163,7 +164,7 @@ class AppleLyricsView extends StatefulWidget {
 }
 
 class _AppleLyricsViewState extends State<AppleLyricsView>
-    with SingleTickerProviderStateMixin {
+    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
   // ============== 动画驱动 ==============
   //
   // 使用 Ticker（而非 AnimationController.addListener + DateTime.now()）驱动每帧，
@@ -285,8 +286,11 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
   // 16.67ms Timer 驱动 _onTick，帧生产被真正限制到 60fps；解锁/关闭 eco 时
   // 切回 Ticker 满帧。
 
-  /// eco 锁定时的 60fps 限帧定时器（真正的帧率限制驱动源）。
-  Timer? _ecoTimer;
+  /// eco 锁定时是否挂在共享 60fps 帧驱动上（真正的帧率限制驱动源）。
+  ///
+  /// 与封面旋转/频谱共用 [PlayerFrameDriver] 的同一节拍：两者独立起 16ms
+  /// Timer 时相位错开，会让 120Hz 屏整页跑到 ~120fps（功耗翻倍）。
+  bool _ecoDriverBound = false;
 
   /// Ticker 帧间隔跳变阈值（秒）。
   ///
@@ -306,7 +310,46 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
   /// 当前驱动源是否为 60fps eco Timer（eco Timer 在跑且满帧 Ticker 未跑）。
   /// 仅测试用：验证挂载即确定性建立 eco 限帧、不依赖 Ticker 的 _onTick 自我纠正。
   @visibleForTesting
-  bool get ecoDriverIsTimerForTest => _ecoTimer != null && !_isTickerRunning;
+  bool get ecoDriverIsTimerForTest => _ecoDriverBound && !_isTickerRunning;
+
+  /// eco Timer 是否存活（仅测试用：验证 P0-A 挂起/恢复语义）。
+  @visibleForTesting
+  bool get ecoTimerActiveForTest => _ecoDriverBound;
+
+  // P0-A：驱动源可见性门控状态。
+  //
+  // Ticker 由 TickerMode/引擎自动 mute，但 eco Timer 不受任何可见性约束——
+  // TabBarView 切走 / App 退后台后仍会以 16ms 周期驱动 _onTick 产生离屏重绘。
+  // 两个标志任一为 true 时，[_syncEcoDriver] 挂起全部驱动源。
+
+  /// App 处于后台（hidden/paused/detached）。
+  bool _lifecycleSuspended = false;
+
+  /// TickerMode 关闭（歌词 tab 被切走，与 Ticker mute 同源）。
+  bool _tickerModeMuted = false;
+
+  /// 从挂起恢复后的首个 _onTick 按"gap 恢复"处理（Timer 路径 dt 恒 16ms，
+  /// 自身检测不到挂起时长缺口，需此标记对齐间奏点等帧时钟动画）。
+  bool _resumeGapPending = false;
+
+  /// 间奏点是否仍处于激活（需要绘制）状态。仅测试用：验证跳转离开间奏后
+  /// 圆点已自动清除，不会悬浮残留在原 anchor 行（穿帮回归护栏）。
+  @visibleForTesting
+  bool get interludeDotsActiveForTest => _interludeDots.shouldRender;
+
+  /// 间奏点是否已进入消失动画阶段（末 750ms）。仅测试用：验证"跳转离开"
+  /// 与"自然结束"两条路径被正确区分。
+  @visibleForTesting
+  bool get interludeDotsInExitPhaseForTest => _interludeDots.isInExitPhase;
+
+  /// 间奏占位展开进度（0=完全收起，1=完全展开）。仅测试用。
+  @visibleForTesting
+  double get interludeExpandProgressForTest => _interludeExpandProgress;
+
+  /// 第 i 行的副行预留高度（已含副行过长换行的行数）。仅测试用：
+  /// 验证副行换行后行距预留随视觉行数增长（否则换行副行压到下一行）。
+  @visibleForTesting
+  double auxSubHeightForTest(int i) => _auxSubHeightOf(i);
 
   /// P1-C：上次间奏检测时的权威播放时间（毫秒）。
   ///
@@ -605,12 +648,18 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
     return _interludePlaceholderHeight * _interludeExpandProgress;
   }
 
-  /// 副行（翻译/罗马音）预留高度，跟随 fontSize（重算行高时更新）。
+  /// 每行副行（翻译/罗马音）预留高度（含过长换行），索引与 [_cleanedLines] 对齐。
   ///
-  /// 公式与 [LyricLayout.measureLineHeight] 的副行预留口径一致：
-  /// `translationFontSize × translationLineHeight + translationFontSize × 0.3`。
-  /// 行高缓存恒按纯主行测量，副行占位由本值 × 动画进度每帧动态叠加。
-  double _transSubHeight = 0;
+  /// 公式见 [LyricLayout.auxSubHeight]：`rows × transFontSize × 1.5 + 0.3em 间隙`，
+  /// rows 为该行副行在可用宽度内的实际视觉行数。行高缓存恒按纯主行测量，
+  /// 副行占位由本值 × 动画进度每帧动态叠加。
+  /// **逐行取值**：不同行的副行行数不同（有的一行、有的换行成 2~3 行），
+  /// 用单一"单行高度"会让换行副行压到下一行歌词上（行距未调整）。
+  List<double> _auxSubHeights = const <double>[];
+
+  /// 第 i 行的副行预留高度（无副行文本/越界 → 0）。
+  double _auxSubHeightOf(int i) =>
+      (i >= 0 && i < _auxSubHeights.length) ? _auxSubHeights[i] : 0;
 
   /// 正在收起副行的行索引 → 收起进度（0=刚开始收起，1=完全收起后移除）。
   ///
@@ -633,38 +682,34 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
   /// 第 i 行因副行动画产生的额外高度（行高消费点叠加）。
   ///
   /// 当前行跟随展开进度增长；收起表中的行随收起进度回落；其余行恒 0
-  /// （静态行高即纯主行高度）。
+  /// （静态行高即纯主行高度）。各自使用**该行自身的**副行预留高度
+  /// （[_auxSubHeightOf]，已含换行行数），换行副行不会与下一行重叠。
   ///
   /// **不读 showTranslation 做立即短路**：关闭翻译时 target 变 0、进度指数
   /// 衰减到 0，高度跟随动画平滑收起——若在此短路，关闭瞬间高度直接塌缩。
   /// 进度收敛后本值自然归 0，无残留。
   double _transExtraHeightFor(int i) {
-    if (_transSubHeight <= 0) {
-      return 0;
-    }
     if (i == _currentLineIndex && _lineHasAuxText(i)) {
-      return _transSubHeight * _translationExpandProgress;
+      return _auxSubHeightOf(i) * _translationExpandProgress;
     }
     final double? c = _transCollapsing[i];
-    return c == null ? 0 : _transSubHeight * (1.0 - c);
+    return c == null ? 0 : _auxSubHeightOf(i) * (1.0 - c);
   }
 
   /// 第 i 行上方所有副行动画高度之和（行 top 消费点叠加）。
   ///
   /// 当前行与收起中的行通常相邻（outgoing = current - 1），表极小（≤4），
-  /// 遍历开销可忽略。不读 showTranslation 短路（理由同 [_transExtraHeightFor]）。
+  /// 遍历开销可忽略。各行使用自身的副行预留高度（与 [_transExtraHeightFor] 同口径）。
+  /// **不读 showTranslation 短路**（理由同 [_transExtraHeightFor]）。
   double _transDeltaBefore(int i) {
-    if (_transSubHeight <= 0) {
-      return 0;
-    }
     double d = 0;
     if (_currentLineIndex >= 0 &&
         _currentLineIndex < i &&
         _lineHasAuxText(_currentLineIndex)) {
-      d += _transSubHeight * _translationExpandProgress;
+      d += _auxSubHeightOf(_currentLineIndex) * _translationExpandProgress;
     }
     _transCollapsing.forEach((k, v) {
-      if (k < i) d += _transSubHeight * (1.0 - v);
+      if (k < i) d += _auxSubHeightOf(k) * (1.0 - v);
     });
     return d;
   }
@@ -757,10 +802,24 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
     _lineHeights = heights;
     _lineTops = tops;
     _interludeAfterIndices = interludeIndices;
-    // 副行预留高度（与 measureLineHeight 预留口径一致），供每帧动态叠加
-    final double transFontSize = LyricLayout.translationFontSize(fontSize);
-    _transSubHeight = transFontSize * LyricLayout.translationLineHeight +
-        transFontSize * 0.3;
+    // 逐行副行预留高度（含过长换行）：按 displayMode 取翻译或罗马音，
+    // 用实际视觉行数 × 副行行高 + 0.3em 间隙。仅在副行文本非空时测量，
+    // 无翻译/罗马音的歌零额外开销。此值在动画中按进度逐行叠加（见
+    // [_transExtraHeightFor]），也是 renderer 副行"长出"位移的取值来源。
+    final List<double> auxHeights = List<double>.filled(_cleanedLines.length, 0);
+    for (int i = 0; i < _cleanedLines.length; i++) {
+      final line = _cleanedLines[i];
+      final String? auxText =
+          currentDisplayMode == LyricDisplayMode.roma
+              ? line.roma
+              : line.translation;
+      if (auxText == null || auxText.isEmpty) continue;
+      auxHeights[i] = LyricLayout.auxSubHeight(
+        fontSize,
+        LyricLayout.measureAuxRows(auxText, fontSize, maxLineWidth),
+      );
+    }
+    _auxSubHeights = auxHeights;
     // 重置激活间奏（lines 变化时）
     _activeInterludeIdx = -1;
     _lastActiveAnchorIdx = -1;
@@ -786,6 +845,8 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
     // 里 Ticker 被 mute、_onTick 从不触发，限帧自我纠正失效，页面停在 120Hz，
     // 必须拨动开关才恢复。改走 _syncEcoDriver() 与拨动开关走同一条路径。
     _syncEcoDriver();
+    // P0-A：监听 App 生命周期——退后台挂起驱动源、回前台恢复（见 _syncEcoDriver）
+    WidgetsBinding.instance.addObserver(this);
     // 自动回弹触发时恢复模糊（由 _computeLineBlur 自动处理）
     _scrollController.onAutoReturn = () {};
     // 解耦：初始化权威时间；提供 positionListenable 时内部订阅位置更新
@@ -802,6 +863,28 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) _syncEcoDriver();
     });
+  }
+
+  /// P0-A：跟踪 TickerMode（TabBarView 切走时 Ticker 自动 mute，Timer 需同步挂起）。
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final bool muted = !TickerMode.of(context);
+    if (muted != _tickerModeMuted) {
+      _tickerModeMuted = muted;
+      _syncEcoDriver();
+    }
+  }
+
+  /// P0-A：App 退后台挂起驱动源，回前台恢复（见 _syncEcoDriver）。
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final bool suspended = state == AppLifecycleState.hidden ||
+        state == AppLifecycleState.paused ||
+        state == AppLifecycleState.detached;
+    if (suspended == _lifecycleSuspended) return;
+    _lifecycleSuspended = suspended;
+    _syncEcoDriver();
   }
 
   /// v3 优化：幂等启动 Ticker。
@@ -837,35 +920,51 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
     _readAuthorityFrom(listenable);
     if (_authorityTimeMs == prev) return;
     if (widget.isPlaying) {
-      final bool ecoLocked =
-          LyricPreferences.instance.ecoMode && !_ecoUnlocked;
-      if (ecoLocked) {
-        _syncEcoDriver();
-      } else {
-        _startTickerIfNeeded();
-      }
+      // 统一走 _syncEcoDriver：锁定 → 确保 60fps Timer；解锁/关闭 → Ticker 满帧
+      _syncEcoDriver();
     }
   }
 
   /// 省电模式驱动源同步：在 Ticker（满帧）与 60fps Timer 之间切换。
   ///
+  /// - 页面不可见（TabBarView 切走 / App 退后台）→ 挂起全部驱动源（P0-A）
   /// - eco 开启且锁定 → 停 Ticker，用 16.67ms Timer 驱动 _onTick，
   ///   把实际帧生产限制到 60fps（Ticker 每帧 scheduleFrame 会让 120Hz 屏
   ///   始终 120fps，仅节流 _onTick 计算省不掉帧）。
   /// - 解锁 / eco 关闭 → 取消 Timer，恢复 Ticker 满帧。
+  ///
+  /// 所有"唤醒驱动"的路径一律走本方法，保证任意时刻至多一个驱动源：
+  /// 裸调 _startTickerIfNeeded 会出现 Ticker + Timer 并存，而 Ticker 被
+  /// TickerMode mute 时 _onEcoTimerTick 会因 _isTickerRunning 持续早退，
+  /// 驱动源实质失效（"切歌后省电模式失效、须重新开关"的一类根因）。
   void _syncEcoDriver() {
+    // P0-A：不可见时挂起。Ticker 此刻本就被 TickerMode/引擎 mute（不回调、
+    // 不产帧），Timer 则不受任何可见性约束，必须显式取消——否则逐字播放中
+    // （恒不收敛）切走 tab / 退后台后仍以 60Hz 驱动 _onTick → 离屏重绘。
+    if (_lifecycleSuspended || _tickerModeMuted) {
+      _resumeGapPending = true;
+      if (_ecoDriverBound) {
+        PlayerFrameDriver.instance.removeListener(_onEcoFrameTick);
+        _ecoDriverBound = false;
+      }
+      return;
+    }
     final bool wantTimer = LyricPreferences.instance.ecoMode && !_ecoUnlocked;
     if (wantTimer) {
       if (_isTickerRunning) {
         _stopTickerIfNeeded();
       }
-      _ecoTimer ??= Timer.periodic(
-        const Duration(milliseconds: 16),
-        _onEcoTimerTick,
-      );
+      if (!_ecoDriverBound) {
+        // 挂在共享节拍上：与封面旋转/频谱同相位，避免两个独立 16ms Timer
+        // 交错产帧把整页推到 120fps（各组件更新率仍为 60fps，无视觉降级）。
+        PlayerFrameDriver.instance.addListener(_onEcoFrameTick);
+        _ecoDriverBound = true;
+      }
     } else {
-      _ecoTimer?.cancel();
-      _ecoTimer = null;
+      if (_ecoDriverBound) {
+        PlayerFrameDriver.instance.removeListener(_onEcoFrameTick);
+        _ecoDriverBound = false;
+      }
       if (!_isTickerRunning) {
         // 复用幂等启动：Ticker 重启后首帧回调传 elapsed=0，必须重置 _lastElapsed
         // 使首帧 dt=0，否则会算出负 dt（blurFade 指数爆炸超出 [0,1]）。
@@ -874,11 +973,15 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
     }
   }
 
-  /// eco 锁定态下由 60fps Timer 驱动：以 16ms 步进推进帧时钟，调用 [_onTick]。
-  void _onEcoTimerTick(Timer timer) {
-    if (!mounted || _isTickerRunning) return;
+  /// eco 锁定态下由共享 60fps 帧驱动推进：以 16ms 步进推进帧时钟，调用 [_onTick]。
+  void _onEcoFrameTick() {
+    if (!mounted) return;
+    if (_isTickerRunning) {
+      // Ticker 与 Timer 并存：Timer 被 _isTickerRunning 阻塞，本帧不驱动。
+      return;
+    }
     // 用 _lastElapsed + 16ms 作为本帧时间：_onTick 内 dt 即 16ms，动画按真实时间推进
-    _onTick(_lastElapsed + const Duration(milliseconds: 16));
+    _onTick(_lastElapsed + PlayerFrameDriver.step);
   }
 
   /// v3 优化：检测所有 perLine 偏移弹簧是否已收敛。
@@ -1021,9 +1124,8 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
       _wordRenderers.clear();
       _lineRenderers.clear();
     }
-    // 始终重启 ticker + setState，确保偏好变化（如 useDuetLayout）触发 build
-    _startTickerIfNeeded();
-    // eco 开关变化时同步驱动源：锁定 → 60fps Timer 限帧；解锁/关闭 → Ticker 满帧
+    // 统一走 _syncEcoDriver 确定驱动源（eco 开关变化：锁定 → 60fps Timer；
+    // 解锁/关闭 → Ticker 满帧），并确保偏好变化（如 useDuetLayout）触发重建
     _syncEcoDriver();
     setState(() {});
   }
@@ -1036,20 +1138,12 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
     _lineRenderers.removeWhere((key, _) => key >= widget.lines.length);
     // v3 优化：恢复播放或切歌时立即重启驱动（停止态恢复）。
     //
-    // **省电模式关键**：eco 开启且锁定（_ecoUnlocked=false）时，驱动源是
-    // 60fps Timer，这里**绝不能**直接 `_startTickerIfNeeded()`——否则每 ~200ms
-    // position 更新（ListenableBuilder 重建本 widget）都会把 Ticker 以 120Hz
-    // 重启一帧，即便画面静止也持续产生额外帧，破坏"锁 60fps"（这正是
-    // "开了开关仍锁不住 60fps"的一个因素）。统一走 [_syncEcoDriver] 决策：
-    // 锁定 → 确保 60fps Timer 在跑；解锁/关闭 eco → 才用 Ticker 满帧。
-    final bool ecoLocked =
-        LyricPreferences.instance.ecoMode && !_ecoUnlocked;
+    // **省电模式关键**：统一走 [_syncEcoDriver] 决策——eco 开启且锁定 →
+    // 确保 60fps Timer 在跑（绝不能裸起 Ticker，否则每 ~200ms position 更新
+    // 都会以 120Hz 重启一帧，破坏"锁 60fps"）；解锁/关闭 eco → Ticker 满帧。
+    // 任意时刻至多一个驱动源，由本方法集中保证。
     if (oldWidget.isPlaying != widget.isPlaying && widget.isPlaying) {
-      if (ecoLocked) {
-        _syncEcoDriver();
-      } else {
-        _startTickerIfNeeded();
-      }
+      _syncEcoDriver();
     }
     // v3 优化：切歌（lines 引用变化）时重启驱动，重新推进新行的 renderer
     if (!identical(oldWidget.lines, widget.lines) ||
@@ -1066,24 +1160,19 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
       _delayStartTimes.clear();
       // 切歌后首次定位直接瞬移到新歌当前行（避免从旧歌曲的长距离滚动）
       _scrollController.resetInitialJump();
-      if (ecoLocked) {
-        _syncEcoDriver();
-      } else {
-        _startTickerIfNeeded();
-      }
+      // 切歌诊断日志：定位"切歌后省电模式失效须重新开关"问题用（低频事件）
+      _syncEcoDriver();
     }
     // P0-A: 非逐字歌词在播放中可能已停 Ticker（静止省电）。position 更新
     //（约 200ms，经 ListenableBuilder 重建本 widget）时唤醒一帧：若确实
     // 发生行切换 / 滚动回弹 / 间奏等动画则继续跑，否则下一帧再次收敛停止。
     // **省电模式锁定态**：由 60fps Timer 持续驱动，无需（也不应）重启 Ticker。
     if (oldWidget.currentTimeMs != widget.currentTimeMs && widget.isPlaying) {
-      if (ecoLocked) {
-        _syncEcoDriver();
-      } else {
-        _startTickerIfNeeded();
-      }
+      _syncEcoDriver();
     }
     // 解耦：positionListenable 实例变化时重新挂载订阅
+    // （切歌时若宿主换了 notifier 实例，旧订阅失效 → position 永久静默 →
+    //  停帧后无法唤醒，表现为"省电模式失效"，故此处的切换必须可观测）
     if (oldWidget.positionListenable != widget.positionListenable) {
       oldWidget.positionListenable?.removeListener(_onExternalPosition);
       final listenable = widget.positionListenable;
@@ -1098,9 +1187,12 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     widget.positionListenable?.removeListener(_onExternalPosition);
-    _ecoTimer?.cancel();
-    _ecoTimer = null;
+    if (_ecoDriverBound) {
+      PlayerFrameDriver.instance.removeListener(_onEcoFrameTick);
+      _ecoDriverBound = false;
+    }
     _ticker.dispose();
     _scrollController.dispose();
     _repaintNotifier.dispose();
@@ -1230,7 +1322,11 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
     // 间奏点动画时钟（帧 dt 累积）冻结而歌曲继续播放，需在本帧把时钟
     // 对齐到真实窗口进度（见 _updateInterlude 的 alignDotsToRealTime）。
     // 该检测为 O(1) 比较，不增加每帧开销。
-    final bool tickerGapResume = dt > _tickerGapResumeThreshold;
+    // P0-A：挂起恢复（Timer 路径 dt 恒为 16ms，检测不到 gap）后的首帧
+    // 也按 gap 恢复处理，对齐间奏点等帧时钟动画到真实进度。
+    final bool tickerGapResume =
+        dt > _tickerGapResumeThreshold || _resumeGapPending;
+    _resumeGapPending = false;
 
     // ============== 歌词省电模式：锁定 60fps ==============
     // 解锁（120Hz 满帧）仅限"用户驱动"的滚动：
@@ -1243,6 +1339,7 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
     // **真正限帧由 [_syncEcoDriver] 切换 Ticker/Timer 实现**：锁定 → 停 Ticker、
     // 用 60fps Timer 驱动 _onTick（限制实际帧生产）；解锁/关闭 eco → Ticker 满帧。
     if (LyricPreferences.instance.ecoMode) {
+      final bool wasUnlocked = _ecoUnlocked;
       _ecoUnlocked = _scrollController.isUserScrolling ||
           (_scrollController.isWaitingForAutoReturn &&
               !_scrollController.isPosYSpringSettled);
@@ -1318,11 +1415,16 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
       // 过渡速率 = 退场行主文本退场淡出速率（[_fadeRateForMs]：快歌快、
       // 慢歌最多 1s），副行收起与原歌词退场严格同速；无退场行（首行/
       // 间奏后）用入场行时长。收起与展开共用该速率，维持下方行零位移。
-      _transSwitchRate = outgoingIdx >= 0
-          ? _fadeRateForMs(widget.lines[outgoingIdx].duration)
-          : (_currentLineIndex >= 0
-              ? _fadeRateForMs(widget.lines[_currentLineIndex].duration)
-              : 14.0);
+      // 边界防御：切歌等 lines 整体替换场景下，outgoingIdx 可能超出新歌词
+      // 行数（_previousLineIndex 尚未随新行更新）。越界访问会让 _onTick 每帧
+      // 抛异常、歌词永久冻结（外观与"省电模式失效"一致），故显式钳制。
+      _transSwitchRate =
+          outgoingIdx >= 0 && outgoingIdx < widget.lines.length
+              ? _fadeRateForMs(widget.lines[outgoingIdx].duration)
+              : (_currentLineIndex >= 0 &&
+                      _currentLineIndex < widget.lines.length
+                  ? _fadeRateForMs(widget.lines[_currentLineIndex].duration)
+                  : 14.0);
       // 新当前行展开进度重置：该行此前若正在收起，从当前进度续升（回环
       // 连切连续性）；否则从头长出。
       final double? resume = _currentLineIndex >= 0
@@ -1337,8 +1439,16 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
       final double collapseDecay = 1 - math.exp(-_transSwitchRate * dt);
       final List<int> done = <int>[];
       _transCollapsing.forEach((k, v) {
-        final double next = v + collapseDecay;
-        if (next >= 0.999) {
+        // 指数趋近 1（与入场 _translationExpandProgress 同一推进方式）。
+        // 原实现是线性 `v + decay`：1/rate ≈ 150ms 就收完，而入场要 ~450ms，
+        // 出场比入场快约 3 倍，观感是"一闪而过、衔接僵硬"。
+        //
+        // 更关键的是它让本文件注释声明的不变量真正成立：稳态切行时
+        // 收起余量 (1-c) = p₀·e^(-λt)、展开量 = 1-e^(-λt)，两者之和恒为 p₀
+        // （上一行切走瞬间通常已完全展开，p₀=1）→ 当前行以下的行在切行期间
+        // **零位移**；线性推进下该和会中途掉 ~18%，表现为下方歌词整块抖一下。
+        final double next = v + (1.0 - v) * collapseDecay;
+        if (next >= 0.99) {
           done.add(k);
         } else {
           _transCollapsing[k] = next;
@@ -1419,8 +1529,11 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
         renderer.thresholdMs = _glowThresholdMs;
         // 翻译副行浮出/渐显进度（仅当前行注入；非当前行 WordRenderer 不绘制副行）。
         // alpha 与位置共用展开进度，淡入淡出贯穿整个过渡。
+        // 当前行恒为入场：副行绕底边从下翻转出现（方向标记必须无条件赋值，
+        // 字段跨帧保留，漏设会让副行残留在上一行的出场方向上）。
         renderer.translationExpand = _translationExpandProgress;
         renderer.translationFade = _translationExpandProgress;
+        renderer.translationExiting = false;
         renderer.setLineState(isActive: true, scale: scale, blurFade: _blurFade, blurActive: blurActive, activeColorValue: _activeLineColorValue);
         // 用平滑时间驱动逐字动画（上浮/字内渐变），避免 positionStream 5fps 卡顿
         // isPlaying 用于冻结自驱动波浪：暂停/未就绪时波浪不推进，防止辉光持续
@@ -1443,10 +1556,15 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
         if (isActive) {
           renderer.translationExpand = _translationExpandProgress;
           renderer.translationFade = _translationExpandProgress;
+          // 当前行：入场，绕副行底边从下翻转出现。
+          renderer.translationExiting = false;
         } else {
           final double? c = _transCollapsing[i];
           renderer.translationExpand = c == null ? 0.0 : 1.0 - c;
           renderer.translationFade = c == null ? 0.0 : 1.0 - c;
+          // 收起中的退场行：出场，绕副行顶边向上翻转消失（入场/出场锚线不同，
+          // 必须显式告知方向）；c == null 的行副行 alpha 为 0，方向无意义。
+          renderer.translationExiting = c != null;
         }
         renderer.setLineState(isActive: isActive, scale: scale, blurFade: _blurFade, blurActive: blurActive, activeColorValue: _activeLineColorValue);
         renderer.tick(dt);
@@ -1511,6 +1629,14 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
     // 收起到接近 0 时直接归零，避免无限逼近占着微小高度
     if (_activeInterludeIdx < 0 && _interludeExpandProgress < 0.001) {
       _interludeExpandProgress = 0;
+      // 收起完成 = 间奏点生命周期的终点：占位已归零，圆点（属于占位行）
+      // 与 anchor 一并释放。
+      // **必须在此处收口**：progress 归零后画面随即收敛，同一帧末尾的
+      // animConverged 判断会停掉 Ticker，之后不再有任何帧回调去执行
+      // _updateInterlude 的收尾分支——若把释放放在那里，间奏点会永久
+      // 停留在 _isActive（时钟冻结、状态悬空），任何后续帧都不会再清除它。
+      _interludeDots.clear();
+      _lastActiveAnchorIdx = -1;
     }
 
     // 7.5 翻译副行展开进度：当前行、开启翻译且有副行文本 → 展开，否则收起。
@@ -1734,8 +1860,10 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
       _stopTickerIfNeeded();
       // 同时停掉 eco 限帧 Timer：静态画面无需继续驱动 _onTick
       //（否则 Timer 每 16ms 触发一次 setState，仍会产生 60fps 空帧）。
-      _ecoTimer?.cancel();
-      _ecoTimer = null;
+      if (_ecoDriverBound) {
+        PlayerFrameDriver.instance.removeListener(_onEcoFrameTick);
+        _ecoDriverBound = false;
+      }
       // 最后一帧 setState 确保稳态画面渲染
       setState(() {});
       return;
@@ -1786,7 +1914,7 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
           activeInterludeIdx: _activeInterludeIdx,
           lastActiveAnchorIdx: _lastActiveAnchorIdx,
           transExpandProgress: _translationExpandProgress,
-          transSubHeight: _transSubHeight,
+          auxSubHeights: _auxSubHeights,
           transCollapsing: _transCollapsing,
           perLineOffsets: _buildPerLineOffsets(),
           perLineOffsetsGeneration: _perLineOffsetsGeneration,
@@ -1839,8 +1967,11 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
   /// **间奏点同步收起**：间奏结束后不立即 `clear()` 间奏点，
   /// 让 `_animationTimeMs` 继续推进到 `interludeDuration`，
   /// 间奏点会自然完成消失动画（最后 750ms easeInBack 缩小）。
-  /// 占位收起与点消失同步进行（都是 ~300-750ms）。
-  /// 只有当 `_interludeExpandProgress` 收起到 0 后才 `clear()` 间奏点状态。
+  /// 占位收起与点消失同步进行（都是 ~300-750ms）。占位收起完成后的
+  /// `clear()` + anchor 释放由推进循环的归零分支收口（见 `_onTick`）。
+  /// 该"继续播完消失动画"的行为只适用于**自然结束**（`isInExitPhase`）；
+  /// 点击其他行歌词跳转 / seek 离开间奏时时钟仍在间奏早期，必须立即清除
+  /// 圆点，否则会悬浮穿帮（见下方 else 分支）。
   /// [forceDotsReset] 为 true 时，即使命中的间奏与当前激活相同，也强制重置
   /// 间奏点动画时钟（`_interludeDots.setInterlude(..., forceReset: true)`）。
   /// 用于 seek/跳转回跳：幂等保护会忽略相同间奏，导致动画时钟从旧进度继续，
@@ -1898,11 +2029,19 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
     } else {
       // 间奏结束：不立即 clear() 间奏点
       // 让 _animationTimeMs 继续推进到 interludeDuration，
-      // 间奏点会自然完成消失动画（最后 750ms easeInBack）
-      // 只有当 _interludeExpandProgress 收起到 0 后才 clear()
-      if (_interludeExpandProgress <= 0.001) {
+      // 间奏点会自然完成消失动画（最后 750ms easeInBack 缩小）
+      //
+      // 但仅限"自然结束"（时钟已在消失阶段）。用户点击其他行歌词跳转 /
+      // 拖动进度条 seek 离开间奏时，时钟可能还停在间奏早期（长间奏尤甚），
+      // 此时若放任其继续推进，满尺寸、满不透明度的圆点会在占位收起的
+      // ~750ms 内悬浮在原 anchor 行，与已切换的歌词同屏 → 穿帮。
+      // 这种情况直接清除圆点（_lastActiveAnchorIdx 不在此重置：占位偏移
+      // 仍由 _interludeExpandProgress 平滑收起，避免下方行瞬间跳位）。
+      //
+      // 占位收起完成后的收尾（clear + 释放 anchor）统一在推进循环的
+      // 归零分支处理——那里不受本方法的调用时机限制。
+      if (!_interludeDots.isInExitPhase) {
         _interludeDots.clear();
-        _lastActiveAnchorIdx = -1;
       }
     }
     // 注意：间奏点动画时间由 _onTick 中的 _interludeDots.tick(dt) 推进，
@@ -1912,7 +2051,9 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
   // ============== 点击跳转与手动滚动 ==============
 
   void _onTapDown(TapDownDetails details) {
-    _startTickerIfNeeded(); // v3 优化：用户交互时重启 Ticker（即便暂停态）
+    // 用户交互唤醒驱动：统一走 _syncEcoDriver（eco 锁定 → Timer；否则 Ticker），
+    // 避免裸起 Ticker 造成与 60fps Timer 并存、Ticker 被 mute 时 Timer 空转
+    _syncEcoDriver();
     _tapDownPosition = details.localPosition;
   }
 
@@ -1986,7 +2127,6 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
   /// 之前只挂了 onTapDown/onTapUp，导致用户无法上下滑动歌词（spec 要求
   /// 用户滚动后 5s 自动回弹到当前行）。这里补上 onVerticalDragUpdate/End。
   void _onVerticalDragUpdate(DragUpdateDetails details) {
-    _startTickerIfNeeded(); // v3 优化：用户滚动时重启 Ticker
     // 省电模式：用户开始滑动歌词立即解锁帧率限制（保持 120Hz 顺滑滚动）。
     // 必须立刻同步驱动源：取消 60fps Timer、确认 Ticker 在跑，
     // 否则要等下一帧 _onTick 里的 _syncEcoDriver 才切，拖动首帧会多走一次 60fps。
@@ -2089,7 +2229,7 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
             lastActiveAnchorIdx: _lastActiveAnchorIdx,
             interludeExpandProgress: _interludeExpandProgress,
             transExpandProgress: _translationExpandProgress,
-            transSubHeight: _transSubHeight,
+            auxSubHeights: _auxSubHeights,
             transCollapsing: _transCollapsing,
             perLineOffsets: _buildPerLineOffsets(),
             blurFade: _blurFade,
@@ -2128,6 +2268,9 @@ class _AppleLyricsViewState extends State<AppleLyricsView>
           _painter!.activeInterludeIdx = _activeInterludeIdx;
           _painter!.lastActiveAnchorIdx = _lastActiveAnchorIdx;
           _painter!.interludeExpandProgress = _interludeExpandProgress;
+          // 逐行副行高度随行集/字号/宽度/displayMode 变化（重算中被替换为新列表），
+          // 必须在此同步引用，否则换歌/切翻译后 painter 会读旧列表（长度不匹配）
+          _painter!.auxSubHeights = _auxSubHeights;
           _painter!.perLineOffsets = _buildPerLineOffsets();
           _painter!.blurFade = _blurFade;
           _painter!.blurActive = useGaussian;
@@ -2724,10 +2867,11 @@ class _LyricsPainter extends CustomPainter {
   int activeInterludeIdx;
   int lastActiveAnchorIdx;
   double interludeExpandProgress;
-  /// 翻译副行动画：当前行展开进度（0→1）/ 副行预留高度 / 收起中的行
+  /// 翻译副行动画：当前行展开进度（0→1）/ 逐行副行预留高度（含过长换行，
+  /// 索引与 lines 对齐）/ 收起中的行
   /// （索引 → 收起进度，live 引用，State 侧原地更新，与 blurReadyLineIndices 同模式）。
   double transExpandProgress;
-  double transSubHeight;
+  List<double> auxSubHeights;
   Map<int, double> transCollapsing;
   List<double> perLineOffsets;
   double blurFade;
@@ -2770,7 +2914,7 @@ class _LyricsPainter extends CustomPainter {
     required this.lastActiveAnchorIdx,
     required this.interludeExpandProgress,
     required this.transExpandProgress,
-    required this.transSubHeight,
+    required this.auxSubHeights,
     required this.transCollapsing,
     required this.perLineOffsets,
     required this.blurFade,
@@ -2795,7 +2939,7 @@ class _LyricsPainter extends CustomPainter {
     required int activeInterludeIdx,
     required int lastActiveAnchorIdx,
     required double transExpandProgress,
-    required double transSubHeight,
+    required List<double> auxSubHeights,
     required Map<int, double> transCollapsing,
     required List<double> perLineOffsets,
     required int perLineOffsetsGeneration,
@@ -2809,7 +2953,7 @@ class _LyricsPainter extends CustomPainter {
     this.activeInterludeIdx = activeInterludeIdx;
     this.lastActiveAnchorIdx = lastActiveAnchorIdx;
     this.transExpandProgress = transExpandProgress;
-    this.transSubHeight = transSubHeight;
+    this.auxSubHeights = auxSubHeights;
     this.transCollapsing = transCollapsing;
     this.perLineOffsets = perLineOffsets;
     this.perLineOffsetsGeneration = perLineOffsetsGeneration;
@@ -2838,34 +2982,33 @@ class _LyricsPainter extends CustomPainter {
     return aux != null && aux.isNotEmpty;
   }
 
+  /// 第 i 行的副行预留高度（与 State._auxSubHeightOf 同口径，含换行行数）。
+  double _auxSubHeightOf(int i) =>
+      (i >= 0 && i < auxSubHeights.length) ? auxSubHeights[i] : 0;
+
   /// 第 i 行副行动画额外高度（与 State._transExtraHeightFor 同口径）：
-  /// 当前行跟随展开进度增长，收起表中的行随收起进度回落。
+  /// 当前行跟随展开进度增长，收起表中的行随收起进度回落，且各自使用
+  /// **该行自身的**副行预留高度（含换行），换行副行不会与下一行重叠。
   /// 不读 showTranslation 短路（关闭翻译时进度衰减到 0，高度平滑收起）。
   double _transExtra(int i) {
-    if (transSubHeight <= 0) {
-      return 0;
-    }
     if (i == currentLineIndex && _lineHasAuxText(i)) {
-      return transSubHeight * transExpandProgress;
+      return _auxSubHeightOf(i) * transExpandProgress;
     }
     final double? c = transCollapsing[i];
-    return c == null ? 0 : transSubHeight * (1.0 - c);
+    return c == null ? 0 : _auxSubHeightOf(i) * (1.0 - c);
   }
 
   /// 第 i 行上方副行动画高度之和（与 State._transDeltaBefore 同口径），
   /// 叠加到行 top 消费点（主绘制循环 / 二分查找 / 间奏锚点）。
   double _transDeltaBefore(int i) {
-    if (transSubHeight <= 0) {
-      return 0;
-    }
     double d = 0;
     if (currentLineIndex >= 0 &&
         currentLineIndex < i &&
         _lineHasAuxText(currentLineIndex)) {
-      d += transSubHeight * transExpandProgress;
+      d += _auxSubHeightOf(currentLineIndex) * transExpandProgress;
     }
     transCollapsing.forEach((k, v) {
-      if (k < i) d += transSubHeight * (1.0 - v);
+      if (k < i) d += _auxSubHeightOf(k) * (1.0 - v);
     });
     return d;
   }
@@ -3037,7 +3180,10 @@ class _LyricsPainter extends CustomPainter {
     //
     // **同步收起**：间奏结束后 progress 收起期间也绘制间奏点，
     // 让点消失动画与占位收起同步（都是 ~300-750ms）。
+    // 占位完全收起（progress == 0）后不得再绘制：圆点属于占位行，
+    // 零高度时绘制会残留在 anchor 行下方悬浮穿帮。
     if (interludeDots.shouldRender &&
+        interludeExpandProgress > 0 &&
         lastActiveAnchorIdx >= 0 &&
         lastActiveAnchorIdx < lines.length) {
       final int anchorIdx = lastActiveAnchorIdx;

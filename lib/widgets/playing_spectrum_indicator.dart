@@ -1,7 +1,8 @@
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
-import 'package:flutter/scheduler.dart';
+
+import '../core/services/player_frame_driver.dart';
 
 /// 正在播放频谱标识。
 ///
@@ -11,8 +12,15 @@ import 'package:flutter/scheduler.dart';
 /// 仅是装饰性动画（不订阅 amplitudeStream / 不需要任何权限），
 /// 用来替代 [CircularProgressIndicator] loading 圈作为歌曲列表「正在播放」标识。
 ///
-/// **性能优化**：用 [ValueNotifier] 驱动 [CustomPainter] 重绘，
-/// 避免 _onTick 每帧 setState 触发 widget 重建。
+/// **性能优化 1**：用 [ValueNotifier] 驱动 [CustomPainter] 重绘，
+/// 避免每帧 setState 触发 widget 重建。
+///
+/// **性能优化 2（驱动源）**：不使用 [Ticker]——Ticker 会每 vsync
+/// scheduleFrame，120Hz 屏上即便本组件只是装饰性动画，也会让**整页**保持
+/// 120fps（实测：正在播放行常驻于播放列表 tab，即使不可见也持续 tick，
+/// 整页帧率由 60 被顶到 ~120，功耗近似翻倍）。
+/// 改挂 [PlayerFrameDriver] 共享 60fps 节拍：与歌词/封面旋转同相位，
+/// 整页回到 60fps，而本动画的更新率不变（仍 60fps）。
 class PlayingSpectrumIndicator extends StatefulWidget {
   final Color color;
 
@@ -34,10 +42,9 @@ class PlayingSpectrumIndicator extends StatefulWidget {
       _PlayingSpectrumIndicatorState();
 }
 
-class _PlayingSpectrumIndicatorState extends State<PlayingSpectrumIndicator>
-    with SingleTickerProviderStateMixin {
-  late final Ticker _ticker;
-  Duration _lastElapsed = Duration.zero;
+class _PlayingSpectrumIndicatorState extends State<PlayingSpectrumIndicator> {
+  /// 是否已挂到共享 60fps 帧驱动上。
+  bool _boundToDriver = false;
 
   /// 时间累积通过 ValueNotifier 驱动 CustomPainter 重绘，
   /// 避免 _onTick 每帧 setState 触发 widget 重建
@@ -46,40 +53,41 @@ class _PlayingSpectrumIndicatorState extends State<PlayingSpectrumIndicator>
   @override
   void initState() {
     super.initState();
-    _ticker = createTicker(_onTick);
-    // 根据 isPlaying 决定是否启动 ticker
-    if (widget.isPlaying) {
-      _ticker.start();
-    }
+    _syncDriver();
   }
 
   @override
   void didUpdateWidget(covariant PlayingSpectrumIndicator oldWidget) {
     super.didUpdateWidget(oldWidget);
-    // isPlaying 状态变化时启停 ticker：
-    // - false → true：重置 _lastElapsed 避免 dt 跳跃，然后 start
-    // - true → false：stop 保留最后一帧（_tNotifier 不再更新，画面冻结）
+    // isPlaying 变化时启停（保留最后一帧：解除订阅后 _tNotifier 不再更新）
     if (widget.isPlaying != oldWidget.isPlaying) {
-      if (widget.isPlaying) {
-        _lastElapsed = Duration.zero;
-        _ticker.start();
-      } else {
-        _ticker.stop();
-      }
+      _syncDriver();
     }
   }
 
-  void _onTick(Duration elapsed) {
-    final dt = (elapsed - _lastElapsed).inMicroseconds / 1000000.0;
-    _lastElapsed = elapsed;
-    // 推进时间并通过 ValueNotifier 触发 CustomPainter 重绘
-    // 不需要 setState：painter 通过 _tNotifier 自动重绘
-    _tNotifier.value = _tNotifier.value + dt;
+  /// 按 isPlaying 绑定/解绑共享 60fps 节拍。
+  void _syncDriver() {
+    if (widget.isPlaying && !_boundToDriver) {
+      PlayerFrameDriver.instance.addListener(_onSharedTick);
+      _boundToDriver = true;
+    } else if (!widget.isPlaying && _boundToDriver) {
+      PlayerFrameDriver.instance.removeListener(_onSharedTick);
+      _boundToDriver = false;
+    }
+  }
+
+  /// 共享节拍回调：固定 16ms 步进推进时间，通过 ValueNotifier 触发重绘
+  /// （不 setState：painter 通过 _tNotifier 自动重绘）。
+  void _onSharedTick() {
+    _tNotifier.value += PlayerFrameDriver.step.inMicroseconds / 1000000.0;
   }
 
   @override
   void dispose() {
-    _ticker.dispose();
+    if (_boundToDriver) {
+      PlayerFrameDriver.instance.removeListener(_onSharedTick);
+      _boundToDriver = false;
+    }
     _tNotifier.dispose();
     super.dispose();
   }

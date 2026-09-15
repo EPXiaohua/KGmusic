@@ -134,14 +134,6 @@
             android:noHistory="true"
             android:showWhenLocked="true"
             android:theme="@style/Theme.MD3Music.LockScreen" />
-        <!-- Miuix 风格发现页测试（原生 Compose + miuix 组件），由设置页经 MethodChannel 打开 -->
-        <activity
-            android:name=".MiuixDiscoverActivity"
-            android:exported="false"
-            android:launchMode="singleTop"
-            android:theme="@style/LaunchTheme"
-            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
-            android:windowSoftInputMode="adjustResize" />
         <!-- 用 Lyrico 外部编辑本地歌曲：通过 FileProvider 把音频文件以 content:// URI
              授权给 Lyrico 读写（用户对本地文件拥有完整编辑权，保存由 Lyrico 写回）。 -->
         <provider

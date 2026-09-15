@@ -16,7 +16,8 @@ class UsbAudioStream(
         endpointFeedback: Int,
         sampleRate: Int,
         channelCount: Int,
-        bitDepth: Int,
+        /** DAC 端点位深（降位/抖动的目标位深）。 */
+        private val bitDepth: Int,
         maxPacketSize: Int,
         /** USB 总线速度：true=full-speed（每 ISO packet 对应 1ms 帧），false=high-speed（125µs microframe）。 */
         fullSpeed: Boolean = false
@@ -82,63 +83,21 @@ class UsbAudioStream(
             2 -> 16   // C.ENCODING_PCM_16BIT
             0x15 -> 24 // C.ENCODING_PCM_24BIT
             0x16 -> 32 // C.ENCODING_PCM_32BIT
-            else -> return
+            else -> {
+                // 静默丢弃会表现为无声且无任何留痕 —— 至少留一条警告
+                UsbLog.w(TAG, "writeRaw: unsupported pcm encoding $encoding, buffer dropped")
+                return
+            }
         }
-        // 软件音量 fallback：整数直写路径也必须缩放（DAC 无硬件音量时）
-        val v = streamVolume
-        if (v < 0.999f) scalePcmInPlace(pcmBuffer, inputBitDepth, v)
+        val dither = ditherEnabled && UsbDither.isReducing(inputBitDepth, bitDepth)
+        // 软件音量 fallback 与抖动合并为一次遍历（音量缩放本身也是一次位深缩减，
+        // 必须与抖动同遍历，否则其截断误差无法被抖动消除）
+        UsbDither.applyVolumeAndDitherInPlace(pcmBuffer, inputBitDepth, bitDepth, streamVolume, dither, ditherRng)
         nativeUsbAudioWriteRaw(nativeHandle, pcmBuffer, inputBitDepth)
     }
 
-    /**
-     * 原地缩放整数 PCM 音量（16/24/32bit LE）。
-     * 注意：与 [write] 的 float 路径共用 [streamVolume]，两路都应用，互不重复。
-     */
-    private fun scalePcmInPlace(buffer: ByteArray, bitDepth: Int, volume: Float) {
-        when (bitDepth) {
-            16 -> {
-                var i = 0
-                while (i + 1 < buffer.size) {
-                    var s = (buffer[i].toInt() and 0xFF) or (buffer[i + 1].toInt() shl 8)
-                    if (s >= 0x8000) s -= 0x10000
-                    s = (s * volume).toInt()
-                    buffer[i] = (s and 0xFF).toByte()
-                    buffer[i + 1] = ((s shr 8) and 0xFF).toByte()
-                    i += 2
-                }
-            }
-            24 -> {
-                var i = 0
-                while (i + 2 < buffer.size) {
-                    var s = (buffer[i].toInt() and 0xFF) or
-                            ((buffer[i + 1].toInt() and 0xFF) shl 8) or
-                            (buffer[i + 2].toInt() shl 16)
-                    if (s >= 0x800000) s -= 0x1000000
-                    s = (s * volume).toInt()
-                    buffer[i] = (s and 0xFF).toByte()
-                    buffer[i + 1] = ((s shr 8) and 0xFF).toByte()
-                    buffer[i + 2] = ((s shr 16) and 0xFF).toByte()
-                    i += 3
-                }
-            }
-            32 -> {
-                var i = 0
-                while (i + 3 < buffer.size) {
-                    // 用 Double 避免 float32 精度丢失（int32 全范围 31bit > float 24bit 尾数）
-                    val s = ((buffer[i].toInt() and 0xFF) or
-                            ((buffer[i + 1].toInt() and 0xFF) shl 8) or
-                            ((buffer[i + 2].toInt() and 0xFF) shl 16) or
-                            (buffer[i + 3].toInt() shl 24)) * volume.toDouble()
-                    val r = s.toInt()
-                    buffer[i] = (r and 0xFF).toByte()
-                    buffer[i + 1] = ((r shr 8) and 0xFF).toByte()
-                    buffer[i + 2] = ((r shr 16) and 0xFF).toByte()
-                    buffer[i + 3] = ((r shr 24) and 0xFF).toByte()
-                    i += 4
-                }
-            }
-        }
-    }
+    /** 本流的 TPDF 随机源（确定性；跨缓冲保持连续）。 */
+    private val ditherRng = XorShift32(System.nanoTime().toUInt())
 
     fun stop() {
         if (nativeHandle == 0L) return
@@ -192,6 +151,13 @@ class UsbAudioStream(
         /** 软件音量（0..1）。DAC 无硬件音量控制时的 fallback，write() 对 float 缩放。 */
         @Volatile
         var streamVolume: Float = 1f
+
+        /**
+         * TPDF 抖动降位开关（默认关闭）。仅当源位深 > DAC 端点位深时参与；
+         * writeRaw 每块缓冲都会读取，因此切换**立即生效**，无需重建流。
+         */
+        @Volatile
+        var ditherEnabled: Boolean = false
 
         init {
             System.loadLibrary("usb_audio_driver")

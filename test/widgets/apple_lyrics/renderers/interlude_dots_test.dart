@@ -184,6 +184,43 @@ void main() {
       });
     });
 
+    group('isInExitPhase（区分自然结束与跳转离开）', () {
+      test('未激活时返回 false', () {
+        final dots = InterludeDots();
+        expect(dots.isInExitPhase, isFalse);
+      });
+
+      test('间奏早期返回 false，末 750ms 返回 true', () {
+        final dots = InterludeDots();
+        dots.setInterlude(1000, 11000); // 时长 10000ms，距消失起点还有 9250ms
+        expect(dots.isInExitPhase, isFalse);
+
+        dots.tick(8.0); // 时钟 8000ms < 9250ms
+        expect(dots.animationTimeMs, closeTo(8000, 0.1));
+        expect(dots.isInExitPhase, isFalse);
+
+        dots.tick(1.5); // 时钟 9500ms ≥ 9250ms
+        expect(dots.animationTimeMs, closeTo(9500, 0.1));
+        expect(dots.isInExitPhase, isTrue);
+      });
+
+      test('对齐到窗口末端后进入消失阶段（自然结束路径）', () {
+        final dots = InterludeDots();
+        dots.setInterlude(1000, 11000);
+        dots.alignToRealTime(11000); // clamp 到 时长 10000
+        expect(dots.isInExitPhase, isTrue);
+      });
+
+      test('clear 后返回 false', () {
+        final dots = InterludeDots();
+        dots.setInterlude(1000, 11000);
+        dots.tick(10.0);
+        expect(dots.isInExitPhase, isTrue);
+        dots.clear();
+        expect(dots.isInExitPhase, isFalse);
+      });
+    });
+
     group('间奏检测规则集成（参照 spec.md）', () {
       test('相邻行间隔 >= 4000ms 应触发间奏（由调用方判定，本类只接收时段）', () {
         final dots = InterludeDots();

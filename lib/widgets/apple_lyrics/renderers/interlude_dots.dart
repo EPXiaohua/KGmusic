@@ -97,6 +97,23 @@ class InterludeDots {
   /// 当前是否需要绘制（间奏激活时）。
   bool get shouldRender => _isActive;
 
+  /// 动画时钟是否已进入消失动画阶段（末 [_exitScaleMs]）。
+  ///
+  /// 用于区分间奏的两种结束方式：
+  /// - **自然结束**：时钟跟随播放进度推进，离开激活窗口时已在消失阶段
+  ///   （≈ interludeDuration），返回 true —— 调用方保留状态，让圆点与占位
+  ///   收起同步收缩消失（原有"同步收起"视觉）。
+  /// - **跳转离开**（点击其他行歌词 / 拖动进度条 seek）：时钟可能远早于
+  ///   消失阶段（长间奏尤甚），返回 false —— 调用方应立即 [clear]，否则
+  ///   满尺寸、满不透明度的圆点会在占位收起的 ~750ms 内悬浮在原 anchor
+  ///   行，与已切换的歌词同屏（穿帮）。
+  bool get isInExitPhase {
+    final start = _startTime;
+    final end = _endTime;
+    if (!_isActive || start == null || end == null) return false;
+    return _animationTimeMs >= (end - start) - _exitScaleMs;
+  }
+
   // ============== 状态设置 ==============
 
   /// 设置当前间奏时段。

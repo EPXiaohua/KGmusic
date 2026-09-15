@@ -8,7 +8,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 /// 歌词字体来源枚举（与全局 [FontSource] 解耦，允许歌词使用与 UI 不同的字体）。
 ///
 /// - [LyricFontSource.system]：使用手机系统字体（默认，符合"优先展示用户手机字体"需求）
-/// - [LyricFontSource.bundled]：使用内置打包的 SimHei
+/// - [LyricFontSource.bundled]：已废弃（内置 SimHei 已移除，仅保留枚举值以稳定
+///   `fontSource.index` 的原生契约 0=system 1=bundled 2=custom），行为等同 system
 /// - [LyricFontSource.custom]：使用用户通过 SAF 选择的 TTF/OTF 文件
 enum LyricFontSource { system, bundled, custom }
 
@@ -282,15 +283,14 @@ class LyricPreferences extends ChangeNotifier {
 
   /// 当前生效的 fontFamily（传给 TextPainter 的 TextStyle）：
   /// - [LyricFontSource.system]：返回 null（让 Flutter 走系统字体链）
-  /// - [LyricFontSource.bundled]：返回 'SimHei'
+  /// - [LyricFontSource.bundled]：已废弃（内置 SimHei 已移除），等同 system 返回 null
   /// - [LyricFontSource.custom]：返回 [_loadedCustomFontFamily]，
   ///   加载失败时为 null（实际降级为 system 行为）
   String? get effectiveFontFamily {
     switch (_fontSource) {
       case LyricFontSource.system:
-        return null;
       case LyricFontSource.bundled:
-        return 'SimHei';
+        return null;
       case LyricFontSource.custom:
         return _loadedCustomFontFamily;
     }
@@ -590,13 +590,13 @@ class LyricPreferences extends ChangeNotifier {
     }
   }
 
+  /// 历史值 'bundled'（内置 SimHei 已移除）迁移为 [LyricFontSource.system]。
   static LyricFontSource _fontSourceFromName(String? name) {
     switch (name) {
-      case 'bundled':
-        return LyricFontSource.bundled;
       case 'custom':
         return LyricFontSource.custom;
       default:
+        // 'bundled' 与未知值一并归入 system（bundled 字体已不再打包）
         return LyricFontSource.system;
     }
   }

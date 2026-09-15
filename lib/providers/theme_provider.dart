@@ -51,7 +51,7 @@ class ThemeProvider extends ChangeNotifier {
   // 底部导航栏文字显示行为（默认始终不显示）
   NavigationDestinationLabelBehavior _navLabelBehavior =
       NavigationDestinationLabelBehavior.alwaysHide;
-  // 字体来源（system / bundled / custom）
+  // 字体来源（system / bundled（已废弃，等同 system）/ custom）
   FontSource _fontSource = FontSource.system;
   // 用户选择的字体文件路径（原生端拷贝到 filesDir 后的真实路径）
   String? _customFontPath;
@@ -130,15 +130,14 @@ class ThemeProvider extends ChangeNotifier {
 
   /// 当前生效的 fontFamily（传给 AppTheme）：
   /// - [FontSource.system]：返回 null（让 Flutter 走系统字体链）
-  /// - [FontSource.bundled]：返回 'SimHei'
+  /// - [FontSource.bundled]：已废弃（内置 SimHei 已移除），等同 system 返回 null
   /// - [FontSource.custom]：返回 [_loadedCustomFontFamily]，
   ///   加载失败时为 null（实际降级为 system 行为）
   String? get effectiveFontFamily {
     switch (_fontSource) {
       case FontSource.system:
-        return null;
       case FontSource.bundled:
-        return 'SimHei';
+        return null;
       case FontSource.custom:
         return _loadedCustomFontFamily;
     }

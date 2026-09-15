@@ -40,8 +40,8 @@ class LyricLayout {
   /// 所有歌词渲染/测量路径的 [TextStyle] 必须显式传入此值，否则
   /// TextPainter + Canvas 直接绘制路径不会继承 [ThemeData.fontFamily]。
   /// - null：Flutter 走系统字体链（Android 默认 Roboto + Noto Sans CJK）
-  /// - 'SimHei'：内置打包字体
   /// - 'LyricUserCustomFont'：用户通过 SAF 选择并加载的自定义字体
+  /// （内置 SimHei 已移除；bundled 为废弃遗留值，行为等同 null）
   static String? get fontFamily => LyricPreferences.instance.effectiveFontFamily;
 
   /// 歌词字重：返回用户偏好的字重。
@@ -89,8 +89,8 @@ class LyricLayout {
   /// - 无 word 时间戳：用 [TextPainter] 对整行 text 自动换行测量。
   /// - 有 word 时间戳：按 word 累加 dx 超过 [maxWidth] 即换行。
   ///
-  /// [showTranslation] 为 true 时，把翻译副行高度（[translationFontSize] ×
-  /// [translationLineHeight] + 0.3em 间隙）追加到返回值。调用方应仅对当前行
+  /// [showTranslation] 为 true 时，把副行高度（[auxSubHeight]，按副行实际视觉行数
+  /// 计算，含 0.3em 间隙）追加到返回值。调用方应仅对当前行
   /// 传 true，非当前行不预留空间，符合"只在当前行显示翻译"的视觉要求。
   ///
   /// 返回值即该行在垂直方向占用的像素高度。
@@ -146,17 +146,17 @@ class LyricLayout {
     }
 
     // 副行高度：按 displayMode 预留翻译或罗马音（与 renderer 绘制逻辑对齐——
-    // 只音译无翻译的歌（粤语等）罗马音同样预留空间，否则副行会与下一行重叠）
+    // 只音译无翻译的歌（粤语等）罗马音同样预留空间，否则副行会与下一行重叠）。
+    // 副行过长换行时按实际视觉行数预留（见 [auxSubHeight]）。
     if (showTranslation) {
       final auxText =
           LyricPreferences.instance.displayMode == LyricDisplayMode.roma
           ? line.roma
           : line.translation;
-      if (auxText != null && auxText.isNotEmpty) {
-        final transFontSize = translationFontSize(fontSize);
-        mainHeight += transFontSize * translationLineHeight +
-            transFontSize * 0.3; // 0.3em 间隙，与 renderer 中绘制位置一致
-      }
+      mainHeight += auxSubHeight(
+        fontSize,
+        measureAuxRows(auxText, fontSize, maxWidth),
+      );
     }
     return mainHeight;
   }
@@ -174,10 +174,155 @@ class LyricLayout {
   /// 副行行高：1.5em
   static const double translationLineHeight = 1.5;
 
+  /// 副行（翻译/罗马音）占用的垂直高度。
+  ///
+  /// 公式：`rows × transFontSize × translationLineHeight + transFontSize × 0.3`，
+  /// 其中 0.3em 为副行与主行之间的间隙（与 renderer 绘制位置一致）。
+  ///
+  /// [rows] 为该副行在可用宽度内的**实际视觉行数**（过长换行时 > 1）；
+  /// `rows <= 0` 表示无副行，返回 0。
+  ///
+  /// **行数必须参与高度计算**：副行过长换行时若仍按单行预留，多出来的视觉行
+  /// 会压到下一行歌词上（行距未调整）。布局预留（`AppleLyricsView` 的逐行副行
+  /// 占位）与绘制位移（`LineRenderer` / `WordRenderer` 的副行"长出"偏移）必须
+  /// 共用本公式且取值相等，否则副行最终位置与预留槽位错位。
+  static double auxSubHeight(double fontSize, int rows) {
+    if (rows <= 0) return 0;
+    final trans = translationFontSize(fontSize);
+    return rows * trans * translationLineHeight + trans * 0.3;
+  }
+
+  /// 测量副行文本在 [maxWidth] 内的视觉行数（无副行文本 → 0）。
+  ///
+  /// 与 renderer 绘制副行所用的 [TextPainter] 完全同 style（0.7em 字号、
+  /// height = [translationLineHeight]、同 [fontFamily]/[fontWeight]），
+  /// 保证测量行数与实际绘制的换行结果一致。
+  static int measureAuxRows(String? auxText, double fontSize, double maxWidth) {
+    if (auxText == null || auxText.isEmpty) return 0;
+    final trans = translationFontSize(fontSize);
+    final painter = TextPainter(
+      text: TextSpan(
+        text: auxText,
+        style: TextStyle(
+          fontSize: trans,
+          height: translationLineHeight,
+          fontFamily: fontFamily,
+          fontWeight: fontWeight,
+        ),
+      ),
+      textDirection: TextDirection.ltr,
+    );
+    if (maxWidth.isFinite && maxWidth > 0) {
+      painter.layout(maxWidth: maxWidth);
+    } else {
+      painter.layout();
+    }
+    final int rows = painter.computeLineMetrics().length;
+    painter.dispose();
+    return rows < 1 ? 1 : rows;
+  }
+
   /// 副行透明度
   ///
   /// 0.5 居中于"已播字(0.8~1.0)"和"未播字(0.2~0.4)"之间，符合"翻译半透明介于已播未播之间"的视觉要求。
   static const double translationOpacity = 0.5;
+
+  // ============== 副行日历式翻转动效 ==============
+
+  /// 副行翻转的最大转角（弧度）= 90°（侧立 → 就位）。
+  static const double _sublineFlipHalfTurn = math.pi / 2;
+
+  /// 翻转「剩余角」的衰减指数。
+  ///
+  /// 副行的位置与 alpha 与展开进度同源（指数趋近，前 200ms 即走完约 74%），
+  /// 若角度线性跟随进度，等副行不透明时旋转已基本结束，翻转几乎看不见。
+  /// 对剩余角取平方根（0.5）让旋转滞后于进度：半透明阶段保留较大转角，
+  /// 末段再平落就位。取 1.0 即退化为与进度线性同步。
+  static const double sublineFlipRemainPower = 0.5;
+
+  /// 翻转「离位量」的死区：`q = 1 - expand` ≤ 该值时角度直接归零。
+  ///
+  /// 入场进度是指数趋近（τ≈150ms），若角度一路跟到 q→0，末尾会留下 0.3~1s
+  /// 的「几度几度慢慢压平」拖尾（真机观感僵硬）。提前归零后翻转在约 280ms
+  /// 处干净落位，剩下的进度只影响 alpha 与位置，不再拖尾。
+  static const double sublineFlipSettleCut = 0.15;
+
+  /// 翻转透视强度（`Matrix4.setEntry(3, 2, ·)`）。
+  ///
+  /// 以像素为单位的深度倒数权重：副行文字高约 18~30px，翻转中离轴端 z 最大
+  /// ≈ 该高度，0.006 → 近/远端 w ≈ 1∓0.11（约 ±11% 缩放），有立体感但不夸张。
+  /// 置 0 退化为正交压扁（无透视，纯高度压缩）。
+  static const double sublineFlipPerspective = 0.006;
+
+  /// 副行翻转角度（弧度）。
+  ///
+  /// - [exiting] = false（入场）：绕副行底边，`expand` 0→1 对应 -90°→0°，
+  ///   副行从底边向上翻起出现；
+  /// - [exiting] = true（出场）：绕副行顶边，`expand` 1→0 对应 0°→+90°，
+  ///   副行向上翻起消失。
+  ///
+  /// `expand` 为渲染器 `translationExpand` 注入的展开进度（出场行注入的是
+  /// `1 - 收起进度`，故 1 = 就位、0 = 完全转走）；越界值钳制到 [0, 1]。
+  /// 返回 0 表示已就位，调用方应跳过任何画布变换（零开销直绘路径）。
+  ///
+  /// 两端对称：同一 `expand` 下入场/出场的转角**大小相同、符号相反**，故切行
+  /// 交接帧的副行视觉高度严格连续，只有锚线与倾斜方向镜像（见计划文档「已知代价」）。
+  static double sublineFlipAngle(double expand, {required bool exiting}) {
+    final double p = expand.clamp(0.0, 1.0);
+    // 离位量 q：0 = 完全就位，1 = 完全转走（入场 1→0，出场 0→1，同一标量）
+    final double q = 1.0 - p;
+    // 死区：q 落到 [sublineFlipSettleCut] 以内即归零，杜绝指数拖尾
+    final double t =
+        ((q - sublineFlipSettleCut) / (1.0 - sublineFlipSettleCut))
+            .clamp(0.0, 1.0);
+    final double remaining = math.pow(t, sublineFlipRemainPower).toDouble();
+    return exiting
+        ? _sublineFlipHalfTurn * remaining
+        : -_sublineFlipHalfTurn * remaining;
+  }
+
+  /// 副行翻转的锚点：**既是旋转锚线，也是透视的投影中心**。
+  ///
+  /// - x = 副行水平中点：透视除法（`w = 1 + perspective·z`）绕该 x 进行。
+  ///   不平移 x 的话，投影中心会落在画布原点（左上角），副行在翻转中会整体
+  ///   向左漂移（w≈1.11 时 x=250 处偏移可达 25px，真机观感「偏左」）；
+  /// - y = 旋转锚线：入场取副行**底边**（`transY + 副行高`）从下翻出；
+  ///   出场取副行**顶边**（`transY`）向上翻走。
+  ///
+  /// [sublineHeight] 传副行 `TextPainter.height`（= 视觉行数 × 副行字号 ×
+  /// [translationLineHeight]），不要传 [auxSubHeight]：后者含底部的 0.3em 间隙，
+  /// 会让入场锚线下移 0.3em 而与文字底边错位。
+  /// [sublineWidth] 传副行 `TextPainter.width`。
+  static Offset sublineFlipAnchor({
+    required double transX,
+    required double sublineWidth,
+    required double transY,
+    required double sublineHeight,
+    required bool exiting,
+  }) {
+    return Offset(transX + sublineWidth / 2,
+        exiting ? transY : transY + sublineHeight);
+  }
+
+  /// 副行翻转的画布变换矩阵：
+  /// `T(anchor) · P · Rx(angle) · T(-anchor)`。
+  ///
+  /// 即以 [anchor] 为轴心做 3D 旋转（角度由 [sublineFlipAngle] 给出），
+  /// [perspective] 为透视强度。**锚点必须同时给出 x**：透视除法绕锚点进行，
+  /// 只平移 y 会让投影中心停在画布左上角，副行翻转时整体左漂。
+  /// 锚线（y = anchor.dy）上的点 z=0 → w=1 → 变换后严格不动。
+  static Matrix4 sublineFlipMatrix({
+    required double angle,
+    required Offset anchor,
+    double perspective = sublineFlipPerspective,
+  }) {
+    final Matrix4 rot = Matrix4.identity()
+      ..setEntry(3, 2, perspective)
+      ..rotateX(angle);
+    return Matrix4.translationValues(anchor.dx, anchor.dy, 0)
+      ..multiply(rot)
+      ..multiply(Matrix4.translationValues(-anchor.dx, -anchor.dy, 0));
+  }
 
   // ============== 背景行（人声） ==============
 

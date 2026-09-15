@@ -25,6 +25,7 @@ class UsbAudioService {
   static const String _tag = 'UsbAudioService';
   static const String _keyAutoDisableForMv = 'usb_auto_disable_for_mv';
   static const String _keyEnable32bit = 'enable_32bit_output';
+  static const String _keyDither = 'usb_dither_enabled';
   static const String _keyOutputRate = 'usb_output_rate';
   static const String _keyOutputBits = 'usb_output_bits';
   static const String _keyOutputChannels = 'usb_output_channels';
@@ -69,6 +70,10 @@ class UsbAudioService {
     initUsbVolume();
     // 恢复 32bit 播放开关并下发原生（默认关闭，确保首次播放即按用户选择）
     initEnable32bit();
+    // 恢复 TPDF 抖动开关并下发原生（幂等）
+    initDither();
+    // 恢复持久化的输出格式强制（采样率/位深/声道）并下发原生
+    initOutputFormat();
   }
 
   /// 从 SharedPreferences 恢复 USB 音量并下发到原生（幂等，可重复调用）。
@@ -143,6 +148,37 @@ class UsbAudioService {
       _debug('setEnable32bit: $value (persisted, next track applies)');
     } catch (e) {
       _debug('setEnable32bit failed: $e');
+    }
+  }
+
+  // ── TPDF 抖动降位（默认关闭） ───────────────────────────────────
+  /// 独占降位（32→24 等）时加三角分布抖动，消除截断的信号相关失真；
+  /// 噪底会抬高约 3dB，属音质取舍，故默认关闭。切换立即生效。
+  bool _ditherEnabled = false;
+  bool get ditherEnabled => _ditherEnabled;
+
+  /// 启动/进入设置页时恢复 TPDF 抖动开关并下发到原生（幂等）。
+  Future<void> initDither() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      _ditherEnabled = prefs.getBool(_keyDither) ?? false;
+      await _channel.invokeMethod('setDitherEnabled', {'enabled': _ditherEnabled});
+      _debug('initDither: $_ditherEnabled');
+    } catch (e) {
+      _debug('initDither failed: $e');
+    }
+  }
+
+  /// 设置 TPDF 抖动开关：持久化 + 下发原生。立即生效（数据路径每块缓冲都读取）。
+  Future<void> setDither(bool value) async {
+    _ditherEnabled = value;
+    try {
+      await _channel.invokeMethod('setDitherEnabled', {'enabled': value});
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(_keyDither, value);
+      _debug('setDither: $value (persisted, applies immediately)');
+    } catch (e) {
+      _debug('setDither failed: $e');
     }
   }
 
@@ -269,6 +305,28 @@ class UsbAudioService {
     } catch (e) {
       _debug('getStatus failed: $e');
       return const {};
+    }
+  }
+
+  /// 主动读取一次接入 DAC 的能力（UAC 版本 / 总线速度 / 支持的采样率、位深、声道）。
+  ///
+  /// 原生只打开设备读 USB 描述符后立即关闭（不 claim 接口、不打断系统音频），
+  /// 未授权时先弹授权框。返回最新状态（含 supportedRates 等）。
+  Future<Map<String, dynamic>> probeDacCapabilities() async {
+    try {
+      final s = await _channel
+          .invokeMapMethod<String, dynamic>('probeDacCapabilities');
+      if (s != null) _lastStatus = s;
+      _debug('probeDacCapabilities: rate=${s?['supportedRates']} '
+          'bits=${s?['supportedBits']} ch=${s?['supportedChannels']} '
+          'uac=${s?['uacLabel']}');
+      return s ?? const {};
+    } on PlatformException catch (e) {
+      _debug('probeDacCapabilities error: ${e.code} ${e.message}');
+      throw UsbAudioException(e.code, e.message ?? '读取 DAC 能力失败');
+    } catch (e) {
+      _debug('probeDacCapabilities error: $e');
+      throw UsbAudioException('PROBE_FAILED', '读取 DAC 能力失败: $e');
     }
   }
 

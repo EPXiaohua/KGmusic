@@ -8,6 +8,9 @@ import 'package:shared_preferences/shared_preferences.dart';
 ///
 /// 与 Apple Music 风格播放页的 [LyricFontSource] 解耦，持久化到独立的
 /// SharedPreferences key，允许两种播放页独立设置歌词字体。
+///
+/// `bundled` 已废弃（内置 SimHei 已移除），仅保留枚举值以稳定
+/// `fontSource.index` 的原生契约（0=system 1=bundled 2=custom），行为等同 system。
 enum Md3LyricFontSource { system, bundled, custom }
 
 /// MD3 风格播放页的歌词显示偏好（字号 + 行间距 + 字体）。
@@ -96,15 +99,14 @@ class Md3LyricPreferences extends ChangeNotifier {
 
   /// 当前生效的 fontFamily（传给 TextPainter 的 TextStyle）：
   /// - [Md3LyricFontSource.system]：返回 null（让 Flutter 走系统字体链）
-  /// - [Md3LyricFontSource.bundled]：返回 'SimHei'
+  /// - [Md3LyricFontSource.bundled]：已废弃（内置 SimHei 已移除），等同 system 返回 null
   /// - [Md3LyricFontSource.custom]：返回 [_loadedCustomFontFamily]，
   ///   加载失败时为 null（实际降级为 system 行为）
   String? get effectiveFontFamily {
     switch (_fontSource) {
       case Md3LyricFontSource.system:
-        return null;
       case Md3LyricFontSource.bundled:
-        return 'SimHei';
+        return null;
       case Md3LyricFontSource.custom:
         return _loadedCustomFontFamily;
     }
@@ -238,13 +240,13 @@ class Md3LyricPreferences extends ChangeNotifier {
     }
   }
 
+  /// 历史值 'bundled'（内置 SimHei 已移除）迁移为 [Md3LyricFontSource.system]。
   static Md3LyricFontSource _fontSourceFromName(String? name) {
     switch (name) {
-      case 'bundled':
-        return Md3LyricFontSource.bundled;
       case 'custom':
         return Md3LyricFontSource.custom;
       default:
+        // 'bundled' 与未知值一并归入 system（bundled 字体已不再打包）
         return Md3LyricFontSource.system;
     }
   }

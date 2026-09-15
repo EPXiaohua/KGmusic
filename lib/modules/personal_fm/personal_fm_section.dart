@@ -231,8 +231,7 @@ class _PersonalFmSectionState extends State<PersonalFmSection> {
   /// 走 [fullPlayerRoute]：与 MiniPlayer 点击展开同一条路由（带拖拽收起、
   /// 交叉淡入、md / AM 两套播放页的选择）。
   void _openPlayerDetail() {
-    if (activePlayerRoute?.isCurrent ?? false) return;
-    Navigator.of(context).push(fullPlayerRoute(context));
+    openFullPlayer(context);
   }
 
   Future<void> _togglePlay() async {

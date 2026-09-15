@@ -473,7 +473,7 @@ class _CoverFlowViewState extends State<_CoverFlowView>
                           widget.songs.map((e) => e.toSong()).toList(),
                           index,
                         );
-                    Navigator.of(context).push(fullPlayerRoute(context));
+                    openFullPlayer(context);
                   } else {
                     _animateTo(index.toDouble());
                   }

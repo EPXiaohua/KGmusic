@@ -103,43 +103,82 @@ class AudioFormatUtils {
     return map[ext] ?? ext.toUpperCase();
   }
 
+  /// 把应用内的路径形态解析为磁盘文件：裸路径 / `file://` / `local://`。
+  /// 本地歌曲的 artwork/播放地址常用 `local://<绝对路径>` 形态（缺省盘符斜杠需补全）。
+  static Future<File?> _resolveLocalFile(String p) async {
+    if (p.isEmpty) return null;
+    final direct = File(p);
+    if (await direct.exists()) return direct;
+    final uri = Uri.tryParse(p);
+    if (uri != null && uri.scheme == 'file') {
+      final f = File(uri.toFilePath());
+      if (await f.exists()) return f;
+    }
+    if (p.startsWith('local://')) {
+      final path = p.substring('local://'.length);
+      final f = File(path.startsWith('/') ? path : '/$path');
+      if (await f.exists()) return f;
+    }
+    return null;
+  }
+
+  /// 仅供单元测试（test/core/utils/audio_format_utils_test.dart）调用：
+  /// WAV 位深解析（RIFF chunk 遍历）。生产路径请走 [parseAudioBitDepth]。
+  static int? parseWavBitsForTest(Uint8List head) =>
+      _parseWavBitsPerSample(head);
+
+  /// WAV/RF64：沿 RIFF chunk 链定位 "fmt " 并读取 wBitsPerSample。
+  /// 兼容 fmt 前有 JUNK/LIST/bext 等非规范 chunk、fmt 18/40 字节
+  /// （WAVE_FORMAT_EXTENSIBLE）与 IEEE float（formatTag=3）布局。
+  /// [head] 为文件头前若干字节（建议 ≥4KB）。
+  static int? _parseWavBitsPerSample(Uint8List head) {
+    if (head.length < 12) return null;
+    // WAVE / WAVE(=RF64 变体)：offset 8..11 应为 "WAVE"
+    if (head[8] != 0x57 || head[9] != 0x41 || head[10] != 0x56 || head[11] != 0x45) {
+      return null;
+    }
+    var pos = 12;
+    while (pos + 8 <= head.length) {
+      final id = String.fromCharCodes([
+        head[pos], head[pos + 1], head[pos + 2], head[pos + 3],
+      ]);
+      final size = (head[pos + 4] & 0xFF) |
+          ((head[pos + 5] & 0xFF) << 8) |
+          ((head[pos + 6] & 0xFF) << 16) |
+          ((head[pos + 7] & 0xFF) << 24);
+      final body = pos + 8;
+      if (id == 'fmt ') {
+        if (body + 16 > head.length) return null;
+        final bits = (head[body + 14] & 0xFF) | ((head[body + 15] & 0xFF) << 8);
+        return (bits > 0 && bits <= 32) ? bits : null;
+      }
+      if (size <= 0) return null; // 非法 chunk，放弃
+      // chunk 按 2 字节对齐（奇数长度补 1）
+      pos = body + size + (size & 1);
+    }
+    return null;
+  }
+
   /// 解析音频文件头（FLAC STREAMINFO / WAV fmt chunk）获取原始位深。
-  /// 本地文件直接读，网络 URL 用 Range 请求前 64 字节。解析失败返回 null。
+  /// 本地文件直接读，网络 URL 用 Range 请求前 4KB。解析失败返回 null。
   static Future<int?> parseAudioBitDepth(String? url, String? localPath) async {
     try {
       Uint8List head;
-      if (localPath != null && localPath.isNotEmpty) {
-        final f = File(localPath);
-        if (!await f.exists()) {
-          // localPath 可能是 file:// URI
-          final uri = Uri.tryParse(localPath);
-          if (uri == null || uri.scheme != 'file') return null;
-          final f2 = File(uri.toFilePath());
-          if (!await f2.exists()) return null;
-          final raf = await f2.open();
-          head = await raf.read(64);
-          await raf.close();
-        } else {
-          final raf = await f.open();
-          head = await raf.read(64);
-          await raf.close();
-        }
-      } else if (url != null && url.isNotEmpty) {
-        if (url.startsWith('file://')) {
-          final f = File(Uri.parse(url).toFilePath());
-          if (!await f.exists()) return null;
-          final raf = await f.open();
-          head = await raf.read(64);
-          await raf.close();
-        } else if (url.startsWith('http://') || url.startsWith('https://')) {
-          final resp = await http
-              .get(Uri.parse(url), headers: {'Range': 'bytes=0-63'})
-              .timeout(const Duration(seconds: 5));
-          if (resp.statusCode < 200 || resp.statusCode >= 300) return null;
-          head = resp.bodyBytes;
-        } else {
-          return null;
-        }
+      // 路径形态兼容：裸路径 / file:// / local://（本地歌曲常用形态，此前不支持导致
+      // USB 独占格式链「源文件」行缺位深 —— 歌曲信息页同参数可解析，两处需一致）
+      final localFile = await _resolveLocalFile(localPath ?? '') ??
+          await _resolveLocalFile(url ?? '');
+      if (localFile != null) {
+        final raf = await localFile.open();
+        head = await raf.read(4096);
+        await raf.close();
+      } else if (url != null &&
+          (url.startsWith('http://') || url.startsWith('https://'))) {
+        final resp = await http
+            .get(Uri.parse(url), headers: {'Range': 'bytes=0-4095'})
+            .timeout(const Duration(seconds: 5));
+        if (resp.statusCode < 200 || resp.statusCode >= 300) return null;
+        head = resp.bodyBytes;
       } else {
         return null;
       }
@@ -154,12 +193,13 @@ class AudioFormatUtils {
         if (bps > 0 && bps <= 32) return bps;
       }
 
-      // WAV: "RIFF" + fmt chunk 的 bitsPerSample（offset 34，2 字节 LE）
-      if (head[0] == 0x52 && head[1] == 0x49 && head[2] == 0x46 && head[3] == 0x46) {
-        if (head.length >= 36) {
-          final bps = (head[34] & 0xFF) | ((head[35] & 0xFF) << 8);
-          if (bps > 0 && bps <= 32) return bps;
-        }
+      // WAV/RF64: 走 RIFF chunk 链定位 "fmt "（2026-09-14 修复：旧实现硬编码
+      // bitsPerSample@34，仅对「RIFF 后紧跟 16 字节 fmt」的规范布局成立；
+      // fmt 前有 JUNK/LIST/bext、fmt 为 18/40 字节（WAVE_FORMAT_EXTENSIBLE）、
+      // 或 IEEE float(tag=3) 的实际产物都会解析失败 → 源文件行缺位深）。
+      final magic = String.fromCharCodes([head[0], head[1], head[2], head[3]]);
+      if (magic == 'RIFF' || magic == 'RF64') {
+        return _parseWavBitsPerSample(head);
       }
     } catch (_) {
       // 网络/文件解析失败静默处理

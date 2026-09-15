@@ -5,7 +5,8 @@ import 'package:flutter/services.dart';
 /// 字体来源枚举。
 ///
 /// - [FontSource.system]：使用手机系统字体（默认，符合"优先展示用户手机字体"需求）
-/// - [FontSource.bundled]：使用内置打包的 SimHei
+/// - [FontSource.bundled]：已废弃（内置 SimHei 已移除，仅保留枚举值以稳定
+///   `fontSource.index` 的原生契约 0=system 1=bundled 2=custom），行为等同 system
 /// - [FontSource.custom]：使用用户通过 SAF 选择的 TTF/OTF 文件
 enum FontSource {
   system,
@@ -31,13 +32,14 @@ class CustomFontLoader {
   static const String _channel = 'com.md3music.md3music/font_picker';
 
   /// 从持久化的字符串名还原 [FontSource]，无效时回退到 [FontSource.system]
+  ///
+  /// 历史值 'bundled'（内置 SimHei 已移除）迁移为 [FontSource.system]。
   static FontSource fromName(String? name) {
     switch (name) {
-      case 'bundled':
-        return FontSource.bundled;
       case 'custom':
         return FontSource.custom;
       default:
+        // 'bundled' 与未知值一并归入 system（bundled 字体已不再打包）
         return FontSource.system;
     }
   }

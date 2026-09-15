@@ -36,6 +36,15 @@ class _UsbExclusiveSectionState extends State<UsbExclusiveSection> {
   int _outputBits = 0;
   int _outputChannels = 0;
 
+  /// TPDF 抖动降位（默认关闭）。本地副本用于开关即时反馈，持久化在服务层。
+  bool _ditherEnabled = false;
+
+  /// 正在读取 DAC 能力（按钮 loading 态）。
+  bool _probing = false;
+
+  /// 已做过 override 校正的能力集（去重，避免重复下发）。
+  String? _lastCapsKey;
+
   // ── 源文件格式（ExoPlayer TrackGroup + 文件头位深），切歌时刷新 ──
   /// 当前曲目的源格式（含歌曲原始采样率/声道/codec），null=尚未获取。
   Map<String, dynamic>? _sourceFormat;
@@ -62,6 +71,13 @@ class _UsbExclusiveSectionState extends State<UsbExclusiveSection> {
     _outputRate = UsbAudioService.instance.outputRate;
     _outputBits = UsbAudioService.instance.outputBits;
     _outputChannels = UsbAudioService.instance.outputChannels;
+    // 恢复 TPDF 抖动开关（服务层已持久化+下发原生；此处仅同步本地副本，幂等）
+    _ditherEnabled = UsbAudioService.instance.ditherEnabled;
+    UsbAudioService.instance.initDither().then((_) {
+      if (mounted) {
+        setState(() => _ditherEnabled = UsbAudioService.instance.ditherEnabled);
+      }
+    });
     // 兜底 c：页面可见时主动查一次（覆盖原生事件未推送的边界场景）
     UsbAudioService.instance.refresh();
     // 每秒轮询原生状态：切歌/钳制重建等场景的格式变化 1s 内刷新到格式链
@@ -78,31 +94,39 @@ class _UsbExclusiveSectionState extends State<UsbExclusiveSection> {
   }
 
   /// 拉取当前曲目的源格式（TrackGroup）+ 文件头原始位深（FLAC/WAV）。
+  /// 两个拉取相互独立：getSourceFormat 失败不应吞掉文件头位深的解析
+  /// （实测 32bit FLAC 场景源文件行的位深因此缺失）。
+  /// provider/song 在首个 await 之前取好，避免跨异步间隙使用 BuildContext。
   Future<void> _refreshSourceFormat() async {
+    final provider = context.read<PlayerProvider>();
+    final player = provider.audioService?.player;
+    final song = provider.currentSong;
     try {
-      final provider = context.read<PlayerProvider>();
-      final player = provider.audioService?.player;
-      final song = provider.currentSong;
       Map<String, dynamic>? fmt;
       if (player != null) {
         fmt = await player.getSourceFormat();
       }
-      final headerBits =
-          await AudioFormatUtils.parseAudioBitDepth(song?.url, song?.localPath);
       if (mounted) {
-        setState(() {
-          _sourceFormat = fmt;
-          _headerBitDepth = headerBits;
-        });
+        setState(() => _sourceFormat = fmt);
       }
     } catch (_) {
       // 源格式仅用于展示，失败静默
+    }
+    try {
+      final headerBits =
+          await AudioFormatUtils.parseAudioBitDepth(song?.url, song?.localPath);
+      if (mounted) {
+        setState(() => _headerBitDepth = headerBits);
+      }
+    } catch (_) {
+      // 文件头解析失败静默处理
     }
   }
 
   void _onStatus(Map<String, dynamic> s) {
     if (!mounted) return;
     setState(() => _status = s);
+    _reconcileOverrides();
     // 拔线检测：独占开启中设备断开 → 提示 + 自动暂停
     final nowConnected = s['deviceConnected'] == true;
     final enabled = s['enabled'] == true;
@@ -148,6 +172,12 @@ class _UsbExclusiveSectionState extends State<UsbExclusiveSection> {
     final connected = _status['deviceConnected'] == true;
     final alive = _status['streamAlive'] == true;
     final deviceName = _status['deviceName'] as String? ?? '未知设备';
+    // UAC1 / UAC2（AudioControl 描述符 bcdADC）——未读取到时为空，不显示徽标
+    final uacLabel = _status['uacLabel'] as String? ?? '';
+    // 输出格式可选项：全部来自接入 DAC 的能力（无能力时只有"自适应"且禁用）
+    final rates = _supportedRates();
+    final bits = _supportedBits();
+    final channels = _supportedChannels();
 
     // 切歌后异步拉取源格式（以歌曲 id 去重，与歌曲信息页同一机制）
     final song = context.watch<PlayerProvider>().currentSong;
@@ -163,7 +193,13 @@ class _UsbExclusiveSectionState extends State<UsbExclusiveSection> {
     final srcRate = hasSrc ? ((src['sampleRate'] as num?)?.toInt() ?? 0) : 0;
     final srcCh = hasSrc ? ((src['channelCount'] as num?)?.toInt() ?? 0) : 0;
     final srcCodec = hasSrc ? src['codec'] as String? : null;
-    final codecLabel = (srcCodec != null && srcCodec.isNotEmpty)
+    // FLAC 扩展 extractor 会在 extractor 层直接解码为 raw PCM（2026-09-14 定位），
+    // 此时 TrackGroup 的 mime 是 audio/raw（解码后 PCM，不含容器/位深信息）。
+    // 这种情况回落到「按文件扩展名」推断原始编码，而不是把 audio/raw 当 codec 展示。
+    final mimeIsDecodedPcm = srcCodec == 'audio/raw';
+    final codecLabel = (srcCodec != null &&
+            srcCodec.isNotEmpty &&
+            !mimeIsDecodedPcm)
         ? srcCodec
         : AudioFormatUtils.codecLabelFromPath(song?.url, song?.localPath);
     // 有损格式（MP3/AAC/…）无位深概念；无损格式仅在文件头解析成功时展示
@@ -226,7 +262,21 @@ class _UsbExclusiveSectionState extends State<UsbExclusiveSection> {
             );
           },
         ),
-        // 状态卡
+        // TPDF 抖动降位（默认关闭）：独占降位(如 32→24)时加三角抖动消除截断失真，
+        // 数据路径每块缓冲读取 → 切换立即生效，无需重建流
+        // search: tpdf 抖动 dither 降位 量化 32bit 位深
+        SwitchListTile(
+          secondary: Icon(Icons.graphic_eq, color: colorScheme.primary),
+          title: const Text('TPDF 抖动降位'),
+          subtitle: const Text('独占输出降位(如 32→24)时加三角抖动，消除截断失真；噪底略升。立即生效'),
+          value: _ditherEnabled,
+          onChanged: (v) async {
+            HapticFeedback.lightImpact();
+            setState(() => _ditherEnabled = v);
+            await UsbAudioService.instance.setDither(v);
+          },
+        ),
+        // 状态卡：设备名 + UAC1/UAC2 + 总线速度 + 能力摘要
         Padding(
           padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
           child: Container(
@@ -249,15 +299,24 @@ class _UsbExclusiveSectionState extends State<UsbExclusiveSection> {
                         overflow: TextOverflow.ellipsis,
                       ),
                     ),
+                    // UAC1 / UAC2：来自 AudioControl 描述符的 bcdADC
+                    if (uacLabel.isNotEmpty) ...[
+                      _StatusChip(uacLabel, color: colorScheme.tertiary),
+                      const SizedBox(width: 6),
+                    ],
                     _StatusChip(
-                      connected
-                          ? (alive ? '运行中' : '已连接')
-                          : '未连接',
+                      connected ? (alive ? '运行中' : '已连接') : '未连接',
                       color: alive
                           ? Colors.green
                           : (connected ? Colors.orange : colorScheme.outline),
                     ),
                   ],
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  _deviceSummary(),
+                  style: textTheme.bodySmall
+                      ?.copyWith(color: colorScheme.onSurfaceVariant),
                 ),
               ],
             ),
@@ -276,6 +335,7 @@ class _UsbExclusiveSectionState extends State<UsbExclusiveSection> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
+                // 可选项全部来自 DAC 能力；未读取到能力时禁用（避免写入 DAC 不支持的格式）
                 _formatDropdown(
                   context,
                   icon: Icons.speed,
@@ -283,10 +343,10 @@ class _UsbExclusiveSectionState extends State<UsbExclusiveSection> {
                   value: _outputRate,
                   items: {
                     0: '自适应',
-                    for (final r in _supportedRates()) r: _rateLabel(r),
+                    for (final r in rates) r: _rateLabel(r),
                   },
-                  onChanged: (v) =>
-                      _updateFormat(rate: v ?? 0),
+                  enabled: rates.isNotEmpty,
+                  onChanged: (v) => _updateFormat(rate: v ?? 0),
                 ),
                 _formatDropdown(
                   context,
@@ -295,29 +355,43 @@ class _UsbExclusiveSectionState extends State<UsbExclusiveSection> {
                   value: _outputBits,
                   items: {
                     0: '自适应',
-                    for (final b in _supportedBits()) b: '$b-bit',
+                    for (final b in bits) b: '$b-bit',
                   },
-                  onChanged: (v) =>
-                      _updateFormat(bits: v ?? 0),
+                  enabled: bits.isNotEmpty,
+                  onChanged: (v) => _updateFormat(bits: v ?? 0),
                 ),
                 _formatDropdown(
                   context,
                   icon: Icons.surround_sound,
                   label: '输出声道',
                   value: _outputChannels,
-                  items: const {
+                  items: {
                     0: '自适应',
-                    1: '单声道',
-                    2: '立体声',
+                    for (final c in channels) c: _channelLabel(c),
                   },
-                  onChanged: (v) =>
-                      _updateFormat(channels: v ?? 0),
+                  enabled: channels.isNotEmpty,
+                  onChanged: (v) => _updateFormat(channels: v ?? 0),
                 ),
                 Text(
-                  '自适应跟随歌曲格式。强制采样率与源不同时将自动重采样',
+                  _capsHintText(connected),
                   style: textTheme.bodySmall
                       ?.copyWith(color: colorScheme.onSurfaceVariant),
                 ),
+                // 手动读取（未授权时弹系统授权框；只读描述符，不打断系统音频）
+                if (connected)
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: TextButton.icon(
+                      onPressed: _probing ? null : _probeCaps,
+                      icon: Icon(Icons.refresh,
+                          size: 16, color: colorScheme.primary),
+                      label: Text(
+                        _probing ? '读取中…' : '读取 DAC 能力',
+                        style: textTheme.labelMedium
+                            ?.copyWith(color: colorScheme.primary),
+                      ),
+                    ),
+                  ),
                 // ── 实时格式链：源文件 → 播放流 → DAC 端点 ──────────────
                 const Padding(
                   padding: EdgeInsets.only(top: 12, bottom: 10),
@@ -512,28 +586,157 @@ class _UsbExclusiveSectionState extends State<UsbExclusiveSection> {
     UsbAudioService.instance.setOutputFormat(r, b, c);
   }
 
-  /// DAC 支持的采样率（getStatus 能力并集；无设备连接时用通用兜底）。
-  List<int> _supportedRates() {
-    final list = _status['supportedRates'];
-    if (list is List && list.isNotEmpty) {
-      return list.map((e) => (e as num).toInt()).toList()..sort();
-    }
-    return const [44100, 48000, 96000];
-  }
+  // ── DAC 能力（全部来自接入设备的 USB 描述符，无硬编码兜底） ───────
+
+  /// DAC 支持的采样率（UAC1 离散列表 / UAC2 连续区间按声明范围生成）。
+  List<int> _supportedRates() => _intList('supportedRates');
 
   /// DAC 支持的位深。
-  List<int> _supportedBits() {
-    final list = _status['supportedBits'];
+  List<int> _supportedBits() => _intList('supportedBits');
+
+  /// DAC 支持的声道数。
+  List<int> _supportedChannels() => _intList('supportedChannels');
+
+  /// 从未开启独占时是否只有"自适应"可选（DAC 能力未知）。
+  bool get _hasCaps =>
+      _supportedRates().isNotEmpty ||
+      _supportedBits().isNotEmpty ||
+      _supportedChannels().isNotEmpty;
+
+  List<int> _intList(String key) {
+    final list = _status[key];
     if (list is List && list.isNotEmpty) {
-      return list.map((e) => (e as num).toInt()).toList()..sort();
+      return list.map((e) => (e as num).toInt()).toSet().toList()..sort();
     }
-    return const [16, 24];
+    return const [];
+  }
+
+  /// UAC2 连续区间时原生给出的声明范围（0=未声明/离散列表）。
+  int get _rateRangeMin => (_status['rateRangeMin'] as num?)?.toInt() ?? 0;
+  int get _rateRangeMax => (_status['rateRangeMax'] as num?)?.toInt() ?? 0;
+
+  /// 能力来源：active=已打开设备（实际流配置）/ probed=只读描述符探测 / none=未知。
+  String get _capsSource => _status['capabilitiesSource'] as String? ?? 'none';
+
+  /// DAC 能力读取完成后，清除当前 DAC 不支持的强制值（回落自适应）。
+  /// 每个能力集只处理一次（按内容去重），避免重复下发。
+  void _reconcileOverrides() {
+    final rates = _supportedRates();
+    final bits = _supportedBits();
+    final chs = _supportedChannels();
+    if (rates.isEmpty && bits.isEmpty && chs.isEmpty) return;
+    final key = '$rates|$bits|$chs';
+    if (key == _lastCapsKey) return;
+    _lastCapsKey = key;
+    var r = _outputRate;
+    var b = _outputBits;
+    var c = _outputChannels;
+    if (r != 0 && rates.isNotEmpty && !rates.contains(r)) r = 0;
+    if (b != 0 && bits.isNotEmpty && !bits.contains(b)) b = 0;
+    if (c != 0 && chs.isNotEmpty && !chs.contains(c)) c = 0;
+    if (r == _outputRate && b == _outputBits && c == _outputChannels) return;
+    setState(() {
+      _outputRate = r;
+      _outputBits = b;
+      _outputChannels = c;
+    });
+    UsbAudioService.instance.setOutputFormat(r, b, c);
+  }
+
+  /// 手动读取一次接入 DAC 的能力（原生只读描述符，不打断系统音频）。
+  Future<void> _probeCaps() async {
+    setState(() => _probing = true);
+    try {
+      await UsbAudioService.instance.probeDacCapabilities();
+      final s = await UsbAudioService.instance.getStatus();
+      if (mounted) {
+        setState(() => _status = s);
+        _reconcileOverrides();
+        showToast(_hasCaps ? '已读取 DAC 能力' : '未读取到 DAC 能力');
+      }
+    } on UsbAudioException catch (e) {
+      if (mounted) showToast('读取 DAC 能力失败：${e.message}', long: true);
+    } catch (e) {
+      if (mounted) showToast('读取 DAC 能力失败：$e', long: true);
+    } finally {
+      if (mounted) setState(() => _probing = false);
+    }
   }
 
   String _rateLabel(int rate) {
     if (rate % 1000 == 0) return '${rate ~/ 1000} kHz';
     return '${(rate / 1000).toStringAsFixed(1)} kHz';
   }
+
+  String _channelLabel(int ch) {
+    if (ch == 1) return '单声道';
+    if (ch == 2) return '立体声';
+    return '$ch 声道';
+  }
+
+  /// 设备卡副标题：VID:PID · 总线速度 · UAC 版本 · DAC 支持的能力并集。
+  String _deviceSummary() {
+    if (_status['deviceConnected'] != true) {
+      return '连接 USB DAC 后自动读取其 UAC 版本与支持的格式';
+    }
+    final seg = <String>[];
+    final vid = (_status['deviceVid'] as num?)?.toInt() ?? 0;
+    final pid = (_status['devicePid'] as num?)?.toInt() ?? 0;
+    if (vid > 0 && pid > 0) seg.add('${_hex4(vid)}:${_hex4(pid)}');
+    final speed = _status['usbSpeed'] as String? ?? '';
+    if (speed == 'full') {
+      seg.add('全速 Full-Speed');
+    } else if (speed == 'high') {
+      seg.add('高速 High-Speed');
+    }
+    final uac = _status['uacLabel'] as String? ?? '';
+    if (uac.isNotEmpty) seg.add(uac);
+    final rates = _supportedRates();
+    final bits = _supportedBits();
+    final channels = _supportedChannels();
+    if (rates.isEmpty && bits.isEmpty && channels.isEmpty) {
+      seg.add('未读取到 DAC 能力');
+      return seg.join(' · ');
+    }
+    if (rates.isNotEmpty) {
+      seg.add(rates.map(_rateShort).join('/'));
+      // UAC2 连续区间：说明可选项来自 DAC 声明的范围
+      if (_rateRangeMin > 0 && _rateRangeMax >= _rateRangeMin) {
+        seg.add('声明范围 ${_rateShort(_rateRangeMin)}-${_rateShort(_rateRangeMax)}');
+      }
+    }
+    if (bits.isNotEmpty) seg.add('${bits.join('/')}-bit');
+    if (channels.isNotEmpty) seg.add(channels.map(_channelLabel).join('/'));
+    // 未开启独占时能力来自"只读描述符"探测（未 claim 接口），与独占中的实际流配置区分
+    if (_capsSource == 'probed') seg.add('未开启独占');
+    return seg.join(' · ');
+  }
+
+  /// 钳制提示：强制值被 DAC 能力降级时说明实际下发的采样率。
+  String _clampHint() {
+    final override = (_status['outputRateOverride'] as num?)?.toInt() ?? 0;
+    final effective = (_status['outputRateEffective'] as num?)?.toInt() ?? 0;
+    if (override > 0 && effective > 0 && override != effective) {
+      return 'DAC 不支持 ${_rateLabel(override)}，已钳制为 ${_rateLabel(effective)}';
+    }
+    return '';
+  }
+
+  /// 输出格式卡提示：无能力时提示先读取；有连续区间时说明来源。
+  String _capsHintText(bool connected) {
+    final clamp = _clampHint();
+    if (clamp.isNotEmpty) return clamp;
+    if (!connected) return '未连接 USB DAC，连接后按其描述符提供可选项';
+    if (!_hasCaps) return '该 DAC 未声明支持的采样率，可点下方「读取 DAC 能力」再试';
+    if (_rateRangeMin > 0 && _rateRangeMax >= _rateRangeMin) {
+      return 'DAC 声明连续采样率区间，可选项已限制在该范围内；自适应跟随歌曲格式';
+    }
+    return '可选项来自 DAC 描述符；自适应跟随歌曲格式，强制值与源不同时将重采样';
+  }
+
+  String _rateShort(int rate) => _rateLabel(rate).replaceAll(' ', '');
+
+  String _hex4(int v) => v.toRadixString(16).toUpperCase().padLeft(4, '0');
 
   Widget _formatDropdown(
     BuildContext context, {
@@ -542,15 +745,23 @@ class _UsbExclusiveSectionState extends State<UsbExclusiveSection> {
     required int value,
     required Map<int, String> items,
     required ValueChanged<int?> onChanged,
+    bool enabled = true,
   }) {
     final colorScheme = Theme.of(context).colorScheme;
     final textTheme = Theme.of(context).textTheme;
     return Row(
       children: [
-        Icon(icon, size: 18, color: colorScheme.primary),
+        Icon(icon,
+            size: 18,
+            color: enabled ? colorScheme.primary : colorScheme.outline),
         const SizedBox(width: 8),
         Expanded(
-          child: Text(label, style: textTheme.bodyMedium),
+          child: Text(
+            label,
+            style: textTheme.bodyMedium?.copyWith(
+              color: enabled ? null : colorScheme.onSurfaceVariant,
+            ),
+          ),
         ),
         DropdownButton<int>(
           value: items.containsKey(value) ? value : 0,
@@ -561,7 +772,8 @@ class _UsbExclusiveSectionState extends State<UsbExclusiveSection> {
                     child: Text(e.value, style: textTheme.bodyMedium),
                   ))
               .toList(),
-          onChanged: onChanged,
+          // 未读取到 DAC 能力时禁用（只有"自适应"），避免下发 DAC 不支持的格式
+          onChanged: enabled ? onChanged : null,
         ),
       ],
     );

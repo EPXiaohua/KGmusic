@@ -238,13 +238,16 @@ class UsbAudioDevice private constructor(private val context: Context) {
                 "epOut=0x${chosen.outEp.toString(16)} maxPacket=${chosen.outMaxPacket} " +
                 "bits=${chosen.bitResolution} ch=${chosen.channels} rates=${chosen.rates.contentToString()}")
 
-        // 能力并集（仅含 OUT 端点的输出流 alt），供输出格式选择 UI 生成可选项
-        val outs = asAlts.filter { it.outEp >= 0 }
-        val allRates = outs.flatMap { it.rates.asIterable() }.distinct().sorted().toIntArray()
-        val allBits = outs.map { it.bitResolution }.distinct().sorted().toIntArray()
-        val allChannels = outs.map { it.channels }.filter { it > 0 }.distinct().sorted().toIntArray()
+        // UAC2 才有 Clock Source 实体；UAC1 采样率走端点请求（见 setSampleRate）。
+        // 提到能力解析之前：UAC2 描述符常不声明速率，需向 Clock Source 发 GET_RANGE。
+        val clockSourceId = if (uacVersion == 2) parseClockSourceId(conn) else -1
 
-        // Claim the AudioControl interface (0) with force=true to disconnect kernel driver
+        // 能力并集（仅含 OUT 端点的输出流 alt），供输出格式选择 UI 生成可选项。
+        // UAC2 描述符常不声明任何速率（Type I bLength=6）→ 退而向 Clock Source 发 GET_RANGE。
+        // [P1 修复 2026-09-13]：类请求（UAC2 GET_RANGE/GET_CUR）必须在 claim AC 接口
+        // （force=true 断开内核 snd-usb-audio）之后发起 —— 内核驱动占用时钟控制时
+        // controlTransfer 全部以 -1 失败（Truesound UAC2 实测 18 实体全 -1 →
+        // supportedRates=[] → 采样率无法读取/钳制）。
         val controlInterface = (0 until device.interfaceCount)
                 .map { device.getInterface(it) }
                 .firstOrNull { it.interfaceClass == UsbConstants.USB_CLASS_AUDIO && it.interfaceSubclass == 1 }
@@ -254,6 +257,16 @@ class UsbAudioDevice private constructor(private val context: Context) {
             if (claimed) claimedInterfaces.add(controlInterface)
             UsbLog.i(TAG, "Claimed AudioControl interface ${controlInterface.id} force=true: $claimed")
         }
+
+        var queried: QueriedRates? = null
+        var caps = capsFromAlts(asAlts)
+        if (caps.rates.isEmpty()) {
+            queried = queryRateRange(conn, uacVersion, clockSourceId, chosen.outEp)
+            if (queried != null) caps = capsFromAlts(asAlts, queried)
+        }
+        val allRates = caps.rates
+        val allBits = caps.bits
+        val allChannels = caps.channels
 
         // Claim 所选输出流接口：按 bInterfaceNumber + bAlternateSetting 精确匹配，
         // 避免在多 AS 组设备（录音/播放两组接口）上命中错误接口
@@ -296,8 +309,7 @@ class UsbAudioDevice private constructor(private val context: Context) {
 
         val fd = conn.fileDescriptor
 
-        // UAC2 才有 Clock Source 实体；UAC1 采样率走端点请求（见 setSampleRate）
-        val clockSourceId = if (uacVersion == 2) parseClockSourceId(conn) else -1
+        // clockSourceId 已在上方能力解析处计算（避免重复解析描述符）
         featureUnitId = parseFeatureUnitId(conn)
         val feedbackSource = if (chosen.fbEp > 0) "same-iface" else "none"
 
@@ -423,8 +435,145 @@ class UsbAudioDevice private constructor(private val context: Context) {
         val channels: Int,
         val bitResolution: Int,
         val subslotSize: Int,       // 每样本字节数
-        val rates: IntArray         // UAC1 离散采样率列表；UAC2/连续区间为空
+        val rates: IntArray,        // UAC1 离散采样率列表；UAC2/连续区间为空
+        val rateMin: Int = 0,       // UAC2 连续区间下限（bSamFreqType=0）；0=无
+        val rateMax: Int = 0        // UAC2 连续区间上限；0=无
     )
+
+    /**
+     * UAC2 连续采样率区间设备（bSamFreqType=0）没有离散列表，
+     * 只能用其声明的 [min,max] 过滤标准速率阶梯生成可选项。
+     */
+    private val STANDARD_RATE_LADDER = intArrayOf(
+            8000, 11025, 16000, 22050, 24000, 32000,
+            44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000
+    )
+
+    private fun le24(raw: ByteArray, offset: Int): Int {
+        if (offset + 2 >= raw.size) return 0
+        return (raw[offset].toInt() and 0xFF) or
+                ((raw[offset + 1].toInt() and 0xFF) shl 8) or
+                ((raw[offset + 2].toInt() and 0xFF) shl 16)
+    }
+
+    private fun le32(raw: ByteArray, offset: Int): Int {
+        if (offset + 3 >= raw.size) return 0
+        return (raw[offset].toInt() and 0xFF) or
+                ((raw[offset + 1].toInt() and 0xFF) shl 8) or
+                ((raw[offset + 2].toInt() and 0xFF) shl 16) or
+                ((raw[offset + 3].toInt() and 0xFF) shl 24)
+    }
+
+    /** 通过标准请求问到的采样率能力（UAC2 GET_RANGE 子区间 / UAC1 GET_MIN·MAX）。 */
+    private data class QueriedRates(
+        val rates: IntArray,   // 子区间端点 + 阶梯命中值（已排序去重）
+        val min: Int,
+        val max: Int
+    )
+
+    /**
+     * 描述符未声明采样率时（典型：UAC2 Type I 描述符 bLength=6，连 bSamFreqType 都没有，
+     * 速率全部由可编程 Clock Source 声明），用标准请求向 DAC 询问可用范围：
+     * - UAC2：Clock Source 实体 GET_RANGE（bRequest=0x02，wValue=CS_SAM_FREQ_CONTROL）
+     *   响应布局（UAC2 5.2.2.1）：wNumSubRanges(2) + N×(dwMin/dwMax/dwRes，各 4 字节 LE)。
+     *   常见 8 个子区间（44.1k–48k / 88.2k–96k / 176.4k–192k / 352.8k–384k …）。
+     * - UAC1：端点 GET_MIN(0x02) / GET_MAX(0x03)，各 3 字节 LE
+     * @return 能力；任一环节失败返回 null
+     */
+    private fun queryRateRange(conn: UsbDeviceConnection, uacVersion: Int,
+                               clockSourceId: Int, outEndpoint: Int): QueriedRates? {
+        return try {
+            if (uacVersion >= 2) {
+                val ids = buildList {
+                    if (clockSourceId > 0) add(clockSourceId)
+                    add(0x09); add(0x0C)
+                    for (id in intArrayOf(0x05, 0x0A, 0x0B, 0x0D,
+                                    0x28, 0x29, 0x2A, 0x06, 0x07, 0x08,
+                                    0x10, 0x11, 0x12, 0x20, 0x21, 0x22)) add(id)
+                }.distinct().toIntArray()
+                for (csId in ids) {
+                    // 2 + 最多 8 个子区间 × 12 字节
+                    val buf = ByteArray(2 + 8 * 12)
+                    val ret = conn.controlTransfer(
+                            0xA1,           // Device-to-Host, Class, Interface
+                            0x02,           // GET_RANGE
+                            0x0100,         // CS_SAM_FREQ_CONTROL
+                            csId shl 8,     // entityId << 8 | interface(0)
+                            buf, buf.size, 1000)
+                    if (ret < 14) {
+                        UsbLog.w(TAG, "GET_RANGE(0x${csId.toString(16)}): ret=$ret")
+                        continue
+                    }
+                    val n = (buf[0].toInt() and 0xFF) or ((buf[1].toInt() and 0xFF) shl 8)
+                    if (n !in 1..8) {
+                        UsbLog.w(TAG, "GET_RANGE(0x${csId.toString(16)}): subRanges=$n (忽略)")
+                        continue
+                    }
+                    val rates = sortedSetOf<Int>()
+                    var lo = Int.MAX_VALUE
+                    var hi = 0
+                    var valid = 0
+                    val subranges = StringBuilder()
+                    for (i in 0 until n) {
+                        val o = 2 + i * 12
+                        if (o + 12 > ret) break
+                        val mn = le32(buf, o)
+                        val mx = le32(buf, o + 4)
+                        val res = le32(buf, o + 8)
+                        // 合理性校验：4k..768k，防止把非采样率实体/乱码当真
+                        if (mn < 4000 || mx < mn || mx > 768000) continue
+                        valid++
+                        lo = minOf(lo, mn)
+                        hi = maxOf(hi, mx)
+                        rates.add(mn)
+                        rates.add(mx)
+                        if (subranges.isNotEmpty()) subranges.append(", ")
+                        subranges.append("$mn-$mx(res=$res)")
+                        for (r in STANDARD_RATE_LADDER) if (r in mn..mx) rates.add(r)
+                    }
+                    if (valid > 0) {
+                        UsbLog.i(TAG, "GET_RANGE(UAC2 clock 0x${csId.toString(16)}): $n subranges, " +
+                                "$lo–$hi Hz → rates=${rates.toIntArray().contentToString()}")
+                        UsbLog.i(TAG, "GET_RANGE subranges(DAC 原始声明): $subranges")
+                        return QueriedRates(rates.toIntArray(), lo, hi)
+                    }
+                    UsbLog.w(TAG, "GET_RANGE(0x${csId.toString(16)}): no valid subrange (n=$n)")
+                }
+                // GET_RANGE 全灭：回退 GET_CUR 读取 DAC 当前采样率（至少给出一个真实可用值）
+                for (csId in ids) {
+                    val cur = ByteArray(4)
+                    val ret = conn.controlTransfer(0xA1, 0x01, 0x0100, csId shl 8, cur, 4, 1000)
+                    val rate = if (ret >= 4) le32(cur, 0) else 0
+                    if (rate in 8000..768000) {
+                        UsbLog.i(TAG, "GET_CUR fallback(0x${csId.toString(16)}): current=$rate Hz")
+                        return QueriedRates(intArrayOf(rate), rate, rate)
+                    }
+                }
+                UsbLog.w(TAG, "GET_RANGE: no clock source answered (ids=${ids.size})")
+                null
+            } else {
+                if (outEndpoint < 0) return null
+                val ep = outEndpoint and 0xFF
+                val minB = ByteArray(3)
+                val maxB = ByteArray(3)
+                val rMin = conn.controlTransfer(0xA2, 0x02, 0x0100, ep, minB, 3, 1000)
+                val rMax = conn.controlTransfer(0xA2, 0x03, 0x0100, ep, maxB, 3, 1000)
+                if (rMin >= 3 && rMax >= 3) {
+                    val min = le24(minB, 0)
+                    val max = le24(maxB, 0)
+                    if (min in 4000..768000 && max >= min) {
+                        UsbLog.i(TAG, "GET_MIN/MAX(UAC1 ep=0x${ep.toString(16)}): $min–$max Hz")
+                        return QueriedRates(intArrayOf(), min, max)
+                    }
+                }
+                UsbLog.w(TAG, "GET_MIN/MAX(UAC1) failed (ret=$rMin/$rMax)")
+                null
+            }
+        } catch (e: Exception) {
+            UsbLog.w(TAG, "queryRateRange threw: ${e.message}")
+            null
+        }
+    }
 
     /**
      * 解析 UAC 版本：在 AudioControl 接口（class=1, subclass=1）内找
@@ -520,11 +669,13 @@ class UsbAudioDevice private constructor(private val context: Context) {
         var bitRes = 0
         var subslot = 0
         var rates = mutableListOf<Int>()
+        var rateMin = 0
+        var rateMax = 0
 
         fun flush() {
             if (inAS && curAlt > 0) {
                 result.add(AsAlt(curNumber, curAlt, outEp, outMaxPacket, fbEp,
-                        channels, bitRes, subslot, rates.toIntArray()))
+                        channels, bitRes, subslot, rates.toIntArray(), rateMin, rateMax))
             }
             outEp = -1; outMaxPacket = 0; fbEp = -1
             // 注意：channels 不在此重置——bNrChannels 是流级属性（AS_GENERAL 通常
@@ -533,6 +684,7 @@ class UsbAudioDevice private constructor(private val context: Context) {
             // 是每个 alt 各自的属性，仍按 alt 重置。
             bitRes = 0; subslot = 0
             rates = mutableListOf()
+            rateMin = 0; rateMax = 0
         }
 
         var i = 0
@@ -616,6 +768,23 @@ class UsbAudioDevice private constructor(private val context: Context) {
                                     } else if (uacVersion >= 2) {
                                         subslot = raw[i + 4].toInt() and 0xFF
                                         bitRes = raw[i + 5].toInt() and 0xFF
+                                        // UAC2 Type I 固定头 7 字节（UAC1 为 8），离散速率从 i+7 起；
+                                        // bLength = 7 + 3n。注意 UAC2 常见 bLength=6（连 bSamFreqType
+                                        // 都没有，采样率完全由 Clock Source 的 GET_RANGE 声明）。
+                                        val n = if (bLength >= 7) raw[i + 6].toInt() and 0xFF else 0
+                                        if (n > 0 && bLength >= 7 + 3 * n) {
+                                            for (k in 0 until n) rates.add(le24(raw, i + 7 + 3 * k))
+                                        } else if (bLength >= 13 && n == 0) {
+                                            // 连续区间（bSamFreqType=0）：tLower/tUpperSamFreq 各 3 字节 LE
+                                            val lo = le24(raw, i + 7)
+                                            val hi = le24(raw, i + 10)
+                                            if (lo > 0 && hi >= lo) {
+                                                rateMin = lo
+                                                rateMax = hi
+                                                UsbLog.i(TAG, "FORMAT_TYPE(UAC2): " +
+                                                        "continuous $lo–$hi Hz (iface=$curNumber alt=$curAlt)")
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -635,6 +804,97 @@ class UsbAudioDevice private constructor(private val context: Context) {
                             "fb=${if (a.fbEp > 0) "0x${a.fbEp.toString(16)}" else "-"})"
                 })
         return result
+    }
+
+    /** 输出流 alt 的能力并集（供 UI 生成可选项 / 能力探测共用）。 */
+    private data class AltCaps(
+        val rates: IntArray,
+        val bits: IntArray,
+        val channels: IntArray,
+        val rateMin: Int,
+        val rateMax: Int
+    )
+
+    /**
+     * 汇总全部含 OUT 端点的输出流 alt 的能力：
+     * - 采样率：UAC1 取离散列表并集；UAC2 连续区间（无离散列表）用声明的
+     *   [rateMin, rateMax] 过滤标准速率阶梯（仍由 DAC 声明的区间决定，非硬编码）。
+     * - 位深 / 声道：全部 alt 的去重并集。
+     */
+    private fun capsFromAlts(asAlts: List<AsAlt>, queried: QueriedRates? = null): AltCaps {
+        val outs = asAlts.filter { it.outEp >= 0 }
+        val discrete = outs.flatMap { it.rates.asIterable() }.distinct().sorted()
+        val lo = outs.map { it.rateMin }.filter { it > 0 }.minOrNull() ?: queried?.min ?: 0
+        val hi = outs.map { it.rateMax }.filter { it > 0 }.maxOrNull() ?: queried?.max ?: 0
+        val rates = when {
+            discrete.isNotEmpty() -> discrete.toIntArray()
+            queried != null && queried.rates.isNotEmpty() -> queried.rates
+            lo > 0 && hi >= lo -> STANDARD_RATE_LADDER.filter { it in lo..hi }.toIntArray()
+            else -> intArrayOf()
+        }
+        return AltCaps(
+            rates,
+            outs.map { it.bitResolution }.filter { it > 0 }.distinct().sorted().toIntArray(),
+            outs.map { it.channels }.filter { it > 0 }.distinct().sorted().toIntArray(),
+            lo, hi
+        )
+    }
+
+    /**
+     * 能力探测：只打开设备读描述符，随后立即关闭（**不 claim 任何接口**）。
+     *
+     * 与 [openDevice] 的区别：不断开内核驱动、不影响正在播放的音频，
+     * 因此可以在"独占未开启、DAC 正被系统使用"时安全调用，
+     * 让 UI 在开启独占前就拿到 UAC 版本/总线速度/支持的采样率、位深、声道。
+     */
+    fun probeCapabilities(device: UsbDevice): UsbAudioCapabilities? {
+        val conn = usbManager.openDevice(device)
+        if (conn == null) {
+            UsbLog.w(TAG, "probeCapabilities: openDevice failed (${device.productName})")
+            return null
+        }
+        return try {
+            val uacVersion = parseUacVersion(conn)
+            val fullSpeed = parseUsbSpeed(conn, uacVersion)
+            val asAlts = parseAudioStreaming(conn, uacVersion)
+            val outs = asAlts.filter { it.outEp >= 0 }
+            // 描述符未声明速率（UAC2 Type I bLength=6 常见）→ 向 Clock Source 发 GET_RANGE
+            var caps = capsFromAlts(asAlts)
+            if (caps.rates.isEmpty() && outs.isNotEmpty()) {
+                val csId = if (uacVersion == 2) parseClockSourceId(conn) else -1
+                val q = queryRateRange(conn, uacVersion, csId, outs.first().outEp)
+                if (q != null) caps = capsFromAlts(asAlts, q)
+            }
+            if (caps.rates.isEmpty() && caps.bits.isEmpty() && caps.channels.isEmpty()) {
+                UsbLog.w(TAG, "probeCapabilities: no output alt parsed (${device.productName})")
+                null
+            } else {
+                UsbLog.i(TAG, "probeCapabilities: ${device.productName} uac=UAC$uacVersion " +
+                        "${if (fullSpeed) "full" else "high"}-speed " +
+                        "rates=${caps.rates.contentToString()} bits=${caps.bits.contentToString()} " +
+                        "ch=${caps.channels.contentToString()}" +
+                        (if (caps.rateMin > 0) " range=${caps.rateMin}-${caps.rateMax}" else ""))
+                UsbAudioCapabilities(
+                    deviceName = device.productName ?: "USB Audio Device",
+                    manufacturer = device.manufacturerName ?: "",
+                    vid = device.vendorId,
+                    pid = device.productId,
+                    uacVersion = uacVersion,
+                    fullSpeed = fullSpeed,
+                    altCount = asAlts.size,
+                    allRates = caps.rates,
+                    allBits = caps.bits,
+                    allChannels = caps.channels,
+                    rateMin = caps.rateMin,
+                    rateMax = caps.rateMax
+                )
+            }
+        } catch (e: Exception) {
+            UsbLog.e(TAG, "probeCapabilities threw: ${e.message}", e)
+            null
+        } finally {
+            try { conn.close() } catch (_: Exception) {}
+        }
     }
 
     /**

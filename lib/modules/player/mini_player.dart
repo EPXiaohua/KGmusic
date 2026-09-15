@@ -271,6 +271,13 @@ class _MiniPlayerState extends State<MiniPlayer>
   ///   避免 MiniPlayer 瞬间恢复全亮造成闪烁
   void _expandPlayerFromDrag() {
     final progress = playerExpansion.value;
+    // 防重复入栈：路由栈里已有播放页时不再 push，否则会出现多个
+    // AmStyleFullPlayer 实例、各自驱动歌词等动画，整页帧率翻倍（实测
+    // 120Hz 屏 ~120fps 且明显发热）。与 openFullPlayer 同一语义。
+    if (activePlayerRoute != null) {
+      playerDragActive.value = false;
+      return;
+    }
     if (_miniTopY <= 0.0 || progress <= 0.0) {
       playerDragActive.value = false;
       playerExpansion.value = 0.0;
@@ -347,8 +354,7 @@ class _MiniPlayerState extends State<MiniPlayer>
           onTap: () {
             // 上滑展开识别后（含 up 后 sweep 阶段）不响应点击
             if (_dragActivated) return;
-            if (activePlayerRoute?.isCurrent ?? false) return;
-            Navigator.of(context).push(fullPlayerRoute(context));
+            openFullPlayer(context);
           },
           // 水平滑动切歌（受设置开关控制）
           onHorizontalDragStart: swipeEnabled ? _onHorizontalDragStart : null,

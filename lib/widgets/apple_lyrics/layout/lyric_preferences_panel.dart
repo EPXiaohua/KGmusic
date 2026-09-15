@@ -131,9 +131,8 @@ class LyricPreferencesPanel extends StatelessWidget {
   String _getFontSourceLabel(LyricFontSource source) {
     switch (source) {
       case LyricFontSource.system:
+      case LyricFontSource.bundled: // 已废弃（内置 SimHei 已移除），等同 system
         return '系统默认（手机字体优先）';
-      case LyricFontSource.bundled:
-        return '内置 SimHei';
       case LyricFontSource.custom:
         return '自定义字体';
     }
@@ -171,20 +170,6 @@ class LyricPreferencesPanel extends StatelessWidget {
                 subtitle: const Text('使用手机系统字体（推荐）'),
                 onTap: () async {
                   await prefs.setFontSource(LyricFontSource.system);
-                  if (ctx.mounted) Navigator.pop(ctx);
-                },
-              ),
-              ListTile(
-                leading: Icon(
-                  current == LyricFontSource.bundled
-                      ? Icons.radio_button_checked
-                      : Icons.radio_button_unchecked,
-                  color: Theme.of(ctx).colorScheme.primary,
-                ),
-                title: const Text('内置 SimHei'),
-                subtitle: const Text('使用打包的黑体字体'),
-                onTap: () async {
-                  await prefs.setFontSource(LyricFontSource.bundled);
                   if (ctx.mounted) Navigator.pop(ctx);
                 },
               ),

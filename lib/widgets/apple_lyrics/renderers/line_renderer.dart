@@ -103,6 +103,14 @@ class LineRenderer {
   /// 淡入淡出贯穿整个过渡时长，速率随行时长自适应）。
   double translationFade = 0.0;
 
+  /// 副行是否处于**出场**阶段（收起中的退场行）。由 AppleLyricsView 注入。
+  ///
+  /// 决定翻转绕哪条锚线、往哪个方向转（见 [LyricLayout.sublineFlipAngle]）：
+  /// - false（当前行 / 入场）：绕副行底边，从下翻转出现；
+  /// - true（收起中的退场行 / 出场）：绕副行顶边，向上翻转消失。
+  /// 默认 false：非当前行且未注入时副行 alpha 为 0，方向无意义。
+  bool translationExiting = false;
+
   /// KRC 行 word 宽度缓存（与 WordRenderer._wordWidths 同口径：同 TextStyle 单字 layout）。
   ///
   /// **换行一致性**：measureLineHeight 与 WordRenderer（当前行）都用"word 累加"
@@ -424,14 +432,9 @@ class LineRenderer {
                   LyricLayout.wrapLineHeightFactor
           : _painter.height;
       // 副行"长出/收回"偏移：expand=0 时贴主行底（隐藏位），=1 时到正常位。
-      // 偏移量 = 副行高 × (expand - 1)，与 measureLineHeight 副行预留口径一致
-      // （与 WordRenderer 当前行副行同式）。
-      final double subH = transFontSize * LyricLayout.translationLineHeight +
-          transFontSize * 0.3;
-      final double transY = offset.dy +
-          mainHeight +
-          transFontSize * 0.3 +
-          subH * (translationExpand - 1.0);
+      // 先布局副行文本，再按**实际视觉行数**取副行高度：副行过长换行时高度随行数
+      // 增长，与 AppleLyricsView 的逐行副行预留（LyricLayout.auxSubHeight）严格同式，
+      // 否则预留槽位与副行终点错位（多出来的行压到下一行歌词上）。
       _translationPainter.text = TextSpan(
         text: auxText,
         style: TextStyle(
@@ -445,13 +448,49 @@ class LineRenderer {
       _translationPainter.layout(
           maxWidth:
               maxWidth == double.infinity ? double.infinity : maxWidth);
+      final int subRows =
+          max(1, _translationPainter.computeLineMetrics().length);
+      final double subH = LyricLayout.auxSubHeight(fontSize, subRows);
+      final double transY = offset.dy +
+          mainHeight +
+          transFontSize * 0.3 +
+          subH * (translationExpand - 1.0);
       // 翻译副行对齐跟随原文，用 _alignX 计算起始 x
       final double transX = _alignX(alignment, offset.dx,
           _translationPainter.width, viewportWidth);
       // 多行翻译副行需设置 textAlign 让每条视觉行独立对齐到 transX
       _translationPainter.textAlign = _duetToTextAlign(alignment);
-      _translationPainter.paint(canvas, Offset(transX, transY));
+      _paintTranslation(canvas, Offset(transX, transY));
     }
+  }
+
+  /// 绘制翻译副行（含日历式翻转）。
+  ///
+  /// [at] 为副行文本的绘制原点（左上角）。翻转绕 [LyricLayout.sublineFlipAnchorY]
+  /// 给出的锚线进行：入场绕底边从下翻出、出场绕顶边向上翻走。角度恰为 0
+  /// （已就位）时不施加任何画布变换，走与改造前完全一致的直绘路径——稳态每帧
+  /// 只做一次浮点比较，无额外 save/transform/restore 开销。
+  void _paintTranslation(Canvas canvas, Offset at) {
+    final double angle = LyricLayout.sublineFlipAngle(translationExpand,
+        exiting: translationExiting);
+    if (angle == 0) {
+      _translationPainter.paint(canvas, at);
+      return;
+    }
+    // 锚点同时给出 x（= 副行水平中点，透视投影中心）与 y（旋转锚线）：
+    // 只平移 y 会让透视除法绕画布左上角进行，翻转时副行整体左漂。
+    final Offset anchor = LyricLayout.sublineFlipAnchor(
+      transX: at.dx,
+      sublineWidth: _translationPainter.width,
+      transY: at.dy,
+      sublineHeight: _translationPainter.height,
+      exiting: translationExiting,
+    );
+    canvas.save();
+    canvas.transform(
+        LyricLayout.sublineFlipMatrix(angle: angle, anchor: anchor).storage);
+    _translationPainter.paint(canvas, at);
+    canvas.restore();
   }
 
   /// 临时调试：打印行换行分析（word 累加 vs TextPainter 行数），定位歌词重叠。

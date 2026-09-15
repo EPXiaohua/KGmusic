@@ -8,7 +8,7 @@ import '../../providers/player_provider.dart';
 import '../../services/kugou_api/kugou_api_client.dart';
 import '../../services/kugou_api/kugou_endpoints.dart';
 import '../../services/kugou_api/kugou_models.dart';
-import '../player/full_player_route.dart';
+import '../player/full_player_route.dart' as player_route;
 
 // ===================== Rust 本地 PCM 前处理（P0 性能优化） =====================
 
@@ -300,7 +300,8 @@ Future<void> playRecognizedSong(
     if (!context.mounted) return;
     context.read<PlayerProvider>().playOnlinePlaylist([song], 0);
     if (openFullPlayer) {
-      Navigator.of(context).push(fullPlayerRoute(context));
+      // 前缀调用：本函数参数 openFullPlayer 会遮蔽同名顶层函数
+      player_route.openFullPlayer(context);
     }
   } catch (e) {
     print('[SongRecognition] 搜索播放失败: $e');
@@ -332,6 +333,7 @@ void _playWithHash(
   if (!context.mounted) return;
   context.read<PlayerProvider>().playOnlinePlaylist([song], 0);
   if (openFullPlayer) {
-    Navigator.of(context).push(fullPlayerRoute(context));
+    // 前缀调用：本函数参数 openFullPlayer 会遮蔽同名顶层函数
+    player_route.openFullPlayer(context);
   }
 }

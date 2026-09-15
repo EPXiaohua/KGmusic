@@ -372,14 +372,10 @@ class _PlaylistCommentsViewState extends State<PlaylistCommentsView> {
 
   String _formatTime(int timestamp) {
     if (timestamp == 0) return '';
-    final now = DateTime.now();
     final date = DateTime.fromMillisecondsSinceEpoch(timestamp * 1000);
-    final diff = now.difference(date);
-
-    if (diff.inMinutes < 60) return '${diff.inMinutes}分钟前';
-    if (diff.inHours < 24) return '${diff.inHours}小时前';
-    if (diff.inDays < 7) return '${diff.inDays}天前';
-    return '${date.month}月${date.day}日';
+    final month = date.month.toString().padLeft(2, '0');
+    final day = date.day.toString().padLeft(2, '0');
+    return '${date.year}.$month.$day';
   }
 
   @override

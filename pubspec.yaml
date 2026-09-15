@@ -1,7 +1,7 @@
 name: md3music
 description: "MD3Music - Music player with Material Design 3"
 publish_to: 'none'
-version: 5.3.7+39
+version: 5.6.0+40
 
 environment:
   sdk: ^3.12.0
@@ -72,7 +72,3 @@ flutter:
     - assets/icons/
     - LICENSE
     - assets/web/
-  fonts:
-    - family: SimHei
-      fonts:
-        - asset: assets/fonts/simhei.ttf

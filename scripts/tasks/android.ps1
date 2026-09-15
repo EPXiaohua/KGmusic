@@ -19,7 +19,8 @@
   只做 Rust 交叉编译 + 更新 jniLibs，不执行 flutter 打包。
 
 .PARAMETER NdkPath
-  手动指定 Android NDK 目录（默认按 ANDROID_NDK_HOME / ANDROID_NDK / 常见 SDK 路径自动探测，
+  手动指定 Android NDK 目录（默认按 ANDROID_NDK_HOME / ANDROID_NDK / ANDROID_SDK_ROOT / ANDROID_HOME
+  / 常见 SDK 路径自动探测，
   取版本号最高者）。
 
 .PARAMETER NoPause
@@ -120,7 +121,16 @@ elseif ($env:ANDROID_NDK -and (Test-Path $env:ANDROID_NDK)) {
     $NDK = $env:ANDROID_NDK
 }
 else {
-    $sdkDirs = @("$env:LOCALAPPDATA\Android\Sdk\ndk", 'C:\Android\Sdk\ndk', "$env:USERPROFILE\Android\Sdk\ndk")
+    # 优先使用 Android SDK 标准环境变量；兼容未设置环境变量的常见默认目录。
+    $sdkRoots = @($env:ANDROID_SDK_ROOT, $env:ANDROID_HOME) |
+        Where-Object { $_ -and (Test-Path $_) } |
+        Select-Object -Unique
+    $sdkDirs = @(
+        ($sdkRoots | ForEach-Object { Join-Path $_ 'ndk' }),
+        "$env:LOCALAPPDATA\Android\Sdk\ndk",
+        'C:\Android\Sdk\ndk',
+        "$env:USERPROFILE\Android\Sdk\ndk"
+    ) | Where-Object { $_ } | Select-Object -Unique
     $found = $null
     foreach ($d in $sdkDirs) {
         if (Test-Path $d) {
@@ -212,6 +222,7 @@ finally { Pop-Location }
 
 # 无需重命名：已去掉 flavor，flutter 直接产出 app-<abi>-release.apk（无引擎标识）。
 # 清理：仅保留 app-<abi>-release.apk，删除历史含 flavor（如 skia-* / *-skia-*）产物，避免混淆
+$outDir = Join-Path $RepoRoot 'build\app\outputs\flutter-apk'
 Get-ChildItem $outDir -Filter '*-release.apk' -ErrorAction SilentlyContinue |
     Where-Object { $_.Name -notmatch '^app-(arm64-v8a|armeabi-v7a|x86_64)-release\.apk$' } |
     Remove-Item -Force

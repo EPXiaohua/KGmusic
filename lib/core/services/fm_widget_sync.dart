@@ -109,8 +109,7 @@ class FmWidgetSync {
       final nav = appNavigatorKey.currentState;
       final navContext = appNavigatorKey.currentContext;
       if (nav == null || navContext == null) return;
-      if (activePlayerRoute?.isCurrent ?? false) return;
-      nav.push(fullPlayerRoute(navContext));
+      openFullPlayer(navContext);
     };
     // 登录引导卡点击：app 已被拉起（MainActivity 转发），这里进登录页。
     MediaNotificationService.onWidgetFmOpenLogin = () {

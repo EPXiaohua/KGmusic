@@ -83,8 +83,8 @@ class SongListItem extends StatelessWidget {
                 showToast('已加入下一首', long: true);
               },
             ),
-            // 本地音乐无在线评论：仅在线歌曲显示"看评论"
-            if (song.isOnline)
+            // 在线歌曲恒提供；本地歌曲由「关闭本地音乐评论区」开关决定
+            if (context.read<PlayerProvider>().showsCommentsFor(song))
               ListTile(
                 leading: const Icon(Icons.comment_outlined),
                 title: const Text('看评论'),

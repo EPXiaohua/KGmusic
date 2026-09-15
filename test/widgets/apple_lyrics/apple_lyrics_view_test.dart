@@ -12,6 +12,7 @@ library;
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:md3music/widgets/apple_lyrics/apple_lyrics_view.dart';
+import 'package:md3music/widgets/apple_lyrics/layout/lyric_layout.dart';
 import 'package:md3music/widgets/apple_lyrics/layout/lyric_preferences.dart';
 import 'package:md3music/widgets/apple_lyrics/models/lyric_line.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -604,6 +605,341 @@ void main() {
       }
       expect(ecoUnlocked(), isFalse,
           reason: '惯性停住后应锁回 60fps');
+    });
+  });
+
+  group('AppleLyricsView 省电模式：可见性门控（P0-A）', () {
+    // 背景：eco 开 + 播放逐字歌词时驱动源恒为 60fps Timer（逐字动画不收敛、
+    // 不进停帧分支）。Ticker 由 TickerMode 自动 mute，但 eco Timer 不受任何
+    // 可见性约束——切走 tab / 退后台后会以 60Hz 离屏驱动 _onTick 持续重绘。
+    // P0-A：不可见时挂起 Timer，恢复可见后重建并做帧时钟 gap 对齐。
+    LyricLine wordLine(int startMs) => LyricLine(
+          startTime: startMs,
+          duration: 60000,
+          text: '逐字歌词行',
+          words: [
+            LyricWord(startTime: startMs, duration: 60000, text: '逐字歌词行'),
+          ],
+        );
+
+    /// lines 传 null 模拟切歌 loading 占位（歌词视图被卸载，同
+    /// full_player_am 的 _isLoadingLyrics 分支）。
+    Widget host(List<LyricLine>? lines, {bool tickerMode = true}) =>
+        MaterialApp(
+          home: Scaffold(
+            body: TickerMode(
+              enabled: tickerMode,
+              child: SizedBox(
+                width: 400,
+                height: 600,
+                child: lines == null
+                    ? const SizedBox.expand()
+                    : AppleLyricsView(
+                        lines: lines,
+                        currentTimeMs: 0,
+                        isPlaying: true,
+                      ),
+              ),
+            ),
+          ),
+        );
+
+    dynamic viewState(WidgetTester tester) =>
+        tester.state(find.byType(AppleLyricsView)) as dynamic;
+
+    Future<void> prepareEcoOn() async {
+      SharedPreferences.setMockInitialValues({'lyric_eco_mode': true});
+      await LyricPreferences.instance.setEcoMode(true);
+      addTearDown(() => LyricPreferences.instance.reset());
+    }
+
+    testWidgets('TickerMode 关闭（tab 切走）挂起 eco Timer，恢复可见后重建',
+        (tester) async {
+      await prepareEcoOn();
+      final lines = <LyricLine>[wordLine(0)];
+
+      // 挂载时即不可见（后台 tab 预构建等场景）：不得建立 Timer
+      await tester.pumpWidget(host(lines, tickerMode: false));
+      expect(viewState(tester).ecoTimerActiveForTest, isFalse,
+          reason: 'TickerMode 关闭时应挂起 eco Timer，不再离屏 60fps 驱动');
+
+      // 恢复可见（切回歌词 tab）→ Timer 回到 60fps 驱动
+      await tester.pumpWidget(host(lines, tickerMode: true));
+      expect(viewState(tester).ecoTimerActiveForTest, isTrue,
+          reason: '恢复可见后 eco Timer 应回到 60fps 驱动');
+      expect(viewState(tester).ecoDriverIsTimerForTest, isTrue);
+    });
+
+    testWidgets('App 退后台挂起 eco Timer，回前台恢复', (tester) async {
+      await prepareEcoOn();
+      final lines = <LyricLine>[wordLine(0)];
+
+      await tester.pumpWidget(host(lines));
+      expect(viewState(tester).ecoTimerActiveForTest, isTrue);
+
+      tester.binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
+      await tester.pump();
+      expect(viewState(tester).ecoTimerActiveForTest, isFalse,
+          reason: '退后台应挂起 eco Timer（否则后台仍 60Hz 驱动 _onTick）');
+
+      tester.binding
+          .handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+      await tester.pump();
+      expect(viewState(tester).ecoTimerActiveForTest, isTrue,
+          reason: '回前台应恢复 60fps Timer 驱动');
+      expect(viewState(tester).ecoDriverIsTimerForTest, isTrue);
+    });
+
+    testWidgets('切歌卸载重挂后省电模式自动恢复（无需重新开关）', (tester) async {
+      await prepareEcoOn();
+      final songA = <LyricLine>[wordLine(0)];
+      final songB = <LyricLine>[wordLine(0), wordLine(60000)];
+
+      // 歌曲 A：挂载即 eco Timer 驱动
+      await tester.pumpWidget(host(songA));
+      expect(viewState(tester).ecoDriverIsTimerForTest, isTrue);
+
+      // 切歌 loading：歌词视图卸载（dispose 应取消 Timer）
+      await tester.pumpWidget(host(null));
+
+      // 新歌重挂：应立即重建 60fps Timer，无需重新开关省电模式
+      await tester.pumpWidget(host(songB));
+      expect(viewState(tester).ecoDriverIsTimerForTest, isTrue,
+          reason: '重挂载后应立即重建 60fps Timer（切歌后省电失效回归护栏）');
+      expect(viewState(tester).ecoUnlockedForTest, isFalse);
+
+      // 推进若干 Timer tick：驱动持续工作且保持锁定（不漂移回满帧 Ticker）
+      const step = Duration(milliseconds: 16);
+      for (int i = 0; i < 60; i++) {
+        await tester.pump(step);
+      }
+      expect(viewState(tester).ecoDriverIsTimerForTest, isTrue,
+          reason: '播放逐字歌词期间应持续锁定 60fps Timer 驱动');
+    });
+  });
+
+  group('AppleLyricsView 间奏点：跳转离开时自动收起（穿帮回归）', () {
+    // 行 0 结束于 1000ms，行 1 起始 30000ms → 间隔 29s ≥ 4000ms 阈值，
+    // 存在间奏窗口 [1000, 29750)（间奏时长 28750ms，消失动画起点 = 28000ms）。
+    List<LyricLine> interludeLines() => <LyricLine>[
+          LyricLine(startTime: 0, duration: 1000, text: 'Line 1'),
+          LyricLine(startTime: 30000, duration: 1000, text: 'Line 2'),
+        ];
+
+    const step = Duration(milliseconds: 16);
+
+    Future<void> pumpFrames(WidgetTester tester, int n) async {
+      for (int i = 0; i < n; i++) {
+        await tester.pump(step);
+      }
+    }
+
+    /// 挂载固定尺寸（800x600 → fontSize=64、lineHeight=76.8）的歌词视图。
+    ///
+    /// 位置由外部 [pos] 驱动（真实播放中为 playerProvider.positionNotifier）。
+    Future<void> mount(
+      WidgetTester tester,
+      ValueNotifier<Duration> pos, {
+      void Function(int ms)? onSeek,
+    }) async {
+      tester.view.physicalSize = const Size(800, 600);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SizedBox(
+              width: 800,
+              height: 600,
+              child: AppleLyricsView(
+                lines: interludeLines(),
+                currentTimeMs: 0,
+                positionListenable: pos,
+                isPlaying: true,
+                onSeek: onSeek,
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
+    testWidgets('间奏点动画中点击其他行：间奏点立即清除，不再悬浮残留', (tester) async {
+      int? seekTime;
+      final pos = ValueNotifier<Duration>(Duration.zero);
+      addTearDown(pos.dispose);
+      await mount(tester, pos, onSeek: (ms) {
+        seekTime = ms;
+        pos.value = Duration(milliseconds: ms); // 模拟真实 seek 后的位置跳变
+      });
+
+      final state = tester.state(find.byType(AppleLyricsView)) as dynamic;
+
+      // 播放推进到间奏早期（2s，处于窗口内且远早于消失阶段）
+      pos.value = const Duration(milliseconds: 2000);
+      await pumpFrames(tester, 60);
+
+      expect(state.interludeDotsActiveForTest, isTrue,
+          reason: '间奏窗口内应显示间奏点');
+      expect(state.interludeDotsInExitPhaseForTest, isFalse,
+          reason: '此时间奏点仍在入场/呼吸阶段，远早于消失阶段（末 750ms）');
+
+      // 点击第 2 行（index=1）：posY ≈ 171.6（第 1 行居中），间奏占位高度 76.8，
+      // 第 2 行 top = 76.8 + 76.8 + 171.6 = 325.2，中心 y ≈ 363.6
+      await tester.tapAt(const Offset(400, 363));
+      await tester.pump(step);
+
+      expect(seekTime, 30000, reason: '点击应命中第 2 行并跳转到其 startTime');
+      expect(state.interludeDotsActiveForTest, isFalse,
+          reason: '跳转离开间奏后间奏点必须立即清除'
+              '（旧实现会让满尺寸圆点悬浮在原 anchor 行 ~750ms → 穿帮）');
+
+      // 占位仍由 progress 平滑收起，不会让下方行瞬间跳位
+      await pumpFrames(tester, 80);
+      expect(state.interludeExpandProgressForTest, 0);
+      expect(state.interludeDotsActiveForTest, isFalse);
+
+      // 排空 AppHaptics 兜底定时器
+      await tester.pump(const Duration(milliseconds: 400));
+    });
+
+    testWidgets('自然结束：时钟已进入消失阶段时保留同步收起动画（不硬切）', (tester) async {
+      final pos = ValueNotifier<Duration>(Duration.zero);
+      addTearDown(pos.dispose);
+      await mount(tester, pos);
+      final state = tester.state(find.byType(AppleLyricsView)) as dynamic;
+
+      pos.value = const Duration(milliseconds: 2000);
+      await pumpFrames(tester, 30);
+      expect(state.interludeDotsActiveForTest, isTrue);
+
+      // 推进到间奏末尾：动画时钟按真实偏移对齐到消失阶段（28000ms）
+      pos.value = const Duration(milliseconds: 29000);
+      await pumpFrames(tester, 5);
+      expect(state.interludeDotsInExitPhaseForTest, isTrue,
+          reason: '间奏末尾时钟应对齐到消失阶段，而非仍停在早期');
+
+      // 自然跨过窗口终点（next.startTime - 250 = 29750）
+      pos.value = const Duration(milliseconds: 29900);
+      await tester.pump(step);
+      expect(state.interludeDotsActiveForTest, isTrue,
+          reason: '自然结束应保留圆点消失动画与占位收起同步，而非立即清除');
+
+      await pumpFrames(tester, 80);
+      expect(state.interludeDotsActiveForTest, isFalse,
+          reason: '占位收起完成后间奏点应清除');
+      expect(state.interludeExpandProgressForTest, 0);
+    });
+  });
+
+  group('AppleLyricsView 副行过长换行：行距预留自适应', () {
+    testWidgets('长翻译副行按换行后的视觉行数预留，短副行仍为单行', (tester) async {
+      SharedPreferences.setMockInitialValues({});
+      LyricPreferences.instance.reset();
+      addTearDown(() => LyricPreferences.instance.reset());
+
+      tester.view.physicalSize = const Size(400, 600);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      final longTranslation =
+          '这是一句非常长的翻译副行文本用来验证换行之后的行距预留是否跟随视觉行数调整' * 2;
+      final lines = <LyricLine>[
+        LyricLine(
+          startTime: 0,
+          duration: 2000,
+          text: 'Line 1',
+          translation: longTranslation,
+        ),
+        LyricLine(
+          startTime: 2000,
+          duration: 2000,
+          text: 'Line 2',
+          translation: '短副行',
+        ),
+      ];
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SizedBox(
+              width: 400,
+              height: 600,
+              child: AppleLyricsView(lines: lines, currentTimeMs: 0),
+            ),
+          ),
+        ),
+      );
+
+      final state = tester.state(find.byType(AppleLyricsView)) as dynamic;
+      final double trans = LyricLayout.translationFontSize(
+        LyricPreferences.instance.fontSize,
+      );
+      final double singleRow =
+          trans * LyricLayout.translationLineHeight + trans * 0.3;
+
+      expect(state.auxSubHeightForTest(1), closeTo(singleRow, 0.001),
+          reason: '短副行仍按单行预留，不应引入额外行距');
+      expect(state.auxSubHeightForTest(0), greaterThan(singleRow),
+          reason: '过长副行必须按换行后的行数预留高度，否则会压到下一行歌词');
+      expect(
+        state.auxSubHeightForTest(0),
+        greaterThanOrEqualTo(
+            2 * trans * LyricLayout.translationLineHeight + trans * 0.3 - 0.001),
+        reason: '至少预留 2 行副行高度',
+      );
+    });
+
+    testWidgets('切到罗马音显示后按 roma 文本行数重算预留', (tester) async {
+      SharedPreferences.setMockInitialValues({});
+      LyricPreferences.instance.reset();
+      addTearDown(() => LyricPreferences.instance.reset());
+
+      tester.view.physicalSize = const Size(400, 600);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      final lines = <LyricLine>[
+        LyricLine(
+          startTime: 0,
+          duration: 2000,
+          text: 'Line 1',
+          translation: '短翻译',
+          roma: 'kore wa totemo nagai romaji no fukugyou desu ' * 8,
+        ),
+      ];
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SizedBox(
+              width: 400,
+              height: 600,
+              child: AppleLyricsView(lines: lines, currentTimeMs: 0),
+            ),
+          ),
+        ),
+      );
+
+      final state = tester.state(find.byType(AppleLyricsView)) as dynamic;
+      final double trans = LyricLayout.translationFontSize(
+        LyricPreferences.instance.fontSize,
+      );
+      final double singleRow =
+          trans * LyricLayout.translationLineHeight + trans * 0.3;
+
+      expect(state.auxSubHeightForTest(0), closeTo(singleRow, 0.001),
+          reason: '翻译模式：短翻译按单行预留');
+
+      await LyricPreferences.instance.setDisplayMode(LyricDisplayMode.roma);
+      await tester.pump();
+
+      expect(state.auxSubHeightForTest(0), greaterThan(singleRow),
+          reason: '罗马音模式：过长 roma 必须按换行行数重新预留');
     });
   });
 }

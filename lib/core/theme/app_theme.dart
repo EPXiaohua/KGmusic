@@ -65,9 +65,9 @@ class AppTheme {
   // 2) macOS / iOS: PingFang SC
   // 3) Linux: WenQuanYi Micro Hei
   // 4) 通用 sans-serif（Android 上解析为系统默认字体，含系统 CJK 支持）
-  // 注意：打包的 SimHei 不放入全局回退链——否则「系统默认」模式下 CJK 也会
-  // 回退到打包 SimHei，导致与「内置 SimHei」选项显示一致（用户反馈过此问题）。
-  // SimHei 仅由「内置 SimHei」模式（fontFamily='SimHei'）作为主字体使用。
+  // 注意：不把任何打包字体放入全局回退链——否则「系统默认」模式下 CJK 也会
+  // 回退到打包字体，导致与字体选项显示不一致（用户反馈过此问题）。
+  // （内置 SimHei 已移除；自定义字体由「自定义字体」模式按需 FontLoader 注册。）
   static const List<String> _cjkFontFallback = [
     'Microsoft YaHei',
     'Microsoft YaHei UI',
@@ -102,8 +102,7 @@ class AppTheme {
   /// 用于「莫奈色」开关启用时，由 ThemeProvider 传入系统提取的主色。
   ///
   /// [fontFamily] 控制全局字体：
-  /// - null：使用系统字体优先（让 Flutter 走系统字体链，SimHei 仅作 fallback）
-  /// - 'SimHei'：使用内置打包的 SimHei
+  /// - null：使用系统字体优先（让 Flutter 走系统字体链）
   /// - 'UserCustomFont'：使用用户通过 SAF 选择并加载的自定义字体
   static ThemeData lightThemeFromSeed(
     Color seedColor, {
@@ -186,7 +185,7 @@ class AppTheme {
       ),
       // fontFamily 为 null 时，Flutter 会走系统字体链（Android 上是 Roboto +
       // Noto Sans CJK），符合"优先展示用户手机字体"需求。
-      // fontFamilyFallback 兜底链保证 SimHei 在系统字体缺字符时仍能命中。
+      // fontFamilyFallback 兜底链保证系统字体缺字符时仍能命中候选。
       fontFamily: fontFamily,
       fontFamilyFallback: _cjkFontFallback,
       scaffoldBackgroundColor: colorScheme.surface,

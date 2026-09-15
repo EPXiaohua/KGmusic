@@ -811,6 +811,7 @@ class SettingsRepository {
   static const String _keyAudioFocusInterruptionMode =
       'settings_audio_focus_interruption_mode';
   static const String _keyZenCoverLongPress = 'settings_zen_cover_long_press';
+  static const String _keyLandscapeImmersive = 'settings_landscape_immersive';
   static const String _keyShowQualityDowngradeToast =
       'settings_show_quality_downgrade_toast';
 
@@ -856,6 +857,17 @@ class SettingsRepository {
     await prefs.setBool(_keyZenCoverLongPress, value);
   }
 
+  /// 全屏播放器横屏自动沉浸（隐藏状态栏/导航栏）开关，默认开启。
+  Future<bool> getLandscapeImmersiveEnabled() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_keyLandscapeImmersive) ?? true;
+  }
+
+  Future<void> setLandscapeImmersiveEnabled(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_keyLandscapeImmersive, value);
+  }
+
   /// 音质降级提示开关，默认关闭。播放音质不可用自动降级时弹出提示。
   Future<bool> getShowQualityDowngradeToast() async {
     final prefs = await SharedPreferences.getInstance();
@@ -865,5 +877,21 @@ class SettingsRepository {
   Future<void> setShowQualityDowngradeToast(bool value) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(_keyShowQualityDowngradeToast, value);
+  }
+
+  // ===== 本地音乐评论区 =====
+  static const String _keyCloseLocalMusicComments =
+      'settings_close_local_music_comments';
+
+  /// 「关闭本地音乐评论区」开关，默认开启。
+  /// 开启时本地歌曲不显示播放器评论 tab，也不提供「看评论」入口；在线歌曲不受影响。
+  Future<bool> getCloseLocalMusicComments() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_keyCloseLocalMusicComments) ?? true;
+  }
+
+  Future<void> setCloseLocalMusicComments(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_keyCloseLocalMusicComments, value);
   }
 }

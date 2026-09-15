@@ -59,6 +59,7 @@ import '../../widgets/player_playlist_view.dart';
 import 'comments_view.dart';
 import 'dlna_cast_sheet.dart';
 import 'full_player_route.dart';
+import 'player_tab_layout.dart';
 
 /// 预加载封面图片到磁盘缓存，防止切换时白屏
 void _preloadArtwork(String? url) {
@@ -85,6 +86,13 @@ const List<Duration> _sleepTimerPresets = [
   Duration(minutes: 60),
   Duration(minutes: 90),
 ];
+
+/// 翻译/罗马音按钮图标四周的透明安全区（每边像素）。
+///
+/// 歌词区用 TapUp 计算命中行，无 hit slop：点在按钮边缘但落在按钮外时
+/// 会穿透到歌词并跳转行。这里给按钮外扩一圈自身的透明热区吸收点击，
+/// 使「想点按钮却点偏」不再误触发寻址。
+const double _kTranslateTogglePadding = 8;
 
 class AmStyleFullPlayer extends StatefulWidget {
   /// 可选扩展：封面长按回调（默认关闭，由私有构建注入，用于下载等旁路操作）。
@@ -126,7 +134,11 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
   Color? _lyricAccentColor;
   String? _lastAccentUrl;
 
-  int _currentTabLength = 4;
+  /// 当前生效的 tab 结构（含封面 tab / 含评论 tab）。
+  /// TabController.length、TabBarView.children、底部导航条 items 全部由它派生；
+  /// 任一输入变化（屏幕宽度、切歌、设置开关）都必须先调用 [_syncTabLayout]
+  /// 重算，保证三者始终一致。
+  PlayerTabLayout _tabLayout = (hasCover: true, hasComments: true);
 
   // === 拖拽收起手势：已移除（与 MD 风格统一：无把手单行布局，关闭通过返回按钮） ===
   /// 防止 PopScope 回调与 dismiss() 重复触发。
@@ -233,7 +245,11 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     // 默认停在专辑 tab（index 1，播放列表 tab 在左侧）
-    _tabController = TabController(length: 4, vsync: this, initialIndex: 1);
+    _tabController = TabController(
+      length: _tabLayout.length,
+      vsync: this,
+      initialIndex: 1,
+    );
     // 桌面歌词状态变化时刷新 UI（同步歌词按钮 icon）
     _onDesktopLyricChanged = () {
       if (mounted) setState(() {});
@@ -267,7 +283,7 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
     _lastPhysicalSize =
         WidgetsBinding.instance.platformDispatcher.views.first.physicalSize;
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      _checkPadMode();
+      _syncTabLayout();
       final song = context.read<PlayerProvider>().currentSong;
       if (song != null) {
         _fetchLyrics(song);
@@ -380,38 +396,51 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
     }
   }
 
-  /// 检测宽屏（横屏/平板）并动态调整 TabController。
+  /// 重算并应用当前 tab 结构：
+  /// - 宽屏（横屏/平板，宽度 >= 600 或设备本身是平板）无封面 tab
+  ///   （封面常驻左栏、歌名固定在封面下方）；
+  /// - 本地歌曲且开启了「关闭本地音乐评论区」时无评论 tab。
   ///
-  /// 手机竖屏：4 tab [播放列表, 封面, 歌词, 评论]。
-  /// 横屏/平板（手机横屏、平板竖屏、平板横屏一致）：封面常驻在左栏、歌名也
-  /// 固定在封面下方，因此不需要封面/信息 tab → 3 tab [播放列表, 歌词, 评论]。
-  void _checkPadMode() {
+  /// 结构变化时才重建 TabController（旧实例必须 dispose）。**必须在 build 之前
+  /// 调用**：TabBarView.children 由 [_tabLayout] 派生，controller.length 与
+  /// children 数量不一致会让 TabBarView 直接抛断言。
+  void _syncTabLayout() {
     if (!mounted) return;
     final width = MediaQuery.sizeOf(context).width;
     final deviceIsPad = isPadLayout(context);
     final isWideLayout = deviceIsPad || width >= 600;
-    final newTabLength = isWideLayout ? 3 : 4;
+    final player = context.read<PlayerProvider>();
+    final song = player.currentSong;
+    final isLocalSong = song != null && !song.isOnline;
+    final next = resolvePlayerTabLayout(
+      isWideLayout: isWideLayout,
+      isLocalSong: isLocalSong,
+      closeLocalMusicComments: player.closeLocalMusicComments,
+    );
+    // 必须比较完整结构：同为 3 个 tab 也可能是「无封面」或「无评论」，
+    // 只比长度会漏掉这种变化。
+    if (next == _tabLayout) return;
 
-    if (_currentTabLength != newTabLength) {
-      // 保存当前 tab 索引
-      final currentIndex = _tabController.index.clamp(0, newTabLength - 1);
-      _tabController.dispose();
-      _currentTabLength = newTabLength;
-      // 首次进入横屏/平板（4 tab → 3 tab）默认打开歌词：
-      // 3 tab 下 index 0 = 播放列表, 1 = 歌词, 2 = 评论
-      _tabController = TabController(
-        length: newTabLength,
-        vsync: this,
-        initialIndex: newTabLength == 3 ? 1 : currentIndex,
-      );
-      setState(() {});
-    }
+    final oldIndex = _tabController.index;
+    _tabController.dispose();
+    _tabLayout = next;
+    _tabController = TabController(
+      length: next.length,
+      vsync: this,
+      initialIndex: next.indexAfterChangeFrom(oldIndex),
+    );
+    // ignore: avoid_print
+    print(
+      '[PlayerTab] am length=${next.length} cover=${next.hasCover} '
+      'comments=${next.hasComments} local=$isLocalSong index=${_tabController.index}',
+    );
+    setState(() {});
   }
 
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    _checkPadMode();
+    _syncTabLayout();
     // 系统栏/沉浸模式初始化：只在首次依赖建立时执行一次。
     // ModalRoute.of 依赖 _ModalScopeStatus（inherited widget），
     // 不能在 initState 中调用，否则报 dependOnInheritedWidgetOfExactType 错误
@@ -437,6 +466,9 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
 
   void _onPlayerSongChanged() {
     if (!mounted) return;
+    // 切歌可能在本地/在线之间切换 → 评论 tab 有无随之变化；
+    // 设置页改「关闭本地音乐评论区」也会经 PlayerProvider 通知走到这里。
+    _syncTabLayout();
     final player = context.read<PlayerProvider>();
     final song = player.currentSong;
     if (song != null && song.id != _lastSongId) {
@@ -467,9 +499,9 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
     SpectrumService.instance.setPlaying(player.isPlaying);
     // 切歌重建会经 AnnotatedRegion 重新调用 setSystemUIOverlayStyle，
     // 在 Android 上把 Zen/横屏沉浸的状态栏重新唤出；本帧结束后再隐藏一次。
-    if (_zenMode || _isLandscapeNow()) {
+    if (_zenMode || _landscapeImmersiveNeeded()) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted && (_zenMode || _isLandscapeNow())) {
+        if (mounted && (_zenMode || _landscapeImmersiveNeeded())) {
           SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
         }
       });
@@ -502,7 +534,7 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
     // 亮屏/回前台：Android 可能清除 sticky 标志，Zen 或横屏沉浸中需重新隐藏系统栏。
     if (state == AppLifecycleState.resumed &&
         mounted &&
-        (_zenMode || _isLandscapeNow())) {
+        (_zenMode || _landscapeImmersiveNeeded())) {
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
     }
   }
@@ -559,9 +591,14 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
     return view.physicalSize.width > view.physicalSize.height;
   }
 
-  /// 同步全局「横屏沉浸生效」标志：仅非 Zen 横屏为 true，供主界面 _SystemUiUpdater 短路。
+  /// 当前是否需要横屏沉浸：横屏且设置开关（横屏隐藏状态栏）开启。
+  bool _landscapeImmersiveNeeded() =>
+      _isLandscapeNow() && kLandscapeImmersiveEnabled;
+
+  /// 同步全局「横屏沉浸生效」标志：仅非 Zen 且开关开启的横屏为 true，供主界面 _SystemUiUpdater 短路。
   void _syncLandscapeImmersiveFlag() {
-    kPlayerLandscapeImmersiveActive.value = !_zenMode && _isLandscapeNow();
+    kPlayerLandscapeImmersiveActive.value =
+        !_zenMode && _landscapeImmersiveNeeded();
   }
 
   /// 进入 Zen 沉浸模式：隐藏顶栏、控件、系统栏，拓宽歌词/封面视图。
@@ -1476,35 +1513,37 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
               children: [
                 // 播放列表面板（index 0，专辑封面 tab 左侧）
                 const PlayerPlaylistView(useDisplayName: true),
-                GestureDetector(
-                  onTap: () {
-                    // 长按封面切 Zen 模式后松手不再当作点击跳歌词页
-                    if (_consumeZenPressTap()) return;
-                    _tabController.animateTo(2);
-                  },
-                  behavior: HitTestBehavior.opaque,
-                  // 封面 tab 与顶栏一样支持向下拖拽原路返回关闭播放器
-                  onVerticalDragStart: _onTopBarDragStart,
-                  onVerticalDragUpdate: _onTopBarDragUpdate,
-                  onVerticalDragEnd: _onTopBarDragEnd,
-                  onVerticalDragCancel: _onTopBarDragCancel,
-                  // Selector 让 _buildArtworkView 仅在 currentSong / isPlaying 变化时重建，
-                  // 不再每 200ms 因 position 变化重建（封面 AnimatedScale 是隐式动画，需要 isPlaying 触发）
-                  child:
-                      Selector<
-                        PlayerProvider,
-                        ({String? songId, bool isPlaying})
-                      >(
-                        selector: (_, p) =>
-                            (songId: p.currentSong?.id, isPlaying: p.isPlaying),
-                        builder: (context, _, __) => _buildArtworkView(
-                          playerProvider,
-                          currentSong,
-                          colorScheme,
-                          isExpanded: true,
+                // 封面 tab：宽屏/平板不存在（封面常驻左栏）
+                if (_tabLayout.hasCover)
+                  GestureDetector(
+                    onTap: () {
+                      // 长按封面切 Zen 模式后松手不再当作点击跳歌词页
+                      if (_consumeZenPressTap()) return;
+                      _tabController.animateTo(_tabLayout.lyricsIndex);
+                    },
+                    behavior: HitTestBehavior.opaque,
+                    // 封面 tab 与顶栏一样支持向下拖拽原路返回关闭播放器
+                    onVerticalDragStart: _onTopBarDragStart,
+                    onVerticalDragUpdate: _onTopBarDragUpdate,
+                    onVerticalDragEnd: _onTopBarDragEnd,
+                    onVerticalDragCancel: _onTopBarDragCancel,
+                    // Selector 让 _buildArtworkView 仅在 currentSong / isPlaying 变化时重建，
+                    // 不再每 200ms 因 position 变化重建（封面 AnimatedScale 是隐式动画，需要 isPlaying 触发）
+                    child:
+                        Selector<
+                          PlayerProvider,
+                          ({String? songId, bool isPlaying})
+                        >(
+                          selector: (_, p) =>
+                              (songId: p.currentSong?.id, isPlaying: p.isPlaying),
+                          builder: (context, _, __) => _buildArtworkView(
+                            playerProvider,
+                            currentSong,
+                            colorScheme,
+                            isExpanded: true,
+                          ),
                         ),
-                      ),
-                ),
+                  ),
                 GestureDetector(
                   onTap: () => _tabController.animateTo(1),
                   behavior: HitTestBehavior.translucent,
@@ -1571,16 +1610,18 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                     ),
                   ),
                 ),
-                // Selector 让 CommentsView 仅在切歌时重建（脱离 200ms 通知路径）
-                Selector<PlayerProvider, String?>(
-                  selector: (_, p) => p.currentSong?.id,
-                  builder: (_, _, __) => CommentsView(
-                    songHash: currentSong.id,
-                    albumAudioId: currentSong.albumAudioId,
-                    artworkUri: currentSong.artworkUri,
-                    isAmStyle: true,
+                // 评论 tab：本地歌曲且开启了「关闭本地音乐评论区」时不存在
+                if (_tabLayout.hasComments)
+                  // Selector 让 CommentsView 仅在切歌时重建（脱离 200ms 通知路径）
+                  Selector<PlayerProvider, String?>(
+                    selector: (_, p) => p.currentSong?.id,
+                    builder: (_, _, __) => CommentsView(
+                      songHash: currentSong.id,
+                      albumAudioId: currentSong.albumAudioId,
+                      artworkUri: currentSong.artworkUri,
+                      isAmStyle: true,
+                    ),
                   ),
-                ),
               ],
             ),
           ),
@@ -1740,16 +1781,18 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                                       ),
                                     ),
                             ),
-                            // Selector 让 CommentsView 仅在切歌时重建（脱离 200ms 通知路径）
-                            Selector<PlayerProvider, String?>(
-                              selector: (_, p) => p.currentSong?.id,
-                              builder: (_, _, __) => CommentsView(
-                                songHash: currentSong.id,
-                                albumAudioId: currentSong.albumAudioId,
-                                artworkUri: currentSong.artworkUri,
-                                isAmStyle: true,
+                            // 评论 tab：本地歌曲且开启了「关闭本地音乐评论区」时不存在
+                            if (_tabLayout.hasComments)
+                              // Selector 让 CommentsView 仅在切歌时重建（脱离 200ms 通知路径）
+                              Selector<PlayerProvider, String?>(
+                                selector: (_, p) => p.currentSong?.id,
+                                builder: (_, _, __) => CommentsView(
+                                  songHash: currentSong.id,
+                                  albumAudioId: currentSong.albumAudioId,
+                                  artworkUri: currentSong.artworkUri,
+                                  isAmStyle: true,
+                                ),
                               ),
-                            ),
                           ],
                         ),
                       ),
@@ -1922,16 +1965,18 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                                       ),
                                     ),
                             ),
-                            // Selector 让 CommentsView 仅在切歌时重建（脱离 200ms 通知路径）
-                            Selector<PlayerProvider, String?>(
-                              selector: (_, p) => p.currentSong?.id,
-                              builder: (_, _, __) => CommentsView(
-                                songHash: currentSong.id,
-                                albumAudioId: currentSong.albumAudioId,
-                                artworkUri: currentSong.artworkUri,
-                                isAmStyle: true,
+                            // 评论 tab：本地歌曲且开启了「关闭本地音乐评论区」时不存在
+                            if (_tabLayout.hasComments)
+                              // Selector 让 CommentsView 仅在切歌时重建（脱离 200ms 通知路径）
+                              Selector<PlayerProvider, String?>(
+                                selector: (_, p) => p.currentSong?.id,
+                                builder: (_, _, __) => CommentsView(
+                                  songHash: currentSong.id,
+                                  albumAudioId: currentSong.albumAudioId,
+                                  artworkUri: currentSong.artworkUri,
+                                  isAmStyle: true,
+                                ),
                               ),
-                            ),
                           ],
                         ),
                       ),
@@ -2442,11 +2487,12 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
 
   /// 底部导航条 —— 只做页面切换这一件事（原先与倍速/收藏/翻译混装在一条胶囊里）。
   ///
-  /// Pad 竖屏时封面 tab 不存在（_tabController.length == 3），items 随之裁剪。
+  /// 封面/评论 tab 是否存在由 [_tabLayout] 决定：**不能用 `length == 4` 反推**，
+  /// 隐藏评论 tab 后竖屏长度同样会变成 3，反推会连带误删封面 tab。
+  /// items 随之裁剪，指示线分段宽度由 [PlayerTabStrip] 按实际段数计算。
   Widget _buildTabStrip() {
     final song = context.read<PlayerProvider>().currentSong;
     final isOnline = song is Song && song.isOnline;
-    final hasCoverTab = _tabController.length == 4;
     return PlayerTabStrip(
       controller: _tabController,
       activeColor: Colors.white,
@@ -2457,7 +2503,7 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
       onDragEnd: _onTabDragEnd,
       items: [
         const PlayerTabItem(icon: Icons.queue_music),
-        if (hasCoverTab)
+        if (_tabLayout.hasCover)
           PlayerTabItem(
             icon: Icons.album,
             // 长按封面段：弹出下载音质选择（本地歌曲屏蔽）
@@ -2478,7 +2524,8 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
               : Icons.lyrics_outlined,
           onLongPress: _toggleDesktopLyric,
         ),
-        const PlayerTabItem(icon: Icons.comment_outlined),
+        if (_tabLayout.hasComments)
+          const PlayerTabItem(icon: Icons.comment_outlined),
       ],
     );
   }
@@ -2517,13 +2564,17 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
   /// 短按开关副行、长按在「翻译 / 罗马音」间切换的交互保持不变。
   /// 落在歌词区右下角（紧贴进度条上方），拇指可达且不压住首行歌词；
   /// 无容器底色，只靠图标亮度区分开关态；Zen 模式下随其它控件一起隐藏。
+  /// 图标外再扩 [_kTranslateTogglePadding] 透明安全区，吸收"点偏"点击，
+  /// 防止穿透到歌词区被判定为跳转行。
   Widget _wrapLyricsWithTranslateToggle(Widget child) {
     return Stack(
       children: [
         Positioned.fill(child: child),
         Positioned(
-          bottom: 4,
-          right: 8,
+          // 减去 _kTranslateTogglePadding 抵消 InkWell 安全区外扩，
+          // 保证图标可见位置仍是距右 8 / 距底 4 像素
+          bottom: 4 - _kTranslateTogglePadding,
+          right: 8 - _kTranslateTogglePadding,
           child: ListenableBuilder(
             listenable: LyricPreferences.instance,
             builder: (context, _) {
@@ -2535,21 +2586,25 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                 onTap: () => LyricPreferences.instance.setShowTranslation(!on),
                 onLongPress: _switchLyricSubLineMode,
                 customBorder: const CircleBorder(),
-                child: SizedBox(
-                  width: 40,
-                  height: 40,
-                  child: Center(
-                    child: Icon(
-                      // 罗马音模式用 Icons.abc 区分，翻译模式用 Icons.translate
-                      LyricPreferences.instance.displayMode ==
-                              LyricDisplayMode.roma
-                          ? Icons.abc
-                          : Icons.translate,
-                      size: 20,
-                      // 开启时纯白，关闭时 45% 白（与导航条未选中态一致）
-                      color: on
-                          ? Colors.white
-                          : Colors.white.withValues(alpha: 0.45),
+                // 安全区：外层额外一圈透明热区吸收点击，避免命中歌词行触发跳转
+                child: Padding(
+                  padding: const EdgeInsets.all(_kTranslateTogglePadding),
+                  child: SizedBox(
+                    width: 40,
+                    height: 40,
+                    child: Center(
+                      child: Icon(
+                        // 罗马音模式用 Icons.abc 区分，翻译模式用 Icons.translate
+                        LyricPreferences.instance.displayMode ==
+                                LyricDisplayMode.roma
+                            ? Icons.abc
+                            : Icons.translate,
+                        size: 20,
+                        // 开启时纯白，关闭时 45% 白（与导航条未选中态一致）
+                        color: on
+                            ? Colors.white
+                            : Colors.white.withValues(alpha: 0.45),
+                      ),
                     ),
                   ),
                 ),

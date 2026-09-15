@@ -40,6 +40,7 @@ import '../../providers/shortcut_config_provider.dart';
 import '../../providers/tab_config_provider.dart';
 import '../../providers/theme_provider.dart';
 import '../../services/kugou_server.dart';
+import '../../utils/landscape_immersive.dart';
 import '../../widgets/apple_lyrics/layout/lyric_preferences.dart';
 import 'lyric_animation_settings_page.dart';
 import '../../widgets/seed_color_picker.dart';
@@ -117,6 +118,8 @@ class _SettingsPageState extends State<SettingsPage>
   bool _enable32bitOutput = false;
   // 长按封面进入/退出 Zen 模式开关（默认开启）
   bool _zenCoverLongPress = true;
+  // 全屏播放器横屏自动隐藏系统栏开关（默认开启）
+  bool _landscapeImmersiveEnabled = true;
   // 音质降级提示开关（默认关闭）：所选音质不可用自动降级时弹出提示
   bool _showQualityDowngradeToast = false;
   // 设备 Android SDK 版本（SuperLyricApi 3.4 要求 API 26+，低于此禁用该协议选项）
@@ -150,6 +153,9 @@ class _SettingsPageState extends State<SettingsPage>
   bool _miniPlayerSwipeSwitch = true;
   // 收藏歌单按「最近点击」排序（默认关闭）
   bool _sortCollectedByLatestClick = false;
+  // 「关闭本地音乐评论区」开关（默认开启）：开启后本地歌曲不显示评论 tab，
+  // 也不提供「看评论」入口
+  bool _closeLocalMusicComments = true;
   // 歌词双击跳转开关（默认关闭，开启后需双击歌词才能跳转位置）
   bool _lyricDoubleTapToJump = false;
   // 自定义背景图片（全局界面背景）；默认开启，未选择图片时回落到内置默认壁纸
@@ -351,8 +357,12 @@ class _SettingsPageState extends State<SettingsPage>
     final uploadListeningDuration =
         await _settingsRepository.getUploadListeningDuration();
     final zenCoverLongPress = await _settingsRepository.getZenCoverLongPress();
+    final landscapeImmersiveEnabled =
+        await _settingsRepository.getLandscapeImmersiveEnabled();
     final showQualityDowngradeToast = await _settingsRepository
         .getShowQualityDowngradeToast();
+    final closeLocalMusicComments =
+        await _settingsRepository.getCloseLocalMusicComments();
 
     setState(() {
       _wifiQuality = wifiQuality;
@@ -392,7 +402,9 @@ class _SettingsPageState extends State<SettingsPage>
       _ignoreAudioFocus = ignoreAudioFocus;
       _audioFocusInterruptionMode = audioFocusInterruptionMode;
       _zenCoverLongPress = zenCoverLongPress;
+      _landscapeImmersiveEnabled = landscapeImmersiveEnabled;
       _showQualityDowngradeToast = showQualityDowngradeToast;
+      _closeLocalMusicComments = closeLocalMusicComments;
       // 启动时把音量均衡设置同步给播放器（当前曲目若已加载会自动重算）
       AudioService().setVolumeNormalization(
         enabled: volumeNormalizationEnabled,
@@ -1137,7 +1149,7 @@ class _SettingsPageState extends State<SettingsPage>
         ),
         // ③ 字体与显示：全局字体来源 + 显示大小，两者都直接改变文字/界面尺寸
         _buildGroupLabel('字体与显示', colorScheme),
-        // app全局字体入口：点击弹出三选一面板（系统 / 内置 SimHei / 自定义 TTF）
+        // app全局字体入口：点击弹出两选一面板（系统 / 自定义 TTF）
         // 选择"自定义"时打开 Android SAF 文件选择器选 .ttf/.otf 文件
         // search: 字体
         ListTile(
@@ -1835,9 +1847,8 @@ class _SettingsPageState extends State<SettingsPage>
   String _getFontSourceLabel(FontSource source) {
     switch (source) {
       case FontSource.system:
+      case FontSource.bundled: // 已废弃（内置 SimHei 已移除），等同 system
         return '系统默认（手机字体优先）';
-      case FontSource.bundled:
-        return '内置 SimHei';
       case FontSource.custom:
         return '自定义字体';
     }
@@ -1845,9 +1856,8 @@ class _SettingsPageState extends State<SettingsPage>
 
   /// 弹出字体来源选择面板。
   ///
-  /// 三个选项：
+  /// 两个选项：
   /// - 系统默认：UI 走系统字体链（Roboto + Noto Sans CJK 等）
-  /// - 内置 SimHei：使用打包的 assets/fonts/simhei.ttf
   /// - 自定义字体：通过 Android SAF 选择 .ttf/.otf 文件，
   ///   原生端拷贝到 filesDir/fonts/user_custom.ttf，Dart 端用 FontLoader 注册
   void _showFontSourceSheet(ThemeProvider themeProvider) {
@@ -1880,19 +1890,6 @@ class _SettingsPageState extends State<SettingsPage>
                 title: const Text('系统默认'),
                 onTap: () async {
                   await themeProvider.setFontSource(FontSource.system);
-                  if (ctx.mounted) Navigator.pop(ctx);
-                },
-              ),
-              ListTile(
-                leading: Icon(
-                  current == FontSource.bundled
-                      ? Icons.radio_button_checked
-                      : Icons.radio_button_unchecked,
-                  color: Theme.of(ctx).colorScheme.primary,
-                ),
-                title: const Text('内置 SimHei'),
-                onTap: () async {
-                  await themeProvider.setFontSource(FontSource.bundled);
                   if (ctx.mounted) Navigator.pop(ctx);
                 },
               ),
@@ -2181,6 +2178,35 @@ class _SettingsPageState extends State<SettingsPage>
             _settingsRepository.setZenCoverLongPress(value);
           },
         ),
+        // 横屏进播放器自动隐藏状态栏/导航栏；关闭后横屏保持系统栏可见
+        // search: 横屏 沉浸 状态栏 导航栏 隐藏 全屏播放器
+        SwitchListTile(
+          title: const Text('横屏隐藏状态栏'),
+          value: _landscapeImmersiveEnabled,
+          onChanged: (value) {
+            HapticFeedback.lightImpact();
+            setState(() => _landscapeImmersiveEnabled = value);
+            _settingsRepository.setLandscapeImmersiveEnabled(value);
+            // 全局标志即时同步：再次进入播放器或旋转屏幕即按新值应用系统栏
+            kLandscapeImmersiveEnabled = value;
+          },
+        ),
+        // 本地歌曲没有在线评论：默认关闭评论 tab 与「看评论」入口；
+        // 关掉该开关后本地歌曲恢复显示，在线歌曲不受影响
+        // search: 本地音乐 评论区 评论 tab 看评论 关闭评论 本地歌曲
+        SwitchListTile(
+          title: const Text('关闭本地音乐评论区'),
+          value: _closeLocalMusicComments,
+          onChanged: (value) {
+            HapticFeedback.lightImpact();
+            setState(() {
+              _closeLocalMusicComments = value;
+            });
+            // 播放器把该开关缓存在 PlayerProvider 字段里（切歌判定路径上读取），
+            // 改完必须通知它，否则已挂载的全屏播放器本次运行内不重建 tab 结构
+            context.read<PlayerProvider>().setCloseLocalMusicComments(value);
+          },
+        ),
         // search: 歌曲淡入淡出 交叉淡化 crossfade 渐入渐出 叠加 衔接 无缝 过渡
         SwitchListTile(
           title: const Text('歌曲淡入淡出'),
@@ -2372,54 +2398,16 @@ class _SettingsPageState extends State<SettingsPage>
     );
   }
 
-  /// 主页管理 section：Tab 显示/隐藏开关 + 拖拽排序
+  /// 主页管理 section：Tab 显示/隐藏开关 + 拖拽排序（直接内嵌，免二次点击）
   Widget _buildTabManagementSection(ColorScheme colorScheme) {
-    return Column(
-      children: [
-        // search: tab 标签页 主页
-        ListTile(
-          leading: const Icon(Icons.tab),
-          title: const Text('主页 Tab 管理'),
-          trailing: const Icon(Icons.chevron_right, size: 18),
-          onTap: () => _showTabManagementSheet(),
-        ),
-      ],
-    );
+    // search-item: 主页 Tab 管理 | tab 标签页 主页
+    return const _TabManagementPanel();
   }
 
-  /// 弹出 Tab 管理面板：支持拖拽排序 + 显示/隐藏开关。
-  void _showTabManagementSheet() {
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      showDragHandle: true,
-      builder: (ctx) => const _TabManagementPanel(),
-    );
-  }
-
-  /// 桌面快捷方式 section：Android 长按应用图标快捷入口的显示/隐藏、排序
+  /// 桌面快捷方式 section：Android 长按应用图标快捷入口的显示/隐藏、排序（直接内嵌，免二次点击）
   Widget _buildDesktopShortcutSection(ColorScheme colorScheme) {
-    return Column(
-      children: [
-        // search: 快捷方式 快捷 长按
-        ListTile(
-          leading: const Icon(Icons.bolt),
-          title: const Text('桌面快捷方式'),
-          trailing: const Icon(Icons.chevron_right, size: 18),
-          onTap: () => _showDesktopShortcutSheet(),
-        ),
-      ],
-    );
-  }
-
-  /// 弹出桌面快捷方式管理面板：支持拖拽排序 + 显示/隐藏开关。
-  void _showDesktopShortcutSheet() {
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      showDragHandle: true,
-      builder: (ctx) => const _DesktopShortcutPanel(),
-    );
+    // search-item: 桌面快捷方式 | 快捷方式 快捷 长按
+    return const _DesktopShortcutPanel();
   }
 
   /// 本地持久化音频管理 section 未包含在公开版本中。
@@ -2712,29 +2700,8 @@ class _SettingsPageState extends State<SettingsPage>
             );
           },
         ),
-        // 开发者入口：Miuix（MIUI 风格组件库）发现页移植测试页（原生 Kotlin + Compose）
-        // 已隐藏：仅保留入口数据与跳转方法，可在需要时取消注释恢复
-        // ListTile(
-        //   title: const Text('Miuix 发现页测试（开发）'),
-        //   subtitle: const Text('MIUI 风格重新排版的发现页信息呈现'),
-        //   leading: const Icon(Icons.explore_outlined),
-        //   onTap: _openMiuixDiscover,
-        // ),
       ],
     );
-  }
-
-  /// 打开原生 Miuix 发现页测试：通过 MethodChannel 启动 MiuixDiscoverActivity，
-  /// 并把本地 Rust API 服务器当前端口传过去（原生页据此直连取数）。
-  // ignore: unused_element
-  Future<void> _openMiuixDiscover() async {
-    const channel = MethodChannel('com.md3music.md3music/miuix_discover');
-    try {
-      await channel.invokeMethod('open', {'port': KugouApiServer.currentPort});
-    } catch (e) {
-      if (!mounted) return;
-      showToast('无法打开原生测试页：$e', long: true);
-    }
   }
 
   Future<void> _openReleasesUrl() async {
@@ -2966,6 +2933,10 @@ class _SettingsPageState extends State<SettingsPage>
 /// Tab 管理面板：支持拖拽排序 + 显示/隐藏开关。
 ///
 /// “我的”页面不允许隐藏（保证用户始终有入口进入设置/登录）。
+/// 主页 Tab 管理面板：支持拖拽排序 + 显示/隐藏开关。
+///
+/// 直接内嵌于设置页「主页管理」二级卡片；外层已是 ListView，
+/// 故 ReorderableListView 以 shrinkWrap + 不滚动方式布局。
 class _TabManagementPanel extends StatelessWidget {
   const _TabManagementPanel();
 
@@ -2976,49 +2947,49 @@ class _TabManagementPanel extends StatelessWidget {
     final allTabs = tabConfig.allTabs;
     final hiddenTabs = tabConfig.hiddenTabs;
 
-    return SafeArea(
-      child: SizedBox(
-        height: MediaQuery.sizeOf(context).height * 0.85,
-        child: Column(
-          children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: Text(
-                      '主页 Tab 管理',
-                      style: Theme.of(context).textTheme.titleMedium,
-                    ),
-                  ),
-                  TextButton(
-                    onPressed: () => tabConfig.resetToDefault(),
-                    child: const Text('重置'),
-                  ),
-                ],
-              ),
-            ),
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16),
-              child: Text(
-                '拖拽排序、开关显示/隐藏（“我的”不可隐藏）',
-                style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                  color: colorScheme.onSurfaceVariant,
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+          child: Row(
+            children: [
+              Expanded(
+                child: Text(
+                  '主页 Tab 管理',
+                  style: Theme.of(context).textTheme.titleMedium,
                 ),
               ),
+              TextButton(
+                onPressed: () => tabConfig.resetToDefault(),
+                child: const Text('重置'),
+              ),
+            ],
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          child: Text(
+            '拖拽排序、开关显示/隐藏（“我的”不可隐藏）',
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+              color: colorScheme.onSurfaceVariant,
             ),
-            const SizedBox(height: 8),
-            Expanded(
-              child: ReorderableListView.builder(
-                padding: const EdgeInsets.symmetric(horizontal: 8),
-                itemCount: allTabs.length,
-                onReorder: (oldIndex, newIndex) {
-                  tabConfig.reorderTabs(oldIndex, newIndex);
-                },
-                itemBuilder: (context, index) {
-                  final tab = allTabs[index];
-                  final isHidden = hiddenTabs.contains(tab.id);
-                  return ListTile(
+          ),
+        ),
+        const SizedBox(height: 8),
+        ReorderableListView.builder(
+          shrinkWrap: true,
+          physics: const NeverScrollableScrollPhysics(),
+          padding: const EdgeInsets.symmetric(horizontal: 8),
+          itemCount: allTabs.length,
+          onReorder: (oldIndex, newIndex) {
+            tabConfig.reorderTabs(oldIndex, newIndex);
+          },
+          itemBuilder: (context, index) {
+            final tab = allTabs[index];
+            final isHidden = hiddenTabs.contains(tab.id);
+            // search: -
+            return ListTile(
                     key: ValueKey(tab.id),
                     leading: Icon(
                       _tabIconForId(tab.id),
@@ -3059,13 +3030,10 @@ class _TabManagementPanel extends StatelessWidget {
                         ),
                       ],
                     ),
-                  );
-                },
-              ),
-            ),
-          ],
+            );
+          },
         ),
-      ),
+      ],
     );
   }
 }
@@ -3120,6 +3088,8 @@ IconData _tabIconForId(String tabId) {
 ///
 /// 配置持久化由 [ShortcutConfigProvider] 负责，变更后 _AppView 会重新
 /// 注册 Android 长按应用图标快捷入口。
+/// 直接内嵌于设置页「桌面快捷方式」二级卡片；外层已是 ListView，
+/// 故 ReorderableListView 以 shrinkWrap + 不滚动方式布局。
 class _DesktopShortcutPanel extends StatelessWidget {
   const _DesktopShortcutPanel();
 
@@ -3130,49 +3100,49 @@ class _DesktopShortcutPanel extends StatelessWidget {
     final allShortcuts = shortcutConfig.allShortcuts;
     final hiddenIds = shortcutConfig.hiddenIds;
 
-    return SafeArea(
-      child: SizedBox(
-        height: MediaQuery.sizeOf(context).height * 0.85,
-        child: Column(
-          children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: Text(
-                      '桌面快捷方式',
-                      style: Theme.of(context).textTheme.titleMedium,
-                    ),
-                  ),
-                  TextButton(
-                    onPressed: () => shortcutConfig.resetToDefault(),
-                    child: const Text('重置'),
-                  ),
-                ],
-              ),
-            ),
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16),
-              child: Text(
-                '长按应用图标弹出；拖拽排序、开关显示/隐藏',
-                style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                  color: colorScheme.onSurfaceVariant,
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+          child: Row(
+            children: [
+              Expanded(
+                child: Text(
+                  '桌面快捷方式',
+                  style: Theme.of(context).textTheme.titleMedium,
                 ),
               ),
+              TextButton(
+                onPressed: () => shortcutConfig.resetToDefault(),
+                child: const Text('重置'),
+              ),
+            ],
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          child: Text(
+            '长按应用图标弹出；拖拽排序、开关显示/隐藏',
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+              color: colorScheme.onSurfaceVariant,
             ),
-            const SizedBox(height: 8),
-            Expanded(
-              child: ReorderableListView.builder(
-                padding: const EdgeInsets.symmetric(horizontal: 8),
-                itemCount: allShortcuts.length,
-                onReorder: (oldIndex, newIndex) {
-                  shortcutConfig.reorderShortcuts(oldIndex, newIndex);
-                },
-                itemBuilder: (context, index) {
-                  final shortcut = allShortcuts[index];
-                  final isHidden = hiddenIds.contains(shortcut.id);
-                  return ListTile(
+          ),
+        ),
+        const SizedBox(height: 8),
+        ReorderableListView.builder(
+          shrinkWrap: true,
+          physics: const NeverScrollableScrollPhysics(),
+          padding: const EdgeInsets.symmetric(horizontal: 8),
+          itemCount: allShortcuts.length,
+          onReorder: (oldIndex, newIndex) {
+            shortcutConfig.reorderShortcuts(oldIndex, newIndex);
+          },
+          itemBuilder: (context, index) {
+            final shortcut = allShortcuts[index];
+            final isHidden = hiddenIds.contains(shortcut.id);
+            // search: -
+            return ListTile(
                     key: ValueKey(shortcut.id),
                     leading: Icon(
                       _tabIconForId(shortcut.id),
@@ -3203,13 +3173,10 @@ class _DesktopShortcutPanel extends StatelessWidget {
                         ),
                       ],
                     ),
-                  );
-                },
-              ),
-            ),
-          ],
+            );
+          },
         ),
-      ),
+      ],
     );
   }
 }

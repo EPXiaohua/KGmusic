@@ -287,7 +287,7 @@ class MediaNotificationService {
   /// [placeholder] 非空时无歌词列表、居中显示占位文本（如「歌词加载中...」）。
   /// 样式字段全部来自 AM 歌词偏好（LyricPreferences），保证锁屏与 Zen 模式一致：
   /// [lineHeightMultiplier] = (fontSize / 15) * lineSpacing；
-  /// [fontSource] 0=系统 1=内置 SimHei 2=自定义（[customFontPath]）；
+  /// [fontSource] 0=system 1=bundled（已废弃，等同 system）2=custom（[customFontPath]）；
   /// [showTranslation] + [displayMode]（0=翻译 1=罗马音）决定当前行副行。
   static Future<void> updateLockScreenLyricData({
     required List<Map<String, Object?>> lines,

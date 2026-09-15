@@ -1,4 +1,4 @@
-# MD3Music - Material Design 3 音乐播放器 - iOS版移植
+# MD3Music - Material Design 3 音乐播放器
 
 <div align="center">
 

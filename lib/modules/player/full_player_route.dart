@@ -66,6 +66,30 @@ double playerDragOriginTop = 0.0;
 /// 新代码应直接监听 [playerExpansion]。
 bool get isFullPlayerOnTop => playerExpansion.value > 0.5;
 
+/// 打开 FullPlayer（**统一防重复入栈**，新代码一律走这里）。
+///
+/// 此前各调用点各自判重且口径不一：多数用 `activePlayerRoute?.isCurrent == true`
+/// ——播放页已在栈中但**非栈顶**时（用户从播放页又打开了歌单/其他页面）
+/// `isCurrent=false`，仍会再 push 一个播放页；另有调用点完全不判重。结果是
+/// 路由栈里同时存在多个 [AmStyleFullPlayer] 实例，每个实例各自驱动歌词 /
+/// 进度等动画，整页帧率翻倍（120Hz 屏实测 ~120fps 且明显发热）。
+///
+/// 统一语义：
+/// - 播放页已在栈顶 → 什么都不做（正常情况）
+/// - 播放页在栈中但被其它页面盖住 → 回退到它（不再新建）
+/// - 不存在 → push 新路由
+void openFullPlayer(BuildContext context) {
+  final NavigatorState navigator = Navigator.of(context);
+  final DraggablePlayerRoute? existing = activePlayerRoute;
+  if (existing != null) {
+    if (existing.isActive && !existing.isCurrent) {
+      navigator.popUntil((Route<dynamic> route) => identical(route, existing));
+    }
+    return;
+  }
+  navigator.push(fullPlayerRoute(context));
+}
+
 /// 创建并返回可拖拽的 FullPlayer 路由。
 ///
 /// 调用方可在拖拽手势 start 时调用并 push，然后通过 `route.controller`

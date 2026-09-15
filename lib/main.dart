@@ -20,6 +20,7 @@ import 'core/services/wakelock_service.dart';
 import 'data/repositories/settings_repository.dart';
 import 'modules/onboarding/user_agreement_page.dart';
 import 'services/kugou_server.dart';
+import 'utils/landscape_immersive.dart';
 import 'widgets/apple_lyrics/layout/lyric_preferences.dart';
 import 'widgets/md3_lyric_preferences.dart';
 
@@ -96,6 +97,8 @@ Future<(bool, bool)> runBootstrap() async {
     // 让歌词服务定时器在需要时启动、启用选中协议。
     // 原生端 AudioPlaybackService.onCreate 会自行从 SharedPreferences 恢复开关。
     _restoreLyricPushPref(),
+    // 恢复全屏播放器横屏沉浸开关（全局变量，播放器同步读取）
+    _restoreLandscapeImmersivePref(),
   ]);
 
   // 注册通知栏/悬浮窗回调（悬浮窗内按钮 → DesktopLyricService；通知栏桌面歌词按钮 → toggle）
@@ -212,6 +215,15 @@ Future<void> _restoreLyricPushPref() async {
     // 原子随身听缺 8/16 能力位（无歌词无进度条）、车机无歌词。
     // ignore: discarded_futures
     DesktopLyricService.instance.setLyricInfoEnabled(true);
+  } catch (_) {}
+}
+
+/// 恢复「全屏播放器横屏隐藏状态栏」开关到全局变量（默认开启）。
+/// 必须在 runApp 前完成：播放器 didChangeDependencies 首次应用系统栏时同步读取该变量。
+Future<void> _restoreLandscapeImmersivePref() async {
+  try {
+    kLandscapeImmersiveEnabled =
+        await SettingsRepository().getLandscapeImmersiveEnabled();
   } catch (_) {}
 }
 

@@ -83,7 +83,15 @@ public final class UsbLog {
             Process p = Runtime.getRuntime().exec(new String[]{
                     "logcat", "-d", "-v", "time",
                     "UsbAudioDevice:V", "UsbAudioPlugin:V", "UsbAudioOutput:V",
-                    "UsbAudioSinkCtrl:V", "UsbStreamingThread:V", "*:S"});
+                    "UsbAudioSinkCtrl:V", "UsbStreamingThread:V",
+                    // media3 链路（P0-4/P0-5 观测）：渲染器调度、render 循环分支、
+                    // codec 生命周期与「输入缓冲容量/KEY_MAX_INPUT_SIZE」修复判据
+                    "ExoPlayerImplInternal:V", "MediaCodecRenderer:V",
+                    "MediaCodecAudioRenderer:V",
+                    // 32bit FLAC 定位（2026-09-14）：libFLAC 原生错误分布在两个 tag ——
+                    // flac_jni（JNI 层）与 FLACParser（解析器逐帧错误/CRC 校验失败）；
+                    // UsbDiag 是 fork 的渲染器/扩展状态打点
+                    "flac_jni:V", "FLACParser:V", "UsbDiag:V", "*:S"});
             BufferedReader reader =
                     new BufferedReader(new InputStreamReader(p.getInputStream(), "UTF-8"));
             StringBuilder sb = new StringBuilder();

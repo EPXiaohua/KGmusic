@@ -165,6 +165,15 @@ class UsbAudioPlugin(private val context: Context) {
     private var deviceCacheTime: Long = 0L
     private var deviceCacheResult: UsbDevice? = null
 
+    /**
+     * 未开启独占时的 DAC 能力探测结果（只读描述符，不 claim 接口，不影响播放）。
+     * key = "$vid:$pid"；同一设备只探测一次，拔插广播时失效。
+     */
+    private var capsKey: String? = null
+    private var probedCaps: UsbAudioCapabilities? = null
+    @Volatile
+    private var capsProbeRunning = false
+
     private fun findCachedDevice(): UsbDevice? {
         val now = android.os.SystemClock.elapsedRealtime()
         if (deviceCacheResult == null || now - deviceCacheTime > 5000) {
@@ -177,6 +186,74 @@ class UsbAudioPlugin(private val context: Context) {
     private fun invalidateDeviceCache() {
         deviceCacheResult = null
         deviceCacheTime = 0L
+        capsKey = null
+        probedCaps = null
+    }
+
+    /**
+     * 必要时后台探测一次 DAC 能力（未开启独占且尚未探测过当前设备时）。
+     *
+     * 探测只 open→读描述符→close，不 claim 接口，不会打断内核驱动/正在播放的音频；
+     * 为避免阻塞主线程（getStatus 每秒被调用），探测在后台线程执行，完成后推送状态。
+     */
+    private fun maybeProbeCaps(device: UsbDevice?) {
+        if (device == null) return
+        // 已打开设备：能力来自实际流配置，无需探测
+        if (usbAudioDevice.getCachedInfo() != null) return
+        // 独占开启中：设备已被 claim，二次 open 的控制传输会集体失败（实测 ret=-1），
+        // 探测只会得到空结果并覆盖掉已有能力 —— 直接跳过
+        if (UsbAudioSinkController.isEnabled()) return
+        val key = "${device.vendorId}:${device.productId}"
+        if (capsKey == key || capsProbeRunning) return
+        // 无授权时无法打开设备；由用户点"读取 DAC 能力"走授权流程后探测
+        if (!usbManager.hasPermission(device)) return
+        capsProbeRunning = true
+        Thread {
+            val caps = usbAudioDevice.probeCapabilities(device)
+            mainHandler.post {
+                capsProbeRunning = false
+                capsKey = key
+                probedCaps = caps
+                UsbLog.i(TAG, "auto probe caps: ${caps?.deviceName ?: "null"} " +
+                        "uac=UAC${caps?.uacVersion} rates=${caps?.allRates?.contentToString()}")
+                pushStatus()
+            }
+        }.apply { isDaemon = true; start() }
+    }
+
+    /** 用户手动触发的能力读取（无论是否已探测过都重新读），必要时先申请授权。 */
+    private fun probeCapsInternal(result: MethodChannel.Result) {
+        invalidateDeviceCache()
+        val device = findCachedDevice()
+        if (device == null) {
+            result.error("NO_DEVICE", "未检测到 USB 音频设备", null)
+            return
+        }
+        val done = {
+            Thread {
+                val caps = usbAudioDevice.probeCapabilities(device)
+                mainHandler.post {
+                    capsKey = "${device.vendorId}:${device.productId}"
+                    // 探测失败（如独占中设备被 claim → 控制传输全部失败）时不要用空结果
+                    // 覆盖已有的能力，否则下拉可选项会凭空消失
+                    val worse = caps == null ||
+                            (caps.allRates.isEmpty() && (probedCaps?.allRates?.isNotEmpty() == true))
+                    if (!worse) probedCaps = caps
+                    pushStatus()
+                    result.success(getStatus())
+                }
+            }.apply { isDaemon = true; start() }
+            Unit
+        }
+        if (usbManager.hasPermission(device)) {
+            done()
+        } else {
+            UsbLog.i(TAG, "probeCaps: requesting permission for ${device.productName}")
+            usbAudioDevice.requestPermission(device) { granted ->
+                if (granted) done()
+                else result.error("PERMISSION_DENIED", "USB 设备授权被拒绝", null)
+            }
+        }
     }
 
     /** 拔插广播：独占开启时拔线自动关闭（避免写坏 fd），重新插入自动恢复。 */
@@ -269,12 +346,21 @@ class UsbAudioPlugin(private val context: Context) {
                         "\n── native 环形（USB 传输层） ──\n" + UsbAudioStream.recentNativeLogs())
             }
             "isEnabled" -> result.success(UsbAudioSinkController.isEnabled())
+            "probeDacCapabilities" -> probeCapsInternal(result)
             "setFloatOutputEnabled" -> {
                 // 32bit 播放支持开关（默认关闭）。开启后在 DefaultAudioSink 的 float 决策点生效，
                 // 下一首歌 configure 即按新开关走 float 高解析；关闭则回退 16bit 保证正确播放。
                 val enabled = call.argument<Boolean>("enabled") ?: false
                 UsbAudioSinkController.setFloatOutputEnabled(enabled)
                 UsbLog.i(TAG, "setFloatOutputEnabled: $enabled (float output ${if (enabled) "开启" else "关闭"})")
+                result.success(true)
+            }
+            "setDitherEnabled" -> {
+                // TPDF 抖动降位开关（默认关闭）。独占数据路径每次 writeRaw 都会读取，
+                // 因此切换立即生效（无需重建流/切歌）。仅在源位深 > 端点位深时参与。
+                val enabled = call.argument<Boolean>("enabled") ?: false
+                UsbAudioStream.ditherEnabled = enabled
+                UsbLog.i(TAG, "setDitherEnabled: $enabled (TPDF 抖动 ${if (enabled) "开启" else "关闭"})")
                 result.success(true)
             }
             "enableExclusive" -> requestEnableInternal(result)
@@ -351,8 +437,24 @@ class UsbAudioPlugin(private val context: Context) {
         base.putAll(UsbAudioSinkController.getStatus())
         val device = findCachedDevice()
         val cached = usbAudioDevice.getCachedInfo()
+        // UAC 版本/总线速度/能力：优先取已打开设备的实际配置，其次取未开启独占时的描述符探测结果
+        val caps = probedCaps
+        val uacVersion = cached?.uacVersion ?: caps?.uacVersion ?: 0
+        val fullSpeed = cached?.fullSpeed ?: caps?.fullSpeed
         base["deviceConnected"] = device != null
-        base["deviceName"] = cached?.deviceName ?: device?.productName
+        base["deviceName"] = cached?.deviceName ?: caps?.deviceName ?: device?.productName
+        base["deviceManufacturer"] = caps?.manufacturer ?: device?.manufacturerName
+        base["deviceVid"] = device?.vendorId ?: caps?.vid ?: 0
+        base["devicePid"] = device?.productId ?: caps?.pid ?: 0
+        base["uacVersion"] = uacVersion
+        base["uacLabel"] = if (uacVersion > 0) "UAC$uacVersion" else ""
+        base["usbSpeed"] = fullSpeed?.let { if (it) "full" else "high" } ?: ""
+        base["capabilitiesSource"] = when {
+            cached != null -> "active"
+            caps != null -> "probed"
+            else -> "none"
+        }
+        base["altSettingCount"] = cached?.altSettingCount ?: caps?.altCount ?: 0
         base["hasPermission"] = device != null && usbAudioDevice.hasPermission(device)
         base["hasHardwareVolume"] = usbAudioDevice.hasHardwareVolume && hardwareVolumeUsable
         base["usbVolumePercent"] = usbVolumePercent
@@ -364,13 +466,20 @@ class UsbAudioPlugin(private val context: Context) {
                 UsbAudioStream.streamVolume * 100f
             }
         } else 0f
-        // 输出格式选择：DAC 能力并集 + 当前 override（UI 生成可选项用）
-        base["supportedRates"] = cached?.allRates?.toList() ?: emptyList<Int>()
-        base["supportedBits"] = cached?.allBits?.toList() ?: emptyList<Int>()
-        base["supportedChannels"] = cached?.allChannels?.toList() ?: emptyList<Int>()
+        // 输出格式选择：DAC 能力并集 + 当前 override（UI 生成可选项用）。
+        // 优先已打开设备的实际能力；其为空（如 openDevice 时 GET_RANGE 失败）时
+        // 回落到未开启独占时探测到的能力，避免下拉可选项莫名消失。
+        base["supportedRates"] = pickCaps(cached?.allRates, caps?.allRates).toList()
+        base["supportedBits"] = pickCaps(cached?.allBits, caps?.allBits).toList()
+        base["supportedChannels"] = pickCaps(cached?.allChannels, caps?.allChannels).toList()
+        base["rateRangeMin"] = caps?.rateMin ?: 0
+        base["rateRangeMax"] = caps?.rateMax ?: 0
         base["outputRateOverride"] = forceRate
         base["outputBitsOverride"] = forceBits
         base["outputChannelsOverride"] = forceChannels
+        base["ditherEnabled"] = UsbAudioStream.ditherEnabled
+        // 钳制后真正下发给 DAC 的率（override≠effective 说明被 DAC 能力降级，UI 需提示）
+        base["outputRateEffective"] = UsbAudioSinkController.getTargetOutputRate()
         // Salt Player 式诊断（「调试信息」面板展示/复制，便于远程定位 DAC 兼容问题）：
         // 三段结构 = Playback（运行状态/有效格式/override）+ Stream Setup（最近一次流创建步骤链）+ Device（拓扑/端点/能力）
         val playback = UsbAudioSinkController.getStatus()
@@ -386,7 +495,21 @@ class UsbAudioPlugin(private val context: Context) {
         diag.appendLine(lastSetupSummary)
         diag.appendLine("── Device ──")
         diag.append(usbAudioDevice.buildDiagnostics(device, cached))
+        if (cached == null && caps != null) {
+            // 未开启独占：能力来自描述符探测（不打开设备），单独列出便于对照
+            diag.appendLine("── Probed Capabilities (未打开设备) ──")
+            diag.appendLine("Source: ${caps.manufacturer.ifEmpty { "-" }} / ${caps.deviceName}")
+            diag.appendLine("UAC Version: UAC${caps.uacVersion}")
+            diag.appendLine("USB Speed: ${if (caps.fullSpeed) "full" else "high"}")
+            diag.appendLine("Alt Settings: ${caps.altCount}")
+            diag.appendLine("Rates: ${caps.allRates.joinToString(",")}" +
+                    (if (caps.rateMin > 0) " (range ${caps.rateMin}-${caps.rateMax})" else ""))
+            diag.appendLine("Bits: ${caps.allBits.joinToString(",")}")
+            diag.appendLine("Channels: ${caps.allChannels.joinToString(",")}")
+        }
         base["diagnostics"] = diag.toString()
+        // 未开启独占时异步探测一次 DAC 能力（供 UI 生成可选项），不阻塞本次返回
+        maybeProbeCaps(device)
         return base
     }
 
@@ -409,6 +532,13 @@ class UsbAudioPlugin(private val context: Context) {
      * 拔插广播 / 广播触发的自动恢复（无 MethodChannel 调用方）会真正依赖它；
      * Dart 调用方（enable/disable）同时从返回值拿到同一份状态，幂等。
      */
+    /** 能力数组择优：优先非空的活跃能力，其次探测能力，都空则空数组。 */
+    private fun pickCaps(active: IntArray?, probed: IntArray?): IntArray {
+        if (active != null && active.isNotEmpty()) return active
+        if (probed != null && probed.isNotEmpty()) return probed
+        return intArrayOf()
+    }
+
     private fun pushStatus() {
         val ch = channel ?: return
         val status = getStatus()

@@ -138,6 +138,10 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # setup-android@v3 默认还会安装已从 SDK 仓库移除的 tools 包。
+          # 这里只需要 platform-tools，其他版本化 SDK 包在下一步显式安装。
+          packages: platform-tools
 
       - name: Install Android SDK packages
         run: |

@@ -1,3 +1,4 @@
+import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/widgets.dart';
@@ -501,6 +502,107 @@ void main() {
       expect(r.isConverged, isTrue);
     });
   });
+
+  // ==================== 9. 翻译副行日历式翻转 ====================
+  group('翻译副行翻转', () {
+    // 副行文本 2 字，Ahem 下宽 2×14=28px < 200 → 恒为 1 个视觉行
+    const lineWithTrans = LyricLine(
+      startTime: 0,
+      duration: 4000,
+      text: '短句',
+      words: [],
+      translation: '译文',
+    );
+
+    /// 副行文字块高度 = 视觉行数 × 副行字号 × 副行行高（与渲染器口径一致）。
+    double sublineHeight() {
+      const double fontSize = 20;
+      final int rows =
+          LyricLayout.measureAuxRows('译文', fontSize, 200);
+      return rows *
+          LyricLayout.translationFontSize(fontSize) *
+          LyricLayout.translationLineHeight;
+    }
+
+    test('副行就位（expand=1）时不施加画布变换，但副行照常绘制', () {
+      renderer.setLineState(isActive: true, scale: LyricLayout.activeScale);
+      renderer.translationExpand = 1.0;
+      renderer.translationFade = 1.0;
+      renderer.translationExiting = false;
+      final canvas = RecordingCanvas();
+      renderer.paintLine(canvas, ui.Offset.zero, lineWithTrans, 20,
+          maxWidth: 200, viewportWidth: 200);
+      expect(canvas.transforms, isEmpty, reason: '就位副行走直绘路径，零变换开销');
+      expect(canvas.drawParagraphOffsets.length, 2,
+          reason: '主行 1 次 + 副行 1 次');
+    });
+
+    test('入场中途绕副行底边翻转（锚线不动、方向为负）', () {
+      renderer.setLineState(isActive: true, scale: LyricLayout.activeScale);
+      renderer.translationExpand = 0.5;
+      renderer.translationFade = 0.5;
+      renderer.translationExiting = false;
+      final canvas = RecordingCanvas();
+      renderer.paintLine(canvas, ui.Offset.zero, lineWithTrans, 20,
+          maxWidth: 200, viewportWidth: 200);
+      expect(canvas.transforms, hasLength(1), reason: '翻转中恰好施加 1 次变换');
+
+      final ui.Offset subOffset = canvas.drawParagraphOffsets.last;
+      final Matrix4 m = Matrix4.fromFloat64List(canvas.transforms.single);
+      // sublineWidth 传 0：本用例只校验锚线 y；锚点 x（透视投影中心）由
+      // lyric_layout_subline_flip_test 的锚点与左右对称用例覆盖。
+      final ui.Offset anchor = LyricLayout.sublineFlipAnchor(
+        transX: subOffset.dx,
+        sublineWidth: 0,
+        transY: subOffset.dy,
+        sublineHeight: sublineHeight(),
+        exiting: false,
+      );
+      final double anchorY = anchor.dy;
+      expect(anchorY, closeTo(subOffset.dy + sublineHeight(), 1e-6),
+          reason: '入场锚线 = 副行底边');
+      final ui.Offset fixed =
+          MatrixUtils.transformPoint(m, ui.Offset(123, anchorY));
+      expect(fixed.dx, closeTo(123, 1e-6));
+      expect(fixed.dy, closeTo(anchorY, 1e-6), reason: '锚线是不动点');
+    });
+
+    test('出场绕副行顶边翻转，且压缩方向与入场相反', () {
+      renderer.setLineState(
+          isActive: false, scale: LyricLayout.inactiveScale, blurActive: false);
+      renderer.translationExpand = 0.5;
+      renderer.translationFade = 0.5;
+      renderer.translationExiting = true;
+      final canvas = RecordingCanvas();
+      renderer.paintLine(canvas, ui.Offset.zero, lineWithTrans, 20,
+          maxWidth: 200, viewportWidth: 200);
+      expect(canvas.transforms, hasLength(1));
+
+      final ui.Offset subOffset = canvas.drawParagraphOffsets.last;
+      final Matrix4 m = Matrix4.fromFloat64List(canvas.transforms.single);
+      final ui.Offset anchor = LyricLayout.sublineFlipAnchor(
+        transX: subOffset.dx,
+        sublineWidth: 0,
+        transY: subOffset.dy,
+        sublineHeight: sublineHeight(),
+        exiting: true,
+      );
+      final double anchorY = anchor.dy;
+      expect(anchorY, closeTo(subOffset.dy, 1e-6), reason: '出场锚线 = 副行顶边');
+      final ui.Offset fixed =
+          MatrixUtils.transformPoint(m, ui.Offset(0, anchorY));
+      expect(fixed.dy, closeTo(anchorY, 1e-6));
+
+      // 锚线下方 d 处的点必须向锚线（上方）压缩：expand=0.5 的出场转角为
+      // 63.6°（cos 0.44），12px 离轴点压缩约 6.7px，取 0.5px 下限即可区分
+      // 「向锚线压缩」与「不动 / 外扩」。
+      const double d = 12;
+      final ui.Offset below =
+          MatrixUtils.transformPoint(m, ui.Offset(0, anchorY + d));
+      expect(anchorY + d - below.dy, greaterThan(0.5),
+          reason: '出场副行向顶边压缩（向上翻走）');
+    });
+  });
 }
 
 /// 测试用：复刻 measureLineHeight 的 word 累加行数计算（与渲染一致）。
@@ -526,16 +628,26 @@ int _wordAccumulateForTest(LyricLine line, double fontSize, double maxWidth) {
   return rows;
 }
 
-/// 记录 [ui.Canvas.drawParagraph] 位置的测试画布（其余方法走 noSuchMethod 兜底）。
+/// 记录 [ui.Canvas.drawParagraph] 位置与画布变换的测试画布（其余方法走 noSuchMethod 兜底）。
 ///
-/// 用于断言自动换行时每个视觉行的绘制 y 位置，验证行盒模型不重叠。
+/// - [drawParagraphOffsets] 用于断言自动换行时每个视觉行的绘制 y 位置，
+///   以及副行（翻译）的绘制原点；
+/// - [transforms] 用于断言副行翻转施加了正确的画布变换（只记录 `transform`，
+///   不记录 translate/scale，避免被主行的对齐变换干扰）。
 class RecordingCanvas implements ui.Canvas {
   final List<ui.Offset> drawParagraphOffsets = <ui.Offset>[];
+
+  /// 按调用顺序记录 `canvas.transform` 传入的 4x4 矩阵（column-major 副本）。
+  final List<Float64List> transforms = <Float64List>[];
 
   @override
   void drawParagraph(ui.Paragraph paragraph, ui.Offset offset) {
     drawParagraphOffsets.add(offset);
   }
+
+  @override
+  void transform(Float64List matrix4) =>
+      transforms.add(Float64List.fromList(matrix4));
 
   @override
   dynamic noSuchMethod(Invocation invocation) => null;

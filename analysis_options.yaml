@@ -21,6 +21,9 @@ analyzer:
     - ios/**
     - macos/**
     - linux/**
+    # 上游版本源码 dump（仅本地参考，不入库）
+    - md3Music-5.5.0/**
+    - md3Music-5.6.0/**
 
 linter:
   # The lint rules applied to this project can be customized in the
