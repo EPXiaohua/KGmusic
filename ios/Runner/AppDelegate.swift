@@ -202,7 +202,7 @@ import UniformTypeIdentifiers
         try data.write(to: dst)
         // 写入成功后清理旧背景文件，避免累积（只保留刚写的一份）
         if let files = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) {
-          for old in files where old.isFile && old.absolutePath != dst.path {
+          for old in files where old.isFileURL && old.path != dst.path {
             try? FileManager.default.removeItem(at: old)
           }
         }
