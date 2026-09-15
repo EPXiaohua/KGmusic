@@ -83,7 +83,8 @@ class CustomFontLoader {
     try {
       final channel = MethodChannel(_channel);
       return await channel.invokeMethod<String>('pickFontFile');
-    } catch (_) {
+    } catch (e) {
+      print('[CustomFontLoader] pick error: $e');
       return null;
     }
   }

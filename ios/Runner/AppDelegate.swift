@@ -27,12 +27,14 @@ import UniformTypeIdentifiers
   // MARK: - MethodChannel 注册
 
   /// Android 端由 MainActivity.kt 实现同名 channel；iOS 在此补齐。
-  /// 场景建立后 window.rootViewController 才是 FlutterViewController，
-  /// 因此 didFinishLaunching / 引擎初始化 / SceneDelegate 连接三处都尝试注册。
+  ///
+  /// 注意：场景化生命周期下 AppDelegate.window 为 nil（窗口归 SceneDelegate 所有），
+  /// 因此查找 FlutterViewController 必须走 connectedScenes -> keyWindow。
+  /// didFinishLaunching / 引擎初始化 / SceneDelegate 连接三处都会尝试注册（幂等）。
   func configureChannelsIfPossible() {
     guard !channelsConfigured else { return }
-    guard let controller = window?.rootViewController as? FlutterViewController else { return }
-    let messenger = controller.binaryMessenger
+    guard let vc = findFlutterViewController() else { return }
+    let messenger = vc.binaryMessenger
 
     FlutterMethodChannel(name: "com.md3music.md3music/font_picker", binaryMessenger: messenger)
       .setMethodCallHandler { [weak self] call, result in
@@ -53,11 +55,35 @@ import UniformTypeIdentifiers
       }
 
     channelsConfigured = true
+    NSLog("[MD3Music] picker MethodChannels registered on FlutterViewController")
+  }
+
+  /// 通过 connectedScenes 找 keyWindow 的根 FlutterViewController
+  private func findFlutterViewController() -> FlutterViewController? {
+    let windows = UIApplication.shared.connectedScenes
+      .compactMap { $0 as? UIWindowScene }
+      .flatMap { $0.windows }
+    for window in windows {
+      if let root = window.rootViewController as? FlutterViewController {
+        return root
+      }
+      // 根不是（例如被导航/容器包住）时向下找一层
+      for child in root?.children ?? [] {
+        if let vc = child as? FlutterViewController {
+          return vc
+        }
+      }
+    }
+    return nil
   }
 
   /// 当前可用于 present 的最顶层控制器
   private var presenter: UIViewController? {
-    var base = window?.rootViewController
+    let windows = UIApplication.shared.connectedScenes
+      .compactMap { $0 as? UIWindowScene }
+      .flatMap { $0.windows }
+    var base = windows.first { $0.isKeyWindow }?.rootViewController
+      ?? windows.first?.rootViewController
     while let presented = base?.presentedViewController {
       base = presented
     }
@@ -71,6 +97,10 @@ import UniformTypeIdentifiers
       result(nil)  // 已有选择器在运行，直接视为取消
       return
     }
+    guard let presenter = presenter else {
+      result(FlutterError(code: "NO_VIEW_CONTROLLER", message: "无法获取展示控制器", details: nil))
+      return
+    }
     pendingResult = result
     // UTType 没有字体静态成员，用标准 UTI 构造：ttf / otf / 通用字体
     let fontTypes = [
@@ -82,7 +112,7 @@ import UniformTypeIdentifiers
       forOpeningContentTypes: fontTypes, asCopy: true)
     picker.delegate = self
     picker.allowsMultipleSelection = false
-    presenter?.present(picker, animated: true)
+    presenter.present(picker, animated: true)
   }
 
   func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
@@ -121,13 +151,17 @@ import UniformTypeIdentifiers
       result(nil)
       return
     }
+    guard let presenter = presenter else {
+      result(FlutterError(code: "NO_VIEW_CONTROLLER", message: "无法获取展示控制器", details: nil))
+      return
+    }
     pendingResult = result
     var config = PHPickerConfiguration()
     config.filter = .images
     config.selectionLimit = 1
     let picker = PHPickerViewController(configuration: config)
     picker.delegate = self
-    presenter?.present(picker, animated: true)
+    presenter.present(picker, animated: true)
   }
 
   func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {

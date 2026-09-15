@@ -17,7 +17,9 @@ class BackgroundImageLoader {
     try {
       final channel = MethodChannel(_channel);
       return await channel.invokeMethod<String>('pickBackgroundImage');
-    } catch (_) {
+    } catch (e) {
+      // ignore: avoid_print
+      print('[BackgroundImageLoader] pick error: $e');
       return null;
     }
   }
