@@ -387,7 +387,7 @@
 					"$(inherited)",
 					"-force_load",
 					"\"$(SRCROOT)/rustlib/libkugou_server.a\"",
-					"-export_dynamic",
+					"-Wl,-exported_symbols_list,$(SRCROOT)/export_symbols.txt",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.md3music.md3music;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -574,7 +574,7 @@
 					"$(inherited)",
 					"-force_load",
 					"\"$(SRCROOT)/rustlib/libkugou_server.a\"",
-					"-export_dynamic",
+					"-Wl,-exported_symbols_list,$(SRCROOT)/export_symbols.txt",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.md3music.md3music;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -602,7 +602,7 @@
 					"$(inherited)",
 					"-force_load",
 					"\"$(SRCROOT)/rustlib/libkugou_server.a\"",
-					"-export_dynamic",
+					"-Wl,-exported_symbols_list,$(SRCROOT)/export_symbols.txt",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.md3music.md3music;
 				PRODUCT_NAME = "$(TARGET_NAME)";
