@@ -2,6 +2,7 @@ import Flutter
 import UIKit
 import PhotosUI
 import UniformTypeIdentifiers
+import MediaPlayer
 
 @main
 @objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate,
@@ -53,6 +54,11 @@ import UniformTypeIdentifiers
         }
         self?.pickBackgroundImage(result: result)
       }
+
+    // iOS 锁屏/控制中心 Now Playing 信息与远程命令。
+    // Android 的锁屏/通知由 Media3 MediaSession 负责，不经过此 channel，
+    // 本 channel 仅在 iOS Runner 内注册，互不影响。
+    NowPlayingManager.shared.attach(messenger: messenger)
 
     channelsConfigured = true
     NSLog("[MD3Music] picker MethodChannels registered on FlutterViewController")
@@ -230,6 +236,210 @@ import UniformTypeIdentifiers
           result(FlutterError(code: "BG_COPY_FAILED", message: error.localizedDescription, details: nil))
         }
       }
+    }
+  }
+}
+
+// MARK: - iOS 锁屏/控制中心 Now Playing
+
+/// iOS 锁屏/控制中心 Now Playing 信息与远程命令桥接。
+///
+/// 与 Android 的 Media3 通知路径互不影响：本类只在 iOS Runner 内编译，
+/// channel 也只由 iOS 端注册。Dart 端对应 lib/core/services/now_playing_service.dart。
+final class NowPlayingManager {
+  static let shared = NowPlayingManager()
+
+  private var channel: FlutterMethodChannel?
+  /// 当前倍速对应的 rate（暂停时必须为 0，否则锁屏进度条按墙钟自己走）
+  private var currentRate: Double = 0
+  /// 已应用到锁屏的封面 URI：同曲重复刷新（通知重建/收藏变化等）不重复下载
+  private var appliedArtUri: String?
+  /// 封面下载请求序号：快速切歌时旧请求返回后按序号丢弃，避免串歌封面
+  private var artworkRequestId = 0
+
+  private init() {}
+
+  /// 注册 MethodChannel 与远程命令（幂等）。attach 与命令回调均保证在主线程。
+  func attach(messenger: FlutterBinaryMessenger) {
+    guard channel == nil else { return }
+    let ch = FlutterMethodChannel(name: "com.md3music/now_playing", binaryMessenger: messenger)
+    ch.setMethodCallHandler { [weak self] call, result in
+      self?.handle(call: call, result: result)
+    }
+    channel = ch
+    registerRemoteCommands()
+    NSLog("[MD3Music] now_playing channel registered")
+  }
+
+  private func handle(call: FlutterMethodCall, result: @escaping FlutterResult) {
+    switch call.method {
+    case "setMetadata":
+      guard let args = call.arguments as? [String: Any] else {
+        result(nil)
+        return
+      }
+      setMetadata(args)
+      result(nil)
+    case "updatePlayback":
+      guard let args = call.arguments as? [String: Any] else {
+        result(nil)
+        return
+      }
+      updatePlayback(args)
+      result(nil)
+    case "clear":
+      clear()
+      result(nil)
+    default:
+      result(FlutterMethodNotImplemented)
+    }
+  }
+
+  // MARK: 元数据（标题/歌手/专辑/时长 + 封面异步下载）
+
+  private func setMetadata(_ args: [String: Any]) {
+    DispatchQueue.main.async { [weak self] in
+      guard let self = self else { return }
+      // 增量更新：保留封面等已有字段，不重建整个 dict
+      var info = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
+      let newTitle = args["title"] as? String
+      let oldTitle = info[MPMediaItemPropertyTitle] as? String
+      // 仅切歌（标题变化）时进度归零；同曲刷新（暂停/收藏/封面覆盖路径等
+      // 重建通知）保留进度，避免把锁屏进度打回 0。
+      let isTrackChange = newTitle != nil && newTitle != oldTitle
+      if let title = newTitle, !title.isEmpty {
+        info[MPMediaItemPropertyTitle] = title
+      }
+      if let artist = args["artist"] as? String {
+        info[MPMediaItemPropertyArtist] = artist
+      }
+      if let album = args["album"] as? String {
+        info[MPMediaItemPropertyAlbumTitle] = album
+      }
+      if let durationMs = (args["duration"] as? NSNumber)?.doubleValue, durationMs > 0 {
+        info[MPMediaItemPropertyPlaybackDuration] = durationMs / 1000.0
+      }
+      if isTrackChange {
+        info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = 0.0
+        info[MPNowPlayingInfoPropertyPlaybackRate] = self.currentRate
+      }
+      MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+      self.loadArtwork(args["artUri"] as? String)
+    }
+  }
+
+  /// 异步取封面：http/https/file 均由 URLSession 支持（Info.plist 已放行 ATS）。
+  /// 成功构造 MPMediaItemArtwork（handler 返回对应尺寸 UIImage）后重新刷新
+  /// nowPlayingInfo；失败静默跳过（锁屏仍显示文字）。
+  private func loadArtwork(_ artUri: String?) {
+    DispatchQueue.main.async { [weak self] in
+      guard let self = self else { return }
+      if let uri = artUri, uri == self.appliedArtUri { return }
+      self.appliedArtUri = artUri
+      self.artworkRequestId += 1
+      let requestId = self.artworkRequestId
+      guard let uri = artUri, !uri.isEmpty, let url = URL(string: uri) else {
+        self.removeArtwork()
+        return
+      }
+      URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
+        guard let self = self else { return }
+        DispatchQueue.main.async {
+          // 已切歌：丢弃过期封面
+          guard requestId == self.artworkRequestId else { return }
+          guard let data = data, let image = UIImage(data: data) else { return }
+          let artwork = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
+          var info = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
+          info[MPMediaItemArtworkProperty] = artwork
+          MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+        }
+      }.resume()
+    }
+  }
+
+  private func removeArtwork() {
+    var info = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
+    info[MPMediaItemArtworkProperty] = nil
+    MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+  }
+
+  // MARK: 播放进度/状态
+
+  private func updatePlayback(_ args: [String: Any]) {
+    DispatchQueue.main.async { [weak self] in
+      guard let self = self else { return }
+      let positionMs = (args["position"] as? NSNumber)?.doubleValue ?? 0
+      let playing = args["playing"] as? Bool ?? false
+      let speed = (args["speed"] as? NSNumber)?.doubleValue ?? 1.0
+      // 暂停时 rate=0：锁屏进度条停止走动
+      let rate: Double = playing ? (speed > 0 ? speed : 1.0) : 0
+      self.currentRate = rate
+      // 增量更新：保持标题/封面字段
+      var info = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
+      info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = positionMs / 1000.0
+      info[MPNowPlayingInfoPropertyPlaybackRate] = rate
+      info[MPNowPlayingInfoPropertyPlaybackQueueIndex] = 0
+      MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+    }
+  }
+
+  private func clear() {
+    DispatchQueue.main.async { [weak self] in
+      MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+      self?.appliedArtUri = nil
+      self?.currentRate = 0
+      self?.artworkRequestId += 1
+    }
+  }
+
+  // MARK: 远程命令（锁屏/控制中心/耳机线控）→ Flutter
+
+  private func registerRemoteCommands() {
+    let center = MPRemoteCommandCenter.shared()
+    center.togglePlayPauseCommand.addTarget { [weak self] _ in
+      self?.sendCommand("toggle")
+      return .success
+    }
+    center.playCommand.addTarget { [weak self] _ in
+      self?.sendCommand("play")
+      return .success
+    }
+    center.pauseCommand.addTarget { [weak self] _ in
+      self?.sendCommand("pause")
+      return .success
+    }
+    center.nextTrackCommand.addTarget { [weak self] _ in
+      self?.sendCommand("next")
+      return .success
+    }
+    center.previousTrackCommand.addTarget { [weak self] _ in
+      self?.sendCommand("previous")
+      return .success
+    }
+    // 控制中心进度条拖动
+    center.changePlaybackPositionCommand.addTarget { [weak self] event in
+      guard let event = event as? MPChangePlaybackPositionCommandEvent else {
+        return .commandFailed
+      }
+      self?.sendCommand("seek", positionMs: Int(event.positionTime * 1000))
+      return .success
+    }
+    center.togglePlayPauseCommand.isEnabled = true
+    center.playCommand.isEnabled = true
+    center.pauseCommand.isEnabled = true
+    center.nextTrackCommand.isEnabled = true
+    center.previousTrackCommand.isEnabled = true
+    center.changePlaybackPositionCommand.isEnabled = true
+  }
+
+  /// 命令回传 Dart：invokeMethod("command", {'action': ..., 'position': <ms>}).
+  private func sendCommand(_ action: String, positionMs: Int? = nil) {
+    DispatchQueue.main.async { [weak self] in
+      var args: [String: Any] = ["action": action]
+      if let positionMs = positionMs {
+        args["position"] = positionMs
+      }
+      self?.channel?.invokeMethod("command", arguments: args)
     }
   }
 }

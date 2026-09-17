@@ -18,6 +18,7 @@ import '../core/services/listening_grade_service.dart';
 import '../core/services/listen_report_service.dart';
 import '../core/services/playback_duration_tracker.dart';
 import '../core/services/media_notification_service.dart';
+import '../core/services/now_playing_service.dart';
 import '../core/services/wakelock_service.dart';
 import '../core/services/media_store_service.dart';
 import '../core/services/usb_audio_service.dart';
@@ -459,6 +460,12 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       _audioInitialized = true;
       await _audioService.init();
       _initStreams();
+      // iOS 锁屏/控制中心 Now Playing：注册 channel 并激活音频会话（playback）。
+      // 必须在 _audioService.init() 之后：其 _configureAudioSession 因 Android
+      // 焦点统一交给 Media3 而执行 setActive(false)，iOS 需在其后重新激活，
+      // 否则锁屏显示后进后台播放会被打断。仅 iOS 生效，Android 全 no-op。
+      NowPlayingService.instance.onCommand = _handleNowPlayingCommand;
+      await NowPlayingService.instance.init();
       // USB 独占关闭后自动恢复 delegate 输出：旧 usb HAL 输出流被独占 force
       // disconnect 杀死，只有重建 AudioTrack（复刻"暂停→重播"）才能重新出声。
       UsbAudioService.instance.onExclusiveDisabled = _handleUsbExclusiveDisabled;
@@ -831,6 +838,9 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
         // 避免每 200ms 重建所有依赖 PlayerProvider 的 widget（MiniPlayer/封面等）
         _updatePosition(position);
         _updateNotificationPosition();
+        // iOS 锁屏进度同步：独立 ~1 秒节流（Android 通知 30s 节流互不影响，
+        // iOS 锁屏进度条依赖 elapsed+rate 自行推进，1s 校准足够）
+        _maybeUpdateNowPlayingPosition(position);
         // 防抖保存位置（3 秒）
         _scheduleSave();
 
@@ -919,6 +929,13 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
         try {
           _updateNotification();
         } catch (_) {}
+        // iOS 锁屏播放状态：暂停/恢复立即推（暂停 rate=0 进度停走，
+        // 恢复 rate=倍速），不等 position 节流
+        NowPlayingService.instance.updatePlayback(
+          positionMs: _position.inMilliseconds,
+          playing: isPlaying,
+          speed: _speed,
+        );
         notifyListeners();
         // 播放/暂停切换时立即推 Lyricon，避免等下一个 positionStream tick
         // state 必须用 PlaybackStateCompat.STATE_PLAYING=3 / STATE_PAUSED=2
@@ -2453,6 +2470,13 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     // 使新位置立即反映到媒体通知进度条。
     _lastNotificationUpdate = null;
     _updateNotification();
+    // iOS 锁屏进度立即同步（重置节流时间戳，避免被上一秒的旧采样拦截）
+    _lastNowPlayingPositionUpdate = null;
+    NowPlayingService.instance.updatePlayback(
+      positionMs: position.inMilliseconds,
+      playing: _isPlaying,
+      speed: _speed,
+    );
   }
 
   Future<bool> _resolveAndPlayCurrentSong({Duration? seekTo, bool play = true}) async {
@@ -2794,6 +2818,8 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     _resolveError = null;
     _stateRepo.clearState();
     _updateNotification();
+    // iOS 锁屏信息清空（停止/清空队列后锁屏不应残留上一首）
+    NowPlayingService.instance.clear();
     notifyListeners();
   }
 
@@ -3410,6 +3436,50 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     _updateNotification();
   }
 
+  DateTime? _lastNowPlayingPositionUpdate;
+
+  /// iOS 锁屏进度同步：~1 秒节流。暂停时不推（暂停瞬间已由 playingStream
+  /// 立即推送 rate=0 的最终状态，之后位置不再变化无需更新）。
+  void _maybeUpdateNowPlayingPosition(Duration position) {
+    if (!_isPlaying) return;
+    final now = DateTime.now();
+    if (_lastNowPlayingPositionUpdate != null &&
+        now.difference(_lastNowPlayingPositionUpdate!).inMilliseconds < 1000) {
+      return;
+    }
+    _lastNowPlayingPositionUpdate = now;
+    NowPlayingService.instance.updatePlayback(
+      positionMs: position.inMilliseconds,
+      playing: true,
+      speed: _speed,
+    );
+  }
+
+  /// iOS 锁屏/控制中心远程命令回调（channel 仅 iOS 注册，此处再判平台双保险）。
+  void _handleNowPlayingCommand(String action, int? positionMs) {
+    if (!Platform.isIOS) return;
+    switch (action) {
+      case 'play':
+        resume();
+      case 'pause':
+        pause();
+      case 'toggle':
+        if (_isPlaying) {
+          pause();
+        } else {
+          resume();
+        }
+      case 'next':
+        next();
+      case 'previous':
+        previous();
+      case 'seek':
+        if (positionMs != null) {
+          seek(Duration(milliseconds: positionMs));
+        }
+    }
+  }
+
   /// 手动选歌无法播放时，弹出提示对话框（提供查看 MV 和评论的入口）。
   /// 通过 [appNavigatorKey] 获取全局 context，不依赖具体 widget 重建。
   void _showUnplayableSongDialog(Song song) {
@@ -3533,6 +3603,16 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     // 封面链路日志：记录最终下发给原生的封面源（便于区分是否走本地缓存/在线 URL）
     debugPrint('[PlayerProvider] 下发通知封面 artUrl=$artUrl '
         'override=${artUrlOverride != null} fallback=${song.localPath}');
+    // iOS 锁屏/控制中心元数据（Android 走下方 MediaNotificationService 的
+    // Media3 通知路径，互不影响）。与切歌同步：本地缓存封面命中后
+    // artUrlOverride 为 file:// 路径，URLSession 可直接读取。
+    NowPlayingService.instance.updateMetadata(
+      title: song.displayName,
+      artist: song.artist,
+      album: song.album,
+      artUri: artUrl,
+      durationMs: _duration?.inMilliseconds,
+    );
     MediaNotificationService.updateNotification(
       songId: song.id,
       // 使用 displayName 剥离 .mp3 等扩展名，与 _createAudioSource 行为保持一致
