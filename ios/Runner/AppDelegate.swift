@@ -350,7 +350,7 @@ final class NowPlayingManager {
           guard let data = data, let image = UIImage(data: data) else { return }
           let artwork = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
           var info = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
-          info[MPMediaItemArtworkProperty] = artwork
+          info[MPMediaItemPropertyArtwork] = artwork
           MPNowPlayingInfoCenter.default().nowPlayingInfo = info
         }
       }.resume()
@@ -359,7 +359,7 @@ final class NowPlayingManager {
 
   private func removeArtwork() {
     var info = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
-    info[MPMediaItemArtworkProperty] = nil
+    info[MPMediaItemPropertyArtwork] = nil
     MPNowPlayingInfoCenter.default().nowPlayingInfo = info
   }
 
