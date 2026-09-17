@@ -5,7 +5,6 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
-import android.app.ActivityManager
 import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.Context
@@ -54,11 +53,13 @@ import io.github.proify.lyricon.lyric.model.Song
 class AudioPlaybackService : Service() {
     companion object {
         const val CHANNEL_ID = "md3music_audio_playback"
-        // 阶段7：保活通知专用频道（IMPORTANCE_NONE，系统默认不显示、不打扰）。
+        // 保活通知专用频道：以最低重要度静默显示，用户可长按进入系统通知设置关闭。
         // 通知对象常驻支撑 startForeground，避免服务被系统降级（DETACH 方案已废弃）。
-        const val KEEPALIVE_CHANNEL_ID = "md3music_keepalive"
+        private const val LEGACY_KEEPALIVE_CHANNEL_ID = "md3music_keepalive"
+        const val KEEPALIVE_CHANNEL_ID = "md3music_keepalive_v2"
+        const val KEEPALIVE_NOTIFICATION_TEXT = "前台保活增强歌曲留存，长按至系统通知设置关闭"
         const val NOTIFICATION_ID = 1002
-        // 阶段8：桌面歌词关闭后通知保活服务立即恢复前台（让位结束）
+        // 桌面歌词关闭后通知播放服务立即确认前台保活状态
         const val ACTION_REFRESH_FOREGROUND = "com.md3music.md3music.REFRESH_FOREGROUND"
         const val ACTION_PREV = "com.md3music.md3music.ACTION_PREV"
         const val ACTION_PLAY_PAUSE = "com.md3music.md3music.ACTION_PLAY_PAUSE"
@@ -1140,40 +1141,11 @@ class AudioPlaybackService : Service() {
     /// （日志：Service.startForeground() not allowed due to mAllowStartForeground false；
     /// uidState: SVC；code:DENIED），此时进程变为后台状态 → 后台网络被系统/ROM 限制 →
     /// 挂后台切歌时 URL/歌词/封面等新连接全部失败（现象：像断网但没断网）。
-    /// 改为常驻 startForeground：保活通知走 IMPORTANCE_NONE 渠道（系统不显示、不打扰），
+    /// 改为常驻 startForeground：保活通知走 IMPORTANCE_MIN 静默渠道，
     /// 通知对象持续存在，服务保持 FGS，进程不降级，后台网络不受限。
     private fun startForegroundDetached(builder: NotificationCompat.Builder) {
-        // 阶段8：桌面歌词开启期间保活让位——FloatingLyricService 常驻 FGS
-        // （1003 可见通知）已撑住进程前台，保活空通知（1002）不再需要，
-        // 避免系统里多个前台服务/通知并存。桌面歌词关闭后由
-        // ACTION_REFRESH_FOREGROUND 或下一次周期通知更新恢复。
-        // 阶段9：播放中 MD3MusicMediaSessionService 亦会自行 startForeground 撑住进程级 FGS，
-        // 同样让位（少一条常驻保活通知），前台保护不缺失。
-        // 用存活探测而非纯标志位：桌面歌词被系统强杀时 onDestroy 可能未执行、
-        // isRunning 残留 true，此时不能继续让位（会失去前台保护）。
-        // 只探测一次并复用：既避免重复 binder 调用，也防止两次探测之间服务状态翻转
-        // 导致「日志说让位给 A、实际让位给 B」。
-        val yieldTarget = if (isFloatingLyricActuallyRunning()) {
-            "FloatingLyricService"
-        } else if (isMedia3Foreground()) {
-            "MD3MusicMediaSessionService"
-        } else {
-            null
-        }
-        if (yieldTarget != null) {
-            // 让位给 FloatingLyricService / MD3MusicMediaSessionService 常驻 FGS 撑住进程前台。
-            // 但 startForegroundService 拉起本服务会产生"5 秒内必须 startForeground"
-            // 的系统义务，直接跳过会触发 ForegroundServiceDidNotStartInTimeException
-            // 闪退（实测 2026-09-02：桌面歌词运行中暂停/恢复等媒体状态变化重启本服务即崩）。
-            // 修复：先挂不可见保活通知履行义务，再立即移除——让位语义不变。
-            try {
-                startForeground(NOTIFICATION_ID, builder.build())
-                try { stopForeground(Service.STOP_FOREGROUND_REMOVE) } catch (_: Throwable) {}
-            } catch (_: Throwable) {}
-            foregroundStarted = false
-            Log.d(TAG, "startForegroundDetached: deferred to $yieldTarget")
-            return
-        }
+        // 不再给桌面歌词或 Media3 服务让位。播放服务自身保持 FGS，避免其他前台
+        // 服务状态切换期间出现保活空档，导致后台网络、切歌和歌曲留存被系统限制。
         try {
             startForeground(NOTIFICATION_ID, builder.build())
             foregroundStarted = true
@@ -1215,10 +1187,9 @@ class AudioPlaybackService : Service() {
         } catch (_: Exception) {}
     }
 
-    /// 阶段8：桌面歌词关闭（让位结束）后立即恢复保活前台。
-    /// 复用 KEEPALIVE_CHANNEL_ID 空通知，不等下一次 30s 周期通知更新。
+    /// 桌面歌词关闭后立即确认播放服务仍处于保活前台。
+    /// 复用 KEEPALIVE_CHANNEL_ID 通知，不等下一次 30s 周期通知更新。
     private fun refreshKeepaliveForeground() {
-        if (isFloatingLyricActuallyRunning()) return
         // 仅在播放中恢复保活前台。暂停/已停止不恢复：暂停期间无切歌需求，
         // 且本次 startService 若新建了服务实例（服务已被 stopSelf）应立即自停，
         // 避免「停止播放后关桌面歌词」残留一个常驻前台服务。
@@ -1231,7 +1202,7 @@ class AudioPlaybackService : Service() {
             val builder = NotificationCompat.Builder(this, KEEPALIVE_CHANNEL_ID)
                 .setSmallIcon(android.R.drawable.ic_media_play)
                 .setContentTitle("")
-                .setContentText("")
+                .setContentText(KEEPALIVE_NOTIFICATION_TEXT)
                 .setContentIntent(pendingIntent)
                 .setOngoing(true)
                 .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
@@ -1241,33 +1212,6 @@ class AudioPlaybackService : Service() {
                 .setSilent(true)
             startForegroundDetached(builder)
         } catch (_: Throwable) {}
-    }
-
-    /// 阶段8：桌面歌词服务是否真实存活（标志位 + 服务存活探测）。
-    /// onDestroy 在进程被系统强杀时可能不执行，标志位会残留，须以服务实况为准。
-    private fun isFloatingLyricActuallyRunning(): Boolean {
-        if (!FloatingLyricService.isRunning) return false
-        return try {
-            val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-            am.getRunningServices(100)
-                .any { it.service.className == FloatingLyricService::class.java.name }
-        } catch (_: Exception) {
-            true // 探测失败时保守按标志位处理（不打断正常让位）
-        }
-    }
-
-    /// 阶段9：媒体3 会话承载服务（MD3MusicMediaSessionService）是否处于前台。
-    /// 播放中它由 media3 自己调用 startForeground 撑住「进程级 FGS」，
-    /// 此时本服务再挂一条保活通知属于重复：让位可以少一条常驻通知，且不损失前台保护。
-    private fun isMedia3Foreground(): Boolean {
-        return try {
-            val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-            am.getRunningServices(100).any {
-                it.service.className == MD3MusicMediaSessionService::class.java.name && it.foreground
-            }
-        } catch (_: Exception) {
-            false // 探测失败按「未在前台」处理：退回常驻保活通知，宁可多一条也别掉前台保护
-        }
     }
 
     /// 线控耳机媒体键 → 派发命令到 Dart 端。
@@ -1627,22 +1571,24 @@ class AudioPlaybackService : Service() {
             }
             manager.createNotificationChannel(channel)
 
-            // 保活通知专用频道：IMPORTANCE_NONE 使「播放保活」在系统
-            // 「应用信息 → 通知」里默认关闭（不显示、不打扰），用户仍可手动开启。
+            // 保活通知专用频道：最低重要度静默显示；用户可长按通知进入系统设置关闭。
             try {
+                // 旧频道以 IMPORTANCE_NONE 创建，Android 不保证同 ID 删除重建后会采用
+                // 新重要度；迁移到 v2 ID，并清理旧的隐藏频道，确保升级安装后能显示。
+                manager.deleteNotificationChannel(LEGACY_KEEPALIVE_CHANNEL_ID)
                 val existingKeepalive = manager.getNotificationChannel(KEEPALIVE_CHANNEL_ID)
                 if (existingKeepalive != null &&
-                    existingKeepalive.importance != NotificationManager.IMPORTANCE_NONE) {
-                    // 渠道一旦创建 importance 不可改，必须先删重建让默认关闭生效
+                    existingKeepalive.importance != NotificationManager.IMPORTANCE_MIN) {
+                    // 渠道一旦创建 importance 不可改，必须先删后按最低重要度重建
                     manager.deleteNotificationChannel(KEEPALIVE_CHANNEL_ID)
                 }
                 manager.createNotificationChannel(
                     NotificationChannel(
                         KEEPALIVE_CHANNEL_ID,
                         "播放保活",
-                        NotificationManager.IMPORTANCE_NONE
+                        NotificationManager.IMPORTANCE_MIN
                     ).apply {
-                        description = "静默保活（不显示）"
+                        description = "前台保活增强歌曲留存，可在系统通知设置中关闭"
                         setShowBadge(false)
                         lockscreenVisibility = NotificationCompat.VISIBILITY_PRIVATE
                         setSound(null, null)
@@ -1928,12 +1874,12 @@ class AudioPlaybackService : Service() {
         val pendingIntent = launchPendingIntent()
 
         // 方案B阶段5：自定义 MediaSessionCompat 已移除，展示层由媒体3 now-playing 通知承载。
-        // 本服务仍须 startForeground 保持前台（Android 8+ 硬性要求），故构建「静默保活通知」：
-        // 阶段7：内容置空 + IMPORTANCE_NONE 频道常驻（不 DETACH，避免服务被系统降级为 SVC）。
+        // 本服务仍须 startForeground 保持前台（Android 8+ 硬性要求），故构建静默保活通知。
+        // 使用最低重要度频道常驻（不 DETACH），并给出关闭入口提示。
         val builder = NotificationCompat.Builder(this, KEEPALIVE_CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_media_play)
-            .setContentTitle("")          // 空内容：IMPORTANCE_NONE 渠道系统不显示
-            .setContentText("")
+            .setContentTitle("")
+            .setContentText(KEEPALIVE_NOTIFICATION_TEXT)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
             .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)

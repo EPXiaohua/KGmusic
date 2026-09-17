@@ -109,6 +109,9 @@ class KugouProvider extends ChangeNotifier {
         await _loadLocalSignedDays();
         await _fetchUserInfo();
         await autoReceiveVipIfNeeded();
+        // 每次打开 App 自动从云端同步一次听歌时长（拉取服务器权威 d_sec 并抬升
+        // 本地基准）。放在最后：不阻塞上面的关键路径，且失败由方法内部吞掉。
+        await getGradeInfo();
       }
     } catch (_) {}
   }
@@ -342,8 +345,6 @@ class KugouProvider extends ChangeNotifier {
   KugouUserVipDetail? get vipInfo => _vipInfo;
   KugouGradeInfo? get gradeInfo => _gradeInfo;
 
-  /// 未上报（服务器未记账）的听歌时长（秒），来自本地累计服务
-  int get unreportedSeconds => ListeningGradeService.instance.unreportedSeconds;
   Map<String, dynamic>? get vipMonthRecord => _vipMonthRecord;
   Set<String> get localSignedDays => _localSignedDays;
   Map<String, dynamic>? get userHistoryData => _userHistoryData;
@@ -2126,23 +2127,28 @@ class KugouProvider extends ChangeNotifier {
   }
 
   /// 拉取听歌等级信息，并同步服务器累计时长到本地基准（避免上报被拒）。
-  Future<void> getGradeInfo() async {
+  ///
+  /// 返回是否成功拿到服务器数据 —— 供「同步云端时长」按钮给出真实反馈
+  /// （此前该方法是 `void` 且静默吞异常，调用方无从判断成败）。
+  Future<bool> getGradeInfo() async {
     try {
       final r = await _apiClient.getGradeInfo();
-      if (r != null) {
-        _gradeInfo = KugouGradeInfo.fromJson(r);
-        // 打印服务器实际返回的 d_sec，用于确认服务器是否记账（排查用）
-        // ignore: avoid_print
-        print(
-          '[GradeQuery] server d_sec=${_gradeInfo?.dSec} grade=${_gradeInfo?.pGrade} point=${_gradeInfo?.pCurrentPoint}/${_gradeInfo?.pNextGradePoint}',
-        );
-        final serverDsec = _gradeInfo?.dSec;
-        if (serverDsec != null) {
-          ListeningGradeService.instance.resyncFromServer(serverDsec);
-        }
-        notifyListeners();
+      if (r == null) return false;
+      _gradeInfo = KugouGradeInfo.fromJson(r);
+      // 打印服务器实际返回的 d_sec，用于确认服务器是否记账（排查用）
+      // ignore: avoid_print
+      print(
+        '[GradeQuery] server d_sec=${_gradeInfo?.dSec} grade=${_gradeInfo?.pGrade} point=${_gradeInfo?.pCurrentPoint}/${_gradeInfo?.pNextGradePoint}',
+      );
+      final serverDsec = _gradeInfo?.dSec;
+      if (serverDsec != null) {
+        await ListeningGradeService.instance.resyncFromServer(serverDsec);
       }
-    } catch (_) {}
+      notifyListeners();
+      return true;
+    } catch (_) {
+      return false;
+    }
   }
 
   Future<void> getVipMonthRecord() async {

@@ -166,6 +166,8 @@ class KugouEndpoints {
   static const String userDetail = '/user/detail';
   static const String userVipDetail = '/user/vip/detail';
   static const String userGradeInfo = '/user/grade/info';
+  /// CSCC 真实播放事件上报（start/end），见 Rust `listen_report.rs`。
+  static const String userListenReport = '/user/listen/report';
   static const String userPlaylist = '/user/playlist';
   static const String userFollow = '/user/follow';
   static const String userFollowMessage = '/user/follow/message';

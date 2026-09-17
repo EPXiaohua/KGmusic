@@ -1,20 +1,19 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:ui' show PlatformDispatcher;
-
 import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 
 /// 诊断日志级别
 enum DiagnosticLogLevel {
-  info('I'),
-  warn('W'),
-  error('E');
+  debug('DEBUG'),
+  info('INFO'),
+  warning('WARNING'),
+  error('ERROR');
 
   const DiagnosticLogLevel(this.tag);
 
-  /// 日志行中的单字母级别标记
+  /// 日志行中的完整级别标记
   final String tag;
 }
 
@@ -84,7 +83,8 @@ class DiagnosticLogger {
     try {
       // Web 无本地文件系统，跳过（入口侧同样有守卫）
       if (kIsWeb) return;
-      _logDir = dir ??
+      _logDir =
+          dir ??
           Directory(
             '${(await getApplicationSupportDirectory()).path}/diagnostic_logs',
           );
@@ -100,16 +100,26 @@ class DiagnosticLogger {
     }
   }
 
+  /// 记录 debug 级别日志
+  void d(String message) => _append(DiagnosticLogLevel.debug, message);
+
   /// 记录 info 级别日志
   void i(String message) => _append(DiagnosticLogLevel.info, message);
 
-  /// 记录 warn 级别日志
-  void w(String message) => _append(DiagnosticLogLevel.warn, message);
+  /// 记录 warning 级别日志
+  void w(String message) => _append(DiagnosticLogLevel.warning, message);
 
   /// 记录 error 级别日志
   void e(String message) => _append(DiagnosticLogLevel.error, message);
 
-  /// 格式化一行日志：`2026-08-31 09:05:03.012 [W] hello`
+  /// 语义清晰的完整方法名；短方法名保留以兼容现有调用。
+  void debug(String message) => d(message);
+  void info(String message) => i(message);
+  void warning(String message) => w(message);
+  void error(String message) => e(message);
+
+  /// 格式化日志：`2026-08-31 09:05:03.012 [WARNING] hello`。
+  /// 多行消息的每一行都带时间与级别，便于导出后按级别检索。
   static String formatLine(
     DateTime time,
     DiagnosticLogLevel level,
@@ -119,8 +129,13 @@ class DiagnosticLogger {
     String three(int v) => v.toString().padLeft(3, '0');
     final ts =
         '${time.year.toString().padLeft(4, '0')}-${two(time.month)}-${two(time.day)} '
-            '${two(time.hour)}:${two(time.minute)}:${two(time.second)}.${three(time.millisecond)}';
-    return '$ts [${level.tag}] $message';
+        '${two(time.hour)}:${two(time.minute)}:${two(time.second)}.${three(time.millisecond)}';
+    final prefix = '$ts [${level.tag}] ';
+    final lines = message
+        .replaceAll('\r\n', '\n')
+        .replaceAll('\r', '\n')
+        .split('\n');
+    return lines.map((line) => '$prefix$line').join('\n');
   }
 
   void _append(DiagnosticLogLevel level, String message) {
@@ -133,19 +148,20 @@ class DiagnosticLogger {
 
   /// 强制把缓冲写入磁盘（导出前必须调用，保证内容完整）。
   Future<void> flush() async {
-    // 若已有刷盘进行中，等待它完成（串行化）：避免节流触发的非等待刷盘
-    // 尚在进行时本次刷盘被跳过，导致刚写入的内容滞后落盘、滚动未执行。
-    final active = _activeFlush;
-    if (active != null) {
-      await active;
-      return;
-    }
-    if (_pending.isEmpty || _sink == null) return;
-    _activeFlush = _writePending();
+    // 串接到已有刷盘之后。这样导出与定时刷盘并发时，前一次写盘期间新追加的
+    // 内容也会由本次操作落盘，不会遗漏最后几行日志。
+    final previous = _activeFlush ?? Future<void>.value();
+    final operation = previous.then((_) async {
+      if (_pending.isEmpty || _sink == null) return;
+      await _writePending();
+    });
+    _activeFlush = operation;
     try {
-      await _activeFlush;
+      await operation;
     } finally {
-      _activeFlush = null;
+      if (identical(_activeFlush, operation)) {
+        _activeFlush = null;
+      }
     }
   }
 
@@ -244,7 +260,7 @@ class DiagnosticLogger {
     _originalDebugPrint = debugPrint;
     final original = _originalDebugPrint!;
     debugPrint = (String? message, {int? wrapWidth}) {
-      instance.i(message ?? '');
+      instance.d(message ?? '');
       original(message, wrapWidth: wrapWidth);
     };
   }

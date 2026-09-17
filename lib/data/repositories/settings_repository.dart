@@ -3,6 +3,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../core/services/audio_service_io.dart';
 import '../../core/services/volume_normalization_service.dart';
+import '../../modules/player/car_mode_layout.dart';
 import '../../services/kugou_api/kugou_api_client.dart';
 
 class SettingsRepository {
@@ -664,6 +665,8 @@ class SettingsRepository {
   // ===== 主页 Tab 配置 =====
   static const String _keyTabOrder = 'settings_tab_order';
   static const String _keyHiddenTabs = 'settings_hidden_tabs';
+  static const String _keyTabConfigMigrationVersion =
+      'settings_tab_config_migration_version';
 
   /// 读取 tab 排序（存储为 tab id 列表）。
   /// 返回 null 表示使用默认顺序。
@@ -687,6 +690,17 @@ class SettingsRepository {
   Future<void> setHiddenTabs(Set<String> hidden) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setStringList(_keyHiddenTabs, hidden.toList());
+  }
+
+  /// 读取主页 Tab 配置迁移版本。
+  Future<int> getTabConfigMigrationVersion() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getInt(_keyTabConfigMigrationVersion) ?? 0;
+  }
+
+  Future<void> setTabConfigMigrationVersion(int version) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_keyTabConfigMigrationVersion, version);
   }
 
   // ===== 桌面快捷方式配置 =====
@@ -893,5 +907,51 @@ class SettingsRepository {
   Future<void> setCloseLocalMusicComments(bool value) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(_keyCloseLocalMusicComments, value);
+  }
+
+  // ===== 车机模式 =====
+  static const String _keyCarModeEnabled = 'settings_car_mode_enabled';
+  static const String _keyCarModePanelRatio = 'settings_car_mode_panel_ratio';
+  static const String _keyCarModePanelSide = 'settings_car_mode_panel_side';
+
+  /// 「车机模式」开关，默认关闭。
+  /// 开启后任何界面（设置页 / 登录页 / 引导页 / 用户协议页除外）常驻一块
+  /// 全屏播放器面板，且全站不再显示 MiniPlayer。
+  Future<bool> getCarModeEnabled() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_keyCarModeEnabled) ?? false;
+  }
+
+  Future<void> setCarModeEnabled(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_keyCarModeEnabled, value);
+  }
+
+  /// 常驻播放器面板的宽度占比（0.20~0.50），默认 0.30。
+  /// 越界值一律夹回合法区间：手改 prefs / 历史脏数据也不会把面板撑爆。
+  Future<double> getCarModePanelRatio() async {
+    final prefs = await SharedPreferences.getInstance();
+    final value = prefs.getDouble(_keyCarModePanelRatio);
+    if (value == null) return kCarModePanelDefaultRatio;
+    return value.clamp(kCarModePanelMinRatio, kCarModePanelMaxRatio);
+  }
+
+  Future<void> setCarModePanelRatio(double value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(
+      _keyCarModePanelRatio,
+      value.clamp(kCarModePanelMinRatio, kCarModePanelMaxRatio),
+    );
+  }
+
+  /// 常驻播放器面板的停靠位置，默认左侧。
+  Future<CarModePanelSide> getCarModePanelSide() async {
+    final prefs = await SharedPreferences.getInstance();
+    return CarModePanelSide.fromIndex(prefs.getInt(_keyCarModePanelSide));
+  }
+
+  Future<void> setCarModePanelSide(CarModePanelSide side) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_keyCarModePanelSide, side.index);
   }
 }

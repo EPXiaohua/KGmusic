@@ -3111,6 +3111,46 @@ class KugouApiClient {
     );
   }
 
+  /// CSCC 真实播放事件上报（`/user/listen/report`）。
+  ///
+  /// 对应 Rust `listen_report.rs` 的三段式协议。**接口不做重试**：上游超时也可能
+  /// 已记账，重试会造成重复上报，故内部只用 `noCache` 保证不命中本地缓存。
+  ///
+  /// [event] `start` / `end`
+  /// [mixsongid] 必填，歌曲 mixsongid（= `Song.albumAudioId`）
+  /// [duration] `end` 必填，实际播放毫秒数（已扣除暂停与拖动）
+  /// [state] `end` 的播放结束状态，默认「完整播放」
+  /// [deviceModel]/[systemVersion] 可选，缺省由 Rust 按项目 dev 配置兜底
+  /// [timestamp] 必填变化值，避免命中 Rust apicache（POST 也需放 URL query）
+  Future<Map<String, dynamic>?> reportListenEvent({
+    required String event,
+    required String mixsongid,
+    int? duration,
+    String? state,
+    String? deviceModel,
+    String? systemVersion,
+    int? screenWidth,
+    int? screenHeight,
+  }) async {
+    final params = <String, dynamic>{
+      'event': event,
+      'mixsongid': mixsongid,
+      // CSCC 与等级接口一样有响应缓存，必须带变化的时间戳绕过（POST 亦然）
+      'timestamp': DateTime.now().millisecondsSinceEpoch.toString(),
+    };
+    if (duration != null) params['duration'] = duration;
+    if (state != null) params['state'] = state;
+    if (deviceModel != null) params['device_model'] = deviceModel;
+    if (systemVersion != null) params['system_version'] = systemVersion;
+    if (screenWidth != null) params['screen_width'] = screenWidth;
+    if (screenHeight != null) params['screen_height'] = screenHeight;
+    return await _get(
+      KugouEndpoints.userListenReport,
+      queryParameters: params,
+      noCache: true,
+    );
+  }
+
   // ==================== Playlist Management ====================
 
   Future<Map<String, dynamic>?> createPlaylist(

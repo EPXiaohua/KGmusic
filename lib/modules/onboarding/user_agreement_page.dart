@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 import 'package:md3music/providers/theme_provider.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import '../player/car_mode_panel.dart';
 
 /// 用户协议页（首次启动展示）。
 ///
@@ -78,12 +79,26 @@ class UserAgreementPage extends StatefulWidget {
   }
 }
 
-class _UserAgreementPageState extends State<UserAgreementPage> {
+class _UserAgreementPageState extends State<UserAgreementPage>
+    with CarModePanelSuppressor<UserAgreementPage> {
   bool _agreed = false;
 
   /// SharedPreferences key：标记用户已同意协议。
   /// 设置后下次冷启动不再展示。
   static const String _kAcceptedKey = 'user_agreement_accepted_v1';
+
+  @override
+  void initState() {
+    super.initState();
+    // 本页不显示车机模式常驻播放器面板
+    suppressCarModePanel();
+  }
+
+  @override
+  void dispose() {
+    releaseCarModePanel();
+    super.dispose();
+  }
 
   Future<void> _onAgree() async {
     if (!_agreed) return;

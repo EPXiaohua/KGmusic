@@ -9,6 +9,7 @@ import '../../services/kugou_api/kugou_models.dart';
 import '../../widgets/scroll_aware_app_bar.dart';
 import '../../widgets/song_list_item.dart';
 import '../player/mini_player.dart';
+import 'scene_content_filter.dart';
 
 /// 场景音乐音乐列表页（/scene/audio/list?id=scene_id&module_id=module_id&tag=tag_id）。
 ///
@@ -104,16 +105,7 @@ class _SceneAudioListPageState extends State<SceneAudioListPage> {
 
   /// 从响应中提取列表（防御：data 可能是 Map 或 List，list 字段名多变）
   List<dynamic> _listOf(Map<String, dynamic>? json) {
-    if (json == null) return const [];
-    final d = json['data'];
-    if (d is Map<String, dynamic>) {
-      final l = d['list'] ?? d['info'] ?? d['items'] ?? d['song_list'];
-      if (l is List) return l;
-    }
-    if (d is List) return d;
-    final l = json['list'] ?? json['info'];
-    if (l is List) return l;
-    return const [];
+    return extractSceneList(json) ?? const [];
   }
 
   @override

@@ -94,7 +94,7 @@ class LyricPreferences extends ChangeNotifier {
   static const double maxGlowThresholdFactor = 2.0;
 
   /// 辉光触发阈值系数默认值
-  static const double defaultGlowThresholdFactor = 1.6;
+  static const double defaultGlowThresholdFactor = 1.2;
 
   /// 非当前行缩放最小值。
   ///
@@ -203,10 +203,10 @@ class LyricPreferences extends ChangeNotifier {
   double _fontSize = defaultUserFontSize;
   double _lineSpacing = defaultLineSpacing;
   int _fontWeight = defaultFontWeight;
-  bool _useGaussianBlur = true;
+  bool _useGaussianBlur = false;
   bool _useGlowEffect = true;
   bool _useFlowingBackground = false;
-  bool _useDuetLayout = true;
+  bool _useDuetLayout = false;
   bool _showTranslation = true;
   LyricDisplayMode _displayMode = LyricDisplayMode.translation;
   LyricFontSource _fontSource = LyricFontSource.system;
@@ -215,7 +215,7 @@ class LyricPreferences extends ChangeNotifier {
   bool _ecoMode = true;
   // 动态字体颜色（默认开启，仅 AM 播放器可用）：当前行歌词颜色按「70% 白 + 30% 封面提取色」混色
   bool _useDynamicLyricColor = true;
-  // 辉光触发阈值系数（默认 1.6）：触发阈值 = 歌词字长中位数 × 该系数
+  // 辉光触发阈值系数（默认 1.2）：触发阈值 = 歌词字长中位数 × 该系数
   double _glowThresholdFactor = defaultGlowThresholdFactor;
   // 非当前行缩放（默认 0.97）：清晰层非当前行与 AM 模糊层共用此值
   double _inactiveScale = defaultInactiveScale;
@@ -318,10 +318,10 @@ class LyricPreferences extends ChangeNotifier {
     _fontWeight =
         (prefs.getInt(_keyFontWeight) ?? _deviceDefaultFontWeight)
             .clamp(minFontWeight, maxFontWeight);
-    _useGaussianBlur = prefs.getBool(_keyUseGaussianBlur) ?? true;
+    _useGaussianBlur = prefs.getBool(_keyUseGaussianBlur) ?? false;
     _useGlowEffect = prefs.getBool(_keyUseGlowEffect) ?? true;
     _useFlowingBackground = prefs.getBool(_keyUseFlowingBackground) ?? false;
-    _useDuetLayout = prefs.getBool(_keyUseDuetLayout) ?? true;
+    _useDuetLayout = prefs.getBool(_keyUseDuetLayout) ?? false;
     _showTranslation = prefs.getBool(_keyShowTranslation) ?? true;
     _displayMode = _displayModeFromName(prefs.getString(_keyDisplayMode));
     _fontSource = _fontSourceFromName(prefs.getString(_keyFontSource));
@@ -442,7 +442,7 @@ class LyricPreferences extends ChangeNotifier {
   /// 设置辉光触发阈值系数并持久化。
   ///
   /// 触发阈值 = 歌词字长中位数 × 该系数，范围 [minGlowThresholdFactor]~
-  /// [maxGlowThresholdFactor]（默认 [defaultGlowThresholdFactor]=1.4）。
+  /// [maxGlowThresholdFactor]（默认 [defaultGlowThresholdFactor]=1.2）。
   /// 系数越小越容易触发辉光。
   Future<void> setGlowThresholdFactor(double value) async {
     final clamped =
@@ -610,10 +610,10 @@ class LyricPreferences extends ChangeNotifier {
     _fontSize = _deviceDefaultFontSize;
     _lineSpacing = _deviceDefaultLineSpacing;
     _fontWeight = _deviceDefaultFontWeight;
-    _useGaussianBlur = true;
+    _useGaussianBlur = false;
     _useGlowEffect = true;
     _useFlowingBackground = false;
-    _useDuetLayout = true;
+    _useDuetLayout = false;
     _showTranslation = true;
     _displayMode = LyricDisplayMode.translation;
     _fontSource = LyricFontSource.system;

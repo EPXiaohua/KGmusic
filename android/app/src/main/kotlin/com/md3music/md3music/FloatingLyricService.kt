@@ -98,6 +98,11 @@ class FloatingLyricService : Service() {
         // 进程前台，AudioPlaybackService 据此让位（不再显示保活空通知 1002）。
         @Volatile
         var isRunning = false
+        // 悬浮窗窗口是否已真正 addView 成功。与 isRunning 分开存：MainActivity
+        // 据此区分"服务存活但窗口未添加"（权限竞态/显示层拒绝）与真正可显示，
+        // 并回填 startFloatingLyric 的真实结果，杜绝开关状态与窗口不一致。
+        @Volatile
+        var viewAdded = false
         // 屏幕亮灭（熄屏时通知 Dart 侧 tick 休眠省电；点亮恢复）
         @Volatile
         var screenOn = true
@@ -146,15 +151,21 @@ class FloatingLyricService : Service() {
         // 若从 onCreate 逸出会杀死整个播放器进程，连带重建并清空 MediaSession actions。
         if (!hasOverlayPermission()) {
             Log.w(TAG, "Overlay permission missing; floating lyric service stopped")
+            MainActivity.completeFloatingStart(false)
             stopSelf()
             return
         }
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, createNotification())
         if (!createFloatingView()) {
+            Log.w(TAG, "Floating view not created; service stopped")
+            MainActivity.completeFloatingStart(false)
             stopSelf()
             return
         }
+        viewAdded = true
+        // 通知 MainActivity 回填 startFloatingLyric 的真实结果（悬浮窗已成功 addView）
+        MainActivity.completeFloatingStart(true)
         // 熄屏感知：动态注册 SCREEN_OFF/ON（照搬锁屏歌词接收器模式），
         // 转发到 Dart 做 tick 门控（熄屏且未开锁屏歌词时休眠省电）
         try {
@@ -919,6 +930,7 @@ class FloatingLyricService : Service() {
 
     override fun onDestroy() {
         isRunning = false
+        viewAdded = false
         instance = null
         screenReceiver?.let {
             try { unregisterReceiver(it) } catch (_: Exception) {}

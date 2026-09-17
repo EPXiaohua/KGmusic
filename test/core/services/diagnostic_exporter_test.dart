@@ -42,8 +42,9 @@ void main() {
 
   test('packageZip 打包目录内全部文件', () async {
     File('${tempDir.path}/app.log').writeAsStringSync('log-content');
-    File('${tempDir.path}/diagnostic_info.txt')
-        .writeAsStringSync('info-content');
+    File(
+      '${tempDir.path}/diagnostic_info.txt',
+    ).writeAsStringSync('info-content');
     final zip = await DiagnosticExporter.packageZip(
       sourceDir: tempDir,
       outputDir: tempDir,
@@ -53,5 +54,29 @@ void main() {
     final archive = ZipDecoder().decodeBytes(zip.readAsBytesSync());
     final names = archive.files.map((f) => f.name).toSet();
     expect(names, containsAll(['app.log', 'diagnostic_info.txt']));
+  });
+
+  test('buildLogSummary 汇总新版、旧版和 Android 日志级别', () {
+    final summary = DiagnosticExporter.buildLogSummary(
+      logFiles: {
+        'app.log': [
+          '2026-09-16 10:00:00.000 [DEBUG] debug',
+          '2026-09-16 10:00:01.000 [INFO] info',
+          '2026-09-16 10:00:02.000 [WARNING] warning',
+          '2026-09-16 10:00:03.000 [ERROR] error',
+          '2026-09-16 10:00:04.000 [W] legacy warning',
+        ].join('\n'),
+        'android.log': [
+          '09-16 10:01:00.000  123  456 D MD3CarLyrics: debug',
+          '09-16 10:01:01.000  123  456 E MD3CarLyrics: error',
+        ].join('\n'),
+      },
+      exportTime: DateTime(2026, 9, 16, 10, 2),
+    );
+
+    expect(summary, contains('全部日志: DEBUG=2 INFO=1 WARNING=2 ERROR=2'));
+    expect(summary, contains('[app.log]'));
+    expect(summary, contains('legacy warning'));
+    expect(summary, contains('[android.log]'));
   });
 }

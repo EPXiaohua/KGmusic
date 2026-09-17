@@ -9,6 +9,8 @@ import android.annotation.TargetApi
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
@@ -65,6 +67,10 @@ class MainActivity : FlutterActivity() {
         // MV 视频宽高比（宽/高），用于画中画窗口比例
         @Volatile private var pipAspectRatio: Rational = Rational(16, 9)
 
+        // 悬浮窗启动结果回填的超时兜底：正常 onCreate 秒级完成；个别 ROM 若因故
+        // 未触发 onCreate，在此按当前状态结算，避免 Dart 端 startFloatingLyric 永久挂起。
+        private const val FLOATING_START_TIMEOUT_MS = 5000L
+
         // 记录自定义插件已注册到的引擎：provideFlutterEngine 复用后台（headless）
         // 引擎时 configureFlutterEngine 会再次执行，若对同一引擎重复注册
         // UsbAudioPlugin 会注册两个拔插广播接收器（无法 unregister），导致 USB
@@ -90,6 +96,25 @@ class MainActivity : FlutterActivity() {
 
         fun sendDesktopLyricConfigChanged(config: Map<String, Any?>) {
             cachedChannel?.invokeMethod("desktopLyricConfigChanged", config)
+        }
+
+        // ===== 悬浮窗启动结果回填（同进程直达，杜绝"假开启"） =====
+        // startFloatingLyric 会把结果挂起，等服务 onCreate 真正完成悬浮窗
+        // addView 后再回填真实结果；超时则按当前状态结算，避免 Dart 永久等待。
+        @Volatile private var pendingFloatingStart: MethodChannel.Result? = null
+        private var pendingFloatingTimeout: Runnable? = null
+        private val floatingHandler = Handler(Looper.getMainLooper())
+
+        /** FloatingLyricService 在 onCreate 完成 addView（或失败 stopSelf）后回填。 */
+        fun completeFloatingStart(success: Boolean) {
+            floatingHandler.post {
+                pendingFloatingStart?.let { r ->
+                    pendingFloatingStart = null
+                    pendingFloatingTimeout?.let { floatingHandler.removeCallbacks(it) }
+                    pendingFloatingTimeout = null
+                    if (success) r.success(true) else r.success(false)
+                }
+            }
         }
     }
 
@@ -274,6 +299,9 @@ class MainActivity : FlutterActivity() {
 
             // 注册 Lyrico 外部编辑插件：本地歌曲经 FileProvider 交给 Lyrico 编辑
             ExternalEditorPlugin(this).register(flutterEngine)
+
+            // 注册诊断日志插件：导出当前应用进程的 Android 原生日志
+            DiagnosticLogPlugin().register(flutterEngine)
         }
 
         // 初始化本地 API 服务器（KugouApiService 含 JNI external 方法，
@@ -298,13 +326,24 @@ class MainActivity : FlutterActivity() {
                         startActivity(intent)
                         result.error("PERMISSION_DENIED", "需要悬浮窗权限", null)
                     } else {
+                        // 服务已在运行且悬浮窗已成功添加：直接成功（避免重复拉起服务）
+                        if (FloatingLyricService.isRunning && FloatingLyricService.viewAdded) {
+                            result.success(true)
+                            return@setMethodCallHandler
+                        }
+                        // 挂起结果：等服务 onCreate 真正完成 addView（或权限竞态失败
+                        // stopSelf）后由 completeFloatingStart 回填真实结果，不再提前
+                        // 返回 success，杜绝"开关已开但悬浮窗未出现"的假开启。
+                        pendingFloatingStart = result
+                        val timeout = Runnable { completeFloatingStart(FloatingLyricService.viewAdded) }
+                        pendingFloatingTimeout = timeout
+                        floatingHandler.postDelayed(timeout, FLOATING_START_TIMEOUT_MS)
                         val intent = Intent(this, FloatingLyricService::class.java).apply {
                             action = FloatingLyricService.ACTION_UPDATE_LYRIC
                             putExtra(FloatingLyricService.EXTRA_LYRIC, call.argument<String>("lyric") ?: "")
                             putExtra(FloatingLyricService.EXTRA_TITLE, call.argument<String>("title") ?: "")
                         }
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent) else startService(intent)
-                        result.success(true)
                     }
                 }
                 "updateLyric" -> {

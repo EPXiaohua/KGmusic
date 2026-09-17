@@ -8,7 +8,11 @@ import 'package:flutter/services.dart';
 /// - [FontSource.bundled]：已废弃（内置 SimHei 已移除，仅保留枚举值以稳定
 ///   `fontSource.index` 的原生契约 0=system 1=bundled 2=custom），行为等同 system
 /// - [FontSource.custom]：使用用户通过 SAF 选择的 TTF/OTF 文件
-enum FontSource { system, bundled, custom }
+enum FontSource {
+  system,
+  bundled,
+  custom,
+}
 
 /// 自定义字体加载与选择服务。
 ///

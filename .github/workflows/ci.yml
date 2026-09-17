@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [main, master]
   workflow_dispatch:
+    inputs:
+      apple_only:
+        description: '仅构建 Apple Music 包名的 arm64 APK'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -107,6 +113,7 @@ jobs:
 
       # 构建 Release APK（按 ABI 拆分）
       - name: Flutter build APK (release, split per ABI)
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.apple_only == false }}
         run: |
           flutter build apk --release --split-per-abi \
             --dart-define=APP_VERSION=ci-${{ github.sha }}
@@ -119,13 +126,17 @@ jobs:
           apk_dir="build/app/outputs/flutter-apk"
           standard_apk="$apk_dir/app-arm64-v8a-release.apk"
           standard_backup="$RUNNER_TEMP/app-arm64-v8a-release.apk"
-          cp "$standard_apk" "$standard_backup"
+          if [[ -f "$standard_apk" ]]; then
+            cp "$standard_apk" "$standard_backup"
+          fi
           flutter build apk --release --split-per-abi \
             --target-platform android-arm64 \
             --android-project-arg=md3ApplicationId=com.apple.android.music \
             --dart-define=APP_VERSION=ci-${{ github.sha }}
           mv "$standard_apk" "$apk_dir/app-apple-music-arm64-v8a-release.apk"
-          mv "$standard_backup" "$standard_apk"
+          if [[ -f "$standard_backup" ]]; then
+            mv "$standard_backup" "$standard_apk"
+          fi
 
       - name: Verify APKs
         run: |
@@ -142,13 +153,16 @@ jobs:
             fi
           done
           aapt2="$ANDROID_HOME/build-tools/36.0.0/aapt2"
-          standard_id="$("$aapt2" dump badging build/app/outputs/flutter-apk/app-arm64-v8a-release.apk | sed -n "s/^package: name='\([^']*\)'.*/\1/p")"
           apple_id="$("$aapt2" dump badging build/app/outputs/flutter-apk/app-apple-music-arm64-v8a-release.apk | sed -n "s/^package: name='\([^']*\)'.*/\1/p")"
-          test "$standard_id" = "com.md3music.md3music"
           test "$apple_id" = "com.apple.android.music"
+          if [[ -f build/app/outputs/flutter-apk/app-arm64-v8a-release.apk ]]; then
+            standard_id="$("$aapt2" dump badging build/app/outputs/flutter-apk/app-arm64-v8a-release.apk | sed -n "s/^package: name='\([^']*\)'.*/\1/p")"
+            test "$standard_id" = "com.md3music.md3music"
+          fi
 
       # 上传构建产物（每个 APK 单独一个 artifact，方便下载）
       - name: Upload arm64-v8a APK
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.apple_only == false }}
         uses: actions/upload-artifact@v4
         with:
           name: app-arm64-v8a-release
@@ -157,6 +171,7 @@ jobs:
           retention-days: 7
 
       - name: Upload armeabi-v7a APK
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.apple_only == false }}
         uses: actions/upload-artifact@v4
         with:
           name: app-armeabi-v7a-release
@@ -165,6 +180,7 @@ jobs:
           retention-days: 7
 
       - name: Upload x86_64 APK
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.apple_only == false }}
         uses: actions/upload-artifact@v4
         with:
           name: app-x86_64-release

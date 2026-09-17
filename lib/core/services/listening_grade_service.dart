@@ -86,14 +86,6 @@ class ListeningGradeService {
     _onlinePlaying = value;
   }
 
-  /// 未上报（服务器未记账）的听歌时长（秒）：
-  /// 本地累计基准 - 服务器累计值。仅当已知服务器值且本地高于服务器时非 0。
-  int get unreportedSeconds {
-    if (_serverDsec <= 0) return 0;
-    final d = _syncedDsec - _serverDsec;
-    return d > 0 ? d : 0;
-  }
-
   /// 查询到服务器 d_sec 后调用：记录服务器值，本地基准只升不降，避免上报被拒。
   Future<void> resyncFromServer(int serverDsec) async {
     _serverDsec = serverDsec;

@@ -11,6 +11,7 @@ import '../../data/repositories/settings_repository.dart';
 import '../../providers/favorites_provider.dart';
 import '../../providers/player_provider.dart';
 import '../../providers/theme_provider.dart';
+import '../../providers/car_mode_provider.dart';
 import '../../widgets/smart_artwork_image.dart';
 import 'full_player_route.dart';
 
@@ -315,6 +316,13 @@ class _MiniPlayerState extends State<MiniPlayer>
 
     if (currentSong == null) {
       _hadSong = false; // 清空后再次播放可重弹
+      return const SizedBox.shrink();
+    }
+
+    // 车机模式：播放器常驻在侧边面板里，任何界面都不再显示 MiniPlayer。
+    // 判定用 enabled 而不是 panelVisible —— 设置页 / 登录页虽然不显示面板，
+    // 但同样不该出现迷你条，否则「开了车机模式还有迷你条」前后不一致。
+    if (context.watch<CarModeProvider>().enabled) {
       return const SizedBox.shrink();
     }
 

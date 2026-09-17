@@ -22,10 +22,23 @@ void main() {
   test('formatLine 输出时间戳、级别与消息', () {
     final line = DiagnosticLogger.formatLine(
       DateTime(2026, 8, 31, 9, 5, 3, 12),
-      DiagnosticLogLevel.warn,
+      DiagnosticLogLevel.warning,
       'hello',
     );
-    expect(line, '2026-08-31 09:05:03.012 [W] hello');
+    expect(line, '2026-08-31 09:05:03.012 [WARNING] hello');
+  });
+
+  test('多行日志的每一行都带相同级别', () {
+    final line = DiagnosticLogger.formatLine(
+      DateTime(2026, 8, 31, 9, 5, 3, 12),
+      DiagnosticLogLevel.error,
+      'boom\nstack line',
+    );
+    expect(
+      line,
+      '2026-08-31 09:05:03.012 [ERROR] boom\n'
+      '2026-08-31 09:05:03.012 [ERROR] stack line',
+    );
   });
 
   test('init 后日志写入文件', () async {
@@ -66,6 +79,20 @@ void main() {
     debugPrint('captured-by-logger');
     await DiagnosticLogger.instance.flush();
     final content = await File('${tempDir.path}/app.log').readAsString();
-    expect(content, contains('captured-by-logger'));
+    expect(content, contains('[DEBUG] captured-by-logger'));
+  });
+
+  test('四种日志级别写入完整标签', () async {
+    await DiagnosticLogger.instance.init(dir: tempDir);
+    DiagnosticLogger.instance.debug('debug-line');
+    DiagnosticLogger.instance.info('info-line');
+    DiagnosticLogger.instance.warning('warning-line');
+    DiagnosticLogger.instance.error('error-line');
+    await DiagnosticLogger.instance.flush();
+    final content = await File('${tempDir.path}/app.log').readAsString();
+    expect(content, contains('[DEBUG] debug-line'));
+    expect(content, contains('[INFO] info-line'));
+    expect(content, contains('[WARNING] warning-line'));
+    expect(content, contains('[ERROR] error-line'));
   });
 }

@@ -10,6 +10,7 @@ import '../../services/kugou_api/kugou_models.dart';
 import '../../widgets/scroll_aware_app_bar.dart';
 import '../player/mini_player.dart';
 import '../playlist/playlist_page.dart';
+import 'scene_content_filter.dart';
 import 'scene_audio_list_page.dart';
 import 'scene_collection_list_page.dart';
 import 'scene_video_list_page.dart';
@@ -86,9 +87,25 @@ class _SceneDetailPageState extends State<SceneDetailPage> {
       final d = KugouSceneDiscuss.fromJson(e);
       if (d.id.isNotEmpty) discusses.add(d);
     }
+
+    // 标签元数据可能残留，但对应的音频列表已经为空。预检第一页，
+    // 只过滤“明确返回空/无可播放歌曲”的标签；接口失败或响应结构未知时保留，
+    // 避免一次临时网络异常把有效内容从页面隐藏。
+    final availableMusic = await filterSceneTagsWithAudio(
+      sceneId: widget.scene.id,
+      tags: music,
+      loadAudioList: ({required sceneId, required moduleId, required tagId}) =>
+          api.getSceneAudioList(
+            sceneId: sceneId,
+            moduleId: moduleId,
+            tag: tagId,
+            page: 1,
+            pagesize: 30,
+          ),
+    );
     if (!mounted) return;
     setState(() {
-      _musicTags = music;
+      _musicTags = availableMusic;
       _collectionTags = collections;
       _videoTags = videos;
       _discusses = discusses;

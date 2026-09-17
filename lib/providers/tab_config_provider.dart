@@ -38,12 +38,12 @@ const List<TabItem> kDefaultTabs = [
   TabItem(id: 'discover', label: '发现'),
   TabItem(id: 'favorites', label: '收藏'),
   TabItem(id: 'launchpad', label: 'LaunchPad'),
+  TabItem(id: 'library', label: '本地音乐'),
   TabItem(id: 'user', label: '我的', isRemovable: false),
 ];
 
 /// 可选 Tab（默认隐藏，需在设置页手动开启）。
 const List<TabItem> kOptionalTabs = [
-  TabItem(id: 'library', label: '本地音乐'), // 原默认（本地音乐），现改为可选
   TabItem(id: 'fm', label: '私人FM'), // 原默认（私人FM），现改为可选
   TabItem(id: 'coverflow', label: '封面流'),
   TabItem(id: 'search', label: '搜索'),
@@ -72,7 +72,7 @@ class TabConfigProvider extends ChangeNotifier {
   /// 所有 tab 的完整排序（含隐藏项），用于设置页展示。
   List<TabItem> _allTabs = List.from(kAllAvailableTabs);
 
-  /// 隐藏的 tab id 集合。可选 Tab 默认全部隐藏。
+  /// 隐藏的 tab id 集合。可选 Tab 默认隐藏。
   Set<String> _hiddenTabs = {
     for (final t in kOptionalTabs) t.id,
   };
@@ -91,6 +91,19 @@ class TabConfigProvider extends ChangeNotifier {
       final hidden = await _repo.getHiddenTabs();
       _hiddenTabs = hidden;
 
+      // 0d5851d 将收藏移入默认 Tab，但旧版本已经把 favorites 持久化在
+      // 隐藏集合中；同时本地音乐的默认显示状态也曾在多个版本间切换。
+      // 只执行一次迁移，恢复这两个默认入口，同时保留用户后续的手动配置。
+      const tabConfigMigrationVersion = 1;
+      if (await _repo.getTabConfigMigrationVersion() <
+          tabConfigMigrationVersion) {
+        _hiddenTabs
+          ..remove('favorites')
+          ..remove('library');
+        await _repo.setHiddenTabs(_hiddenTabs);
+        await _repo.setTabConfigMigrationVersion(tabConfigMigrationVersion);
+      }
+
       if (order != null && order.isNotEmpty) {
         // 按持久化顺序重排
         final ordered = <TabItem>[];
@@ -100,13 +113,13 @@ class TabConfigProvider extends ChangeNotifier {
         }
         // 补充新增的 tab（版本更新可能新增 tab）。
         // 新增 tab 一律默认隐藏，避免老用户升级后突然多出 Tab；
-        // 例外：launchpad / favorites 作为默认导航 tab，升级后也保持默认显示。
+        // 默认 Tab 升级后保持默认显示。
         // 若用户此前主动打开过（toggleTabVisibility 会写 order 使其
         // 包含该 tab，从而不会走到这个分支），则保持可见。
         for (final tab in kAllAvailableTabs) {
           if (!ordered.any((t) => t.id == tab.id)) {
             ordered.add(tab);
-            if (tab.id != 'launchpad' && tab.id != 'favorites') {
+            if (!kDefaultTabs.any((defaultTab) => defaultTab.id == tab.id)) {
               _hiddenTabs.add(tab.id);
             }
           }

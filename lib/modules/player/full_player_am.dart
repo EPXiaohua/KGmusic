@@ -18,6 +18,7 @@ import '../../core/services/spectrum_service.dart';
 import '../../core/services/usb_audio_service.dart';
 import '../../core/utils/local_lyric_loader.dart';
 import '../../core/utils/app_haptics.dart';
+import '../../main.dart';
 import '../../core/utils/app_toast.dart';
 import '../../core/utils/artwork_color_extractor.dart';
 import '../../data/models/album.dart';
@@ -56,6 +57,7 @@ import '../../widgets/spectrum_background.dart';
 import '../../utils/landscape_immersive.dart';
 import '../../utils/playlist_order_utils.dart';
 import '../../widgets/player_playlist_view.dart';
+import 'car_mode_exit.dart';
 import 'comments_view.dart';
 import 'dlna_cast_sheet.dart';
 import 'full_player_route.dart';
@@ -99,7 +101,14 @@ class AmStyleFullPlayer extends StatefulWidget {
   static void Function(BuildContext context, dynamic song)?
   coverLongPressCallback;
 
-  const AmStyleFullPlayer({super.key});
+  /// 车机模式：开启后播放器以常驻面板（由 CarModePanel 承载）形式嵌入任意界面，
+  /// 不可收起、不显示 MiniPlayer。
+  /// 语义与 FullPlayer.dockMode 完全一致（不可收起 / 不接管系统栏 /
+  /// 禁用 Zen 与横屏沉浸 / 整页跳转走根 Navigator / tab 结构恒按窄屏）。
+  /// 默认 false，既有 `const AmStyleFullPlayer()` 调用点不受影响。
+  final bool dockMode;
+
+  const AmStyleFullPlayer({super.key, this.dockMode = false});
 
   @override
   State<AmStyleFullPlayer> createState() => _AmStyleFullPlayerState();
@@ -408,7 +417,12 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
     if (!mounted) return;
     final width = MediaQuery.sizeOf(context).width;
     final deviceIsPad = isPadLayout(context);
-    final isWideLayout = deviceIsPad || width >= 600;
+    // 车机模式恒按窄屏处理：面板宽度已由 CarModePanel 覆盖到 MediaQuery.size，
+    // 但用户若在设置里把「设备类型」手动选成平板，isPadLayout 仍会返回 true，
+    // 那会让 tab 结构删掉封面 tab —— 而面板走的是 compact 分支、没有左栏封面，
+    // 封面会彻底不可达。所以这里显式短路。
+    final isWideLayout =
+        !widget.dockMode && (deviceIsPad || width >= 600);
     final player = context.read<PlayerProvider>();
     final song = player.currentSong;
     final isLocalSong = song != null && !song.isOnline;
@@ -431,7 +445,8 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
     );
     // ignore: avoid_print
     print(
-      '[PlayerTab] am length=${next.length} cover=${next.hasCover} '
+      '[PlayerTab] am dock=${widget.dockMode} length=${next.length} '
+      'cover=${next.hasCover} '
       'comments=${next.hasComments} local=$isLocalSong index=${_tabController.index}',
     );
     setState(() {});
@@ -453,6 +468,11 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
       route.controller.addStatusListener(_onDragRouteStatus);
     } else if (route == null) {
       // 拖拽覆盖层（非路由）：不切换系统栏，展开后由路由接管
+      _dragRoute = null;
+      _systemUiModified = false;
+    } else if (widget.dockMode) {
+      // 车机常驻面板：面板内的 ModalRoute 是 CarModePanel 的宿主路由，
+      // 不是全屏页，不接管系统栏也不设横屏沉浸标志。
       _dragRoute = null;
       _systemUiModified = false;
     } else {
@@ -520,6 +540,9 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
       // 引发无效的 applyImmersiveForOrientation 调用导致系统栏闪烁
       if (_lastPhysicalSize == current) return;
       _lastPhysicalSize = current;
+      // 车机面板不接管系统栏：方向变化时什么都不做
+      // （面板宽度变化也不会走 didChangeMetrics，它量的是设备物理屏）。
+      if (widget.dockMode) return;
       if (_zenMode) {
         SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
       } else {
@@ -592,8 +615,9 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
   }
 
   /// 当前是否需要横屏沉浸：横屏且设置开关（横屏隐藏状态栏）开启。
+  /// 车机模式下恒为 false：面板只是屏幕的一部分，不该让整个 App 的系统栏消失。
   bool _landscapeImmersiveNeeded() =>
-      _isLandscapeNow() && kLandscapeImmersiveEnabled;
+      !widget.dockMode && _isLandscapeNow() && kLandscapeImmersiveEnabled;
 
   /// 同步全局「横屏沉浸生效」标志：仅非 Zen 且开关开启的横屏为 true，供主界面 _SystemUiUpdater 短路。
   void _syncLandscapeImmersiveFlag() {
@@ -604,6 +628,10 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
   /// 进入 Zen 沉浸模式：隐藏顶栏、控件、系统栏，拓宽歌词/封面视图。
   void _enterZenMode() {
     if (_zenMode) return;
+    // 车机模式：面板常驻不会 dispose，而 Zen 会设全局沉浸标志
+    // kPlayerZenImmersiveActive；面板一旦进入 Zen 就没有兜底清理点，
+    // 会让主界面 _SystemUiUpdater 被永久短路。
+    if (widget.dockMode) return;
     setState(() => _zenMode = true);
     _zenController.forward();
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
@@ -685,7 +713,9 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
   /// 封面长按包装：指针监听 + 按压内缩动效 + Zen 长按引导提示层。
   /// [child] 为原封面内容（含播放/暂停缩放动画）。
   Widget _wrapArtworkZenPress({required Widget child}) {
-    if (!_zenLongPressEnabled) return child;
+    // 车机模式禁用长按进 Zen：见 _enterZenMode 的说明。
+    // 这一处是主守卫（连长按提示层与按压动效一并去掉）。
+    if (!_zenLongPressEnabled || widget.dockMode) return child;
     return Listener(
       onPointerDown: _onArtworkPointerDown,
       onPointerMove: _onArtworkPointerMove,
@@ -828,7 +858,7 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
           if (filePath.startsWith('file://')) {
             filePath = Uri.parse(filePath).toFilePath();
           }
-          final embedded = LocalLyricLoader.loadForAudio(filePath);
+          final embedded = await LocalLyricLoader.loadForAudioAsync(filePath);
           if (embedded != null && embedded.isNotEmpty) {
             lyricText = embedded;
           }
@@ -837,6 +867,7 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
 
       // 内嵌歌词为空时回退到酷狗 API
       if (lyricText.isEmpty) {
+        if (!mounted) return;
         final kugouProvider = context.read<KugouProvider>();
         // 本地歌曲的 songId 是 'local_<path>'，不是酷狗 hash，
         // 传空 hash 让酷狗 API 完全基于 songName 搜索歌词
@@ -1054,6 +1085,11 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
 
   /// 点击下拉按钮直接收起（保留原 _buildTopBar 的 IconButton 行为）。
   void _collapseByButton() {
+    // 车机模式：面板常驻，任何入口都不得收起。
+    // 这里必须早返回：面板内的 ModalRoute 是 CarModePanel 自带的
+    // MaterialPageRoute（不是 DraggablePlayerRoute），会走到下面的 else 分支
+    // `Navigator.of(context).maybePop()` 把面板那一页 pop 掉 → 面板永久空白。
+    if (widget.dockMode) return;
     final route = ModalRoute.of(context);
     if (route is DraggablePlayerRoute) {
       _isDismissing = true;
@@ -1066,6 +1102,26 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
     } else {
       Navigator.of(context).maybePop();
     }
+  }
+
+  /// 面板内「整页跳转」的目标 Navigator。
+  ///
+  /// 车机模式下必须走根 Navigator：面板自带一层 Navigator，按原逻辑
+  /// `Navigator.of(context)` 会把专辑页 / 歌手页 / MV 等 pushed 到面板内部，
+  /// 把常驻播放器顶掉（视觉上「面板被换成了专辑页」）。
+  /// 与 DlnaCastingOverlay 通过 appNavigatorKey 跳转的做法一致。
+  NavigatorState? _pageNavigator(BuildContext context) {
+    if (widget.dockMode) return appNavigatorKey.currentState;
+    return Navigator.maybeOf(context);
+  }
+
+  /// 车机模式顶栏左侧按钮：二次确认后退出车机模式（整块面板随之卸载）。
+  ///
+  /// 车机面板不可收起，所以这里是面板内唯一的「退出」入口；必须走二次确认，
+  /// 避免误触后常驻播放器突然消失、用户不知发生了什么。
+  Future<void> _confirmExitCarMode() async {
+    final exited = await confirmExitCarMode(context);
+    if (exited) showToast('已退出车机模式');
   }
 
   // ── 顶栏向下拖拽原路返回（与上滑展开镜像） ──
@@ -1190,18 +1246,18 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
     // 先 dismiss FullPlayer，再 push 专辑页。
     // 注意：必须在 dismiss 之前捕获 navigatorState 引用，因为 dismiss 后
     // widget 会被 dispose，State.mounted 变为 false，原来的 if (mounted) 检查会失败。
-    final navigatorState = Navigator.of(context);
+    final navigatorState = _pageNavigator(context);
     final route = ModalRoute.of(context);
     if (route is DraggablePlayerRoute) {
       _isDismissing = true;
       route.dismiss();
       Future.delayed(const Duration(milliseconds: 300), () {
-        navigatorState.push(
+        navigatorState?.push(
           MaterialPageRoute(builder: (_) => AlbumDetailPage(album: album)),
         );
       });
     } else {
-      navigatorState.push(
+      navigatorState?.push(
         MaterialPageRoute(builder: (_) => AlbumDetailPage(album: album)),
       );
     }
@@ -1318,13 +1374,13 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
     }
     // 注意：必须在 dismiss 之前捕获 navigatorState 引用，因为 dismiss 后
     // widget 会被 dispose，State.mounted 变为 false，原来的 if (mounted) 检查会失败。
-    final navigatorState = Navigator.of(context);
+    final navigatorState = _pageNavigator(context);
     final route = ModalRoute.of(context);
     if (route is DraggablePlayerRoute) {
       _isDismissing = true;
       route.dismiss();
       Future.delayed(const Duration(milliseconds: 300), () {
-        navigatorState.push(
+        navigatorState?.push(
           MaterialPageRoute(
             builder: (_) => ArtistDetailPage(
               artistId: artistId,
@@ -1335,7 +1391,7 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
         );
       });
     } else {
-      navigatorState.push(
+      navigatorState?.push(
         MaterialPageRoute(
           builder: (_) => ArtistDetailPage(
             artistId: artistId,
@@ -1391,6 +1447,8 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
           canPop: false,
           onPopInvokedWithResult: (didPop, _) {
             if (didPop || _isDismissing) return;
+            // 车机面板常驻，返回键不得让它消失
+            if (widget.dockMode) return;
             if (_zenMode) {
               _exitZenMode();
               return;
@@ -1420,8 +1478,9 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
     // 拖拽展开模式下系统栏样式跟随展开进度，避免拖动过程提前切换（见 PlayerSystemUiScope）
     return PlayerSystemUiScope(
       dragRoute: _dragRoute,
-      // 拖拽覆盖层（非路由）期间系统栏恒为主页面样式
-      forceMainStyle: _isDragOverlay,
+      // 拖拽覆盖层（非路由）期间系统栏恒为主页面样式；
+      // 车机面板也不是全屏页，同样一律沿用主页面样式。
+      forceMainStyle: _isDragOverlay || widget.dockMode,
       child: Scaffold(
         backgroundColor: Colors.black,
         extendBody: true,
@@ -1523,10 +1582,13 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                     },
                     behavior: HitTestBehavior.opaque,
                     // 封面 tab 与顶栏一样支持向下拖拽原路返回关闭播放器
-                    onVerticalDragStart: _onTopBarDragStart,
-                    onVerticalDragUpdate: _onTopBarDragUpdate,
-                    onVerticalDragEnd: _onTopBarDragEnd,
-                    onVerticalDragCancel: _onTopBarDragCancel,
+                    // 车机模式：封面不参与「下拉原路收起」，否则手势会被白白吃掉
+                    // （_onTopBarDragStart 内部会因 route 不是 DraggablePlayerRoute 而早返回，
+                    // 但仍是注册了手势识别器）。
+                    onVerticalDragStart: widget.dockMode ? null : _onTopBarDragStart,
+                    onVerticalDragUpdate: widget.dockMode ? null : _onTopBarDragUpdate,
+                    onVerticalDragEnd: widget.dockMode ? null : _onTopBarDragEnd,
+                    onVerticalDragCancel: widget.dockMode ? null : _onTopBarDragCancel,
                     // Selector 让 _buildArtworkView 仅在 currentSong / isPlaying 变化时重建，
                     // 不再每 200ms 因 position 变化重建（封面 AnimatedScale 是隐式动画，需要 isPlaying 触发）
                     child:
@@ -1629,7 +1691,14 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
             animation: _zenAnimation,
             child: Padding(
               padding: EdgeInsets.only(bottom: _zenMode ? 16 : bottomPadding),
-              child: _buildControls(playerProvider, colorScheme),
+              // 车机面板是窄容器：用紧凑档控件（传输行 164dp，见
+              // MD3ETransportRow），否则 212dp 的传输行 + 40dp 内边距
+              // 在 20% 宽的面板里必然 RenderFlex overflow。
+              child: _buildControls(
+                playerProvider,
+                colorScheme,
+                isExpanded: widget.dockMode,
+              ),
             ),
           ),
         ],
@@ -1687,10 +1756,11 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                               // 同时保留长按封面进入/退出 Zen 模式（按压内缩 + 引导提示）
                               child: GestureDetector(
                                 behavior: HitTestBehavior.opaque,
-                                onVerticalDragStart: _onTopBarDragStart,
-                                onVerticalDragUpdate: _onTopBarDragUpdate,
-                                onVerticalDragEnd: _onTopBarDragEnd,
-                                onVerticalDragCancel: _onTopBarDragCancel,
+                                // 车机模式：封面不参与「下拉原路收起」，否则手势会被白白吃掉。
+                                onVerticalDragStart: widget.dockMode ? null : _onTopBarDragStart,
+                                onVerticalDragUpdate: widget.dockMode ? null : _onTopBarDragUpdate,
+                                onVerticalDragEnd: widget.dockMode ? null : _onTopBarDragEnd,
+                                onVerticalDragCancel: widget.dockMode ? null : _onTopBarDragCancel,
                                 child: _wrapArtworkZenPress(
                                   child: AnimatedScale(
                                     // 频谱模式（style 0/1 圆形旋转封面）不需要封面的放大缩小动画
@@ -1876,10 +1946,11 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                                 // 同时保留长按封面进入/退出 Zen 模式（按压内缩 + 引导提示）
                                 child: GestureDetector(
                                   behavior: HitTestBehavior.opaque,
-                                  onVerticalDragStart: _onTopBarDragStart,
-                                  onVerticalDragUpdate: _onTopBarDragUpdate,
-                                  onVerticalDragEnd: _onTopBarDragEnd,
-                                  onVerticalDragCancel: _onTopBarDragCancel,
+                                  // 车机模式：封面不参与「下拉原路收起」，否则手势会被白白吃掉。
+                                  onVerticalDragStart: widget.dockMode ? null : _onTopBarDragStart,
+                                  onVerticalDragUpdate: widget.dockMode ? null : _onTopBarDragUpdate,
+                                  onVerticalDragEnd: widget.dockMode ? null : _onTopBarDragEnd,
+                                  onVerticalDragCancel: widget.dockMode ? null : _onTopBarDragCancel,
                                   child: _wrapArtworkZenPress(
                                     child: AnimatedScale(
                                       // 频谱模式（style 0/1 圆形旋转封面）不需要封面的放大缩小动画
@@ -2012,18 +2083,29 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
     // 整个顶栏支持向下拖拽原路返回（点击按钮仍由子元素处理，竞技场自动区分）
     return GestureDetector(
       behavior: HitTestBehavior.translucent,
-      onVerticalDragStart: _onTopBarDragStart,
-      onVerticalDragUpdate: _onTopBarDragUpdate,
-      onVerticalDragEnd: _onTopBarDragEnd,
-      onVerticalDragCancel: _onTopBarDragCancel,
+      // 车机模式：顶栏不参与「下拉原路收起」，否则手势会被白白吃掉
+      // （_onTopBarDragStart 内部会因 route 不是 DraggablePlayerRoute 而早返回，
+      // 但仍是注册了手势识别器）。
+      onVerticalDragStart: widget.dockMode ? null : _onTopBarDragStart,
+      onVerticalDragUpdate: widget.dockMode ? null : _onTopBarDragUpdate,
+      onVerticalDragEnd: widget.dockMode ? null : _onTopBarDragEnd,
+      onVerticalDragCancel: widget.dockMode ? null : _onTopBarDragCancel,
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
         child: Row(
           children: [
-            IconButton(
-              icon: const Icon(Icons.keyboard_arrow_down, color: Colors.white),
-              onPressed: _collapseByButton,
-            ),
+            // 车机模式：面板不可收起，左侧按钮改为「退出车机模式」（二次确认）
+            if (widget.dockMode)
+              IconButton(
+                icon: const Icon(Icons.close_fullscreen, color: Colors.white),
+                tooltip: '退出车机模式',
+                onPressed: _confirmExitCarMode,
+              )
+            else
+              IconButton(
+                icon: const Icon(Icons.keyboard_arrow_down, color: Colors.white),
+                onPressed: _collapseByButton,
+              ),
             const Spacer(),
             // AM v2: 顶部栏右侧 FLAC 质量徽章，点击复用 _showQualityDialog，
             // 长按呼出 _showVolumeDialog（与 MD 风格统一）
@@ -2107,54 +2189,61 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
         children: [
           if (!isExpanded) const Spacer(),
           if (isExpanded) ...[
-            // 封面用 Flexible(fit: loose) 弹性吸收：空间充足时按宽度预算显示约 380，
-            // 键盘弹出/小屏高度骤减时被压缩到适配剩余空间，Column 永不溢出。
-            Flexible(
-              fit: FlexFit.loose,
+            // 用 Expanded 包一层，让 LayoutBuilder 拿到**有界**的高度：
+            // 原实现靠上下两个 Spacer 撑居中，Column 给非 flex 子级的高度约束
+            // 是 infinity，于是正方形封面只能按宽度取边长，短屏（车机面板、
+            // 横屏手机）下会顶破剩余高度 → RenderFlex overflow。
+            // 改后 maxSize 同时受可用高度约束，居中由 Center 保证，长屏观感不变。
+            Expanded(
               child: LayoutBuilder(
                 builder: (context, constraints) {
-                  // 封面尺寸由弹性约束 + 宽度共同决定，heightBudget 不再需要
-                  final widthBudget = (constraints.maxWidth - 32).clamp(
-                    0.0,
-                    380.0,
-                  );
-                  final maxSize = widthBudget;
+                  final maxSize = (constraints.maxWidth - 32)
+                      .clamp(0.0, 380.0)
+                      .clamp(
+                        0.0,
+                        (constraints.maxHeight - 72).clamp(
+                          0.0,
+                          double.infinity,
+                        ),
+                      );
                   // 长按封面进入/退出 Zen 模式：精确 2000ms + 按压内缩与引导提示
-                  return _wrapArtworkZenPress(
-                    child: ConstrainedBox(
-                      constraints: BoxConstraints(
-                        maxWidth: maxSize,
-                        maxHeight: maxSize,
-                      ),
-                      child: AspectRatio(
-                        aspectRatio: 1,
-                        child: AnimatedScale(
-                          // 频谱模式（style 0/1 圆形旋转封面）不需要封面的放大缩小动画
-                          scale: _spectrumEnabled && _spectrumStyle < 2
-                              ? 1.0
-                              : (playerProvider.isPlaying ? 1.0 : 0.85),
-                          duration: const Duration(milliseconds: 500),
-                          curve: Curves.easeOutBack,
-                          // 频谱模式：style 0/1 白色圆形旋转封面 + 环形频谱
-                          child: _spectrumEnabled && _spectrumStyle < 2
-                              ? SpectrumArtwork(
-                                  artworkUri: currentSong.artworkUri,
-                                  fallbackFilePath: currentSong.localPath,
-                                  isPlaying: playerProvider.isPlaying,
-                                  bandCount: SpectrumService.instance.bandCount,
-                                  style: _spectrumStyle,
-                                  barColor: _spectrumColor,
-                                  opacity: _spectrumOpacity,
-                                )
-                              : ClipRRect(
-                                  borderRadius: BorderRadius.circular(16),
-                                  child: _buildCrossfadeArtwork(
-                                    currentSong.artworkUri,
-                                    colorScheme,
-                                    iconSize: iconSize,
+                  return Center(
+                    child: _wrapArtworkZenPress(
+                      child: ConstrainedBox(
+                        constraints: BoxConstraints(
+                          maxWidth: maxSize,
+                          maxHeight: maxSize,
+                        ),
+                        child: AspectRatio(
+                          aspectRatio: 1,
+                          child: AnimatedScale(
+                            // 频谱模式（style 0/1 圆形旋转封面）不需要封面的放大缩小动画
+                            scale: _spectrumEnabled && _spectrumStyle < 2
+                                ? 1.0
+                                : (playerProvider.isPlaying ? 1.0 : 0.85),
+                            duration: const Duration(milliseconds: 500),
+                            curve: Curves.easeOutBack,
+                            // 频谱模式：style 0/1 白色圆形旋转封面 + 环形频谱
+                            child: _spectrumEnabled && _spectrumStyle < 2
+                                ? SpectrumArtwork(
+                                    artworkUri: currentSong.artworkUri,
                                     fallbackFilePath: currentSong.localPath,
+                                    isPlaying: playerProvider.isPlaying,
+                                    bandCount: SpectrumService.instance.bandCount,
+                                    style: _spectrumStyle,
+                                    barColor: _spectrumColor,
+                                    opacity: _spectrumOpacity,
+                                  )
+                                : ClipRRect(
+                                    borderRadius: BorderRadius.circular(16),
+                                    child: _buildCrossfadeArtwork(
+                                      currentSong.artworkUri,
+                                      colorScheme,
+                                      iconSize: iconSize,
+                                      fallbackFilePath: currentSong.localPath,
+                                    ),
                                   ),
-                                ),
+                          ),
                         ),
                       ),
                     ),
@@ -2951,8 +3040,7 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                     title: const Text('查看 MV'),
                     onTap: () {
                       Navigator.pop(sheetContext);
-                      Navigator.push(
-                        rootContext,
+                      _pageNavigator(rootContext)?.push(
                         MaterialPageRoute(
                           builder: (_) => MvPlayerPage(song: song),
                         ),
@@ -2997,8 +3085,7 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                   title: const Text('歌曲信息'),
                   onTap: () {
                     Navigator.pop(sheetContext);
-                    Navigator.push(
-                      rootContext,
+                    _pageNavigator(rootContext)?.push(
                       MaterialPageRoute(builder: (_) => const SongInfoPage()),
                     );
                   },
@@ -3038,8 +3125,7 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                             active: eq.enabled,
                             onTap: () {
                               Navigator.pop(sheetContext);
-                              Navigator.push(
-                                rootContext,
+                              _pageNavigator(rootContext)?.push(
                                 MaterialPageRoute(
                                   builder: (_) => const EqualizerSettingsPage(),
                                 ),
@@ -3054,8 +3140,7 @@ class _AmStyleFullPlayerState extends State<AmStyleFullPlayer>
                         active: false,
                         onTap: () {
                           Navigator.pop(sheetContext);
-                          Navigator.push(
-                            rootContext,
+                          _pageNavigator(rootContext)?.push(
                             MaterialPageRoute(
                               builder: (_) => const SoundsPage(),
                             ),

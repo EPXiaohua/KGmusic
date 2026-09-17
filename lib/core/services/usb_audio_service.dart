@@ -121,8 +121,8 @@ class UsbAudioService {
     } catch (_) {}
   }
 
-  // ── 32bit 播放支持开关（默认关闭，无损坏风险） ─────────────────
-  /// 是否开启 32bit(float 高解析)输出。默认关闭；开启后部分设备可能变速/变调，需用户自担。
+  // ── 32bit 播放支持开关（默认关闭） ─────────────────
+  /// 是否开启 32bit(float 高解析)输出。默认关闭；个别设备可能变速/变调，需用户自行开启。
   bool _enable32bit = false;
   bool get enable32bit => _enable32bit;
 

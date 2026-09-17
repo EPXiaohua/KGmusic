@@ -35,6 +35,27 @@ class _UserCenterPageState extends State<UserCenterPage> {
   /// 顶栏渐变 ScrollController：与 ScrollAwareAppBar 共享
   final ScrollController _scrollController = ScrollController();
 
+  /// 「同步云端时长」按钮的进行中状态（防重复点击）。
+  bool _syncingGrade = false;
+
+  /// 从云端同步听歌时长：拉取服务器权威 d_sec 并抬升本地基准。
+  ///
+  /// 与 App 打开时的自动同步（`KugouProvider._autoConnect`）走同一条链路；
+  /// 这里额外给出成功/失败反馈，故需要 `getGradeInfo` 返回真实结果。
+  Future<void> _syncGradeFromCloud(KugouProvider kugou) async {
+    if (_syncingGrade) return;
+    setState(() => _syncingGrade = true);
+    var ok = false;
+    try {
+      ok = await kugou.getGradeInfo();
+    } finally {
+      if (mounted) setState(() => _syncingGrade = false);
+    }
+    if (!mounted) return;
+    // 用全局 toast（Android 上为原生 Toast）而非 SnackBar —— 与本项目其余提示一致
+    showToast(ok ? '已从云端同步听歌时长' : '同步失败，请稍后重试');
+  }
+
   @override
   void initState() {
     super.initState();
@@ -277,12 +298,7 @@ class _UserCenterPageState extends State<UserCenterPage> {
                                 // 无等级数据时占住等级行的高度，避免卡片塌到头像里
                                 child: grade == null
                                     ? SizedBox(height: 38)
-                                    : _buildGradeInfo(
-                                        cs,
-                                        tt,
-                                        grade,
-                                        kugou.unreportedSeconds,
-                                      ),
+                                    : _buildGradeInfo(cs, tt, grade, kugou),
                               ),
                               Padding(
                                 // 下移至与等级数字视觉中心齐平
@@ -411,11 +427,10 @@ class _UserCenterPageState extends State<UserCenterPage> {
     ColorScheme cs,
     TextTheme tt,
     KugouGradeInfo grade,
-    int unreportedSec,
+    KugouProvider kugou,
   ) {
     final sec = grade.dSec ?? grade.duration ?? 0;
     final gradeNum = grade.pGrade ?? 0;
-    final showUnreported = unreportedSec >= 300; // 5 分钟
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       mainAxisSize: MainAxisSize.min,
@@ -453,13 +468,39 @@ class _UserCenterPageState extends State<UserCenterPage> {
             ),
           ],
         ),
-        if (showUnreported)
-          Text(
-            '未上报 ${_formatGradeSeconds(unreportedSec)}',
-            style: tt.labelSmall?.copyWith(color: cs.error),
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
+        // 「未上报时长」已下线 —— 它只是「本地基准 − 服务器记账」的对账差额，
+        // 既不是待发送队列也无法补报，展示它只会造成误解。
+        // 改为显式的云端同步入口：拉取服务器权威 d_sec 并抬升本地基准。
+        TextButton.icon(
+          onPressed: _syncingGrade ? null : () => _syncGradeFromCloud(kugou),
+          icon: _syncingGrade
+              ? SizedBox(
+                  width: 12,
+                  height: 12,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 1.6,
+                    color: cs.onPrimaryContainer.withValues(alpha: 0.7),
+                  ),
+                )
+              : Icon(
+                  Icons.cloud_sync_outlined,
+                  size: 14,
+                  color: cs.onPrimaryContainer.withValues(alpha: 0.8),
+                ),
+          label: Text(
+            _syncingGrade ? '同步中…' : '同步云端时长',
+            style: tt.labelSmall?.copyWith(
+              color: cs.onPrimaryContainer.withValues(alpha: 0.8),
+            ),
           ),
+          style: TextButton.styleFrom(
+            padding: EdgeInsets.zero,
+            minimumSize: Size.zero,
+            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            visualDensity: VisualDensity.compact,
+            foregroundColor: cs.onPrimaryContainer,
+          ),
+        ),
       ],
     );
   }

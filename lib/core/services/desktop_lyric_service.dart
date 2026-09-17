@@ -13,6 +13,7 @@ import '../../providers/kugou_provider.dart';
 import '../../providers/player_provider.dart';
 import '../../providers/theme_provider.dart';
 import '../../core/layout/ui_density.dart';
+import '../../core/utils/app_toast.dart';
 import '../../core/utils/artwork_color_extractor.dart';
 import '../../core/utils/local_lyric_loader.dart';
 import 'package:md3music/widgets/apple_lyrics/models/lyric_line.dart';
@@ -333,11 +334,15 @@ class DesktopLyricService {
     if (_player == null || _kugou == null) {
       return;
     }
-    // startFloatingLyric 返回 false（权限竞态撤销/BadTokenException）时
-    // 不点亮开关，避免悬浮窗未出现但按钮显示已开启的"假开启"状态。
+    // startFloatingLyric 返回 false（权限竞态撤销/BadTokenException/显示层拒绝）
+    // 时保持开关为关（原生端会回填真实 addView 结果），避免悬浮窗未出现但按钮
+    // 显示已开启的"假开启"状态，并提示用户授权悬浮窗权限后重试。
     final started =
         await MediaNotificationService.startFloatingLyric(lyric: '', title: '');
-    if (!started) return;
+    if (!started) {
+      showToast('桌面歌词开启失败，请检查并开启悬浮窗权限后重试');
+      return;
+    }
     _enabled = true;
     await _loadConfig();
     await _pushConfig();
@@ -911,7 +916,7 @@ class DesktopLyricService {
           if (filePath.startsWith('file://')) {
             filePath = Uri.parse(filePath).toFilePath();
           }
-          final embedded = LocalLyricLoader.loadForAudio(filePath);
+          final embedded = await LocalLyricLoader.loadForAudioAsync(filePath);
           if (embedded != null && embedded.isNotEmpty) {
             if (!_isCurrentLyricRequest(token, requestedSongId)) return;
             final lines = await parseLyricOffMainThread(embedded);

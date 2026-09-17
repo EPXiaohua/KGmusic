@@ -17,6 +17,7 @@ import '../../core/services/usb_audio_service.dart';
 import '../../core/utils/local_lyric_loader.dart';
 import '../../core/utils/app_haptics.dart';
 import '../../core/utils/app_toast.dart';
+import '../../main.dart';
 import '../../data/models/album.dart';
 import '../../data/models/song.dart';
 import '../../data/repositories/settings_repository.dart';
@@ -54,6 +55,7 @@ import '../../widgets/smart_artwork_image.dart';
 import '../../widgets/player_playlist_view.dart';
 import '../../widgets/spectrum_artwork.dart';
 import '../../widgets/spectrum_background.dart';
+import 'car_mode_exit.dart';
 import 'dlna_cast_sheet.dart';
 import 'full_player_route.dart';
 
@@ -88,7 +90,20 @@ class FullPlayer extends StatefulWidget {
   static void Function(BuildContext context, dynamic song)?
   coverLongPressCallback;
 
-  const FullPlayer({super.key});
+  /// 车机模式常驻面板：由 CarModePanel 以普通 widget 形式嵌在侧边面板里渲染，
+  /// 不是路由、也不可收起。此模式下：
+  ///   * 不显示「收起」按钮、不响应任何收起手势，返回键也不收起；
+  ///   * 不接管系统栏（面板只是屏幕的一部分，不是全屏页）；
+  ///   * 禁止 Zen 模式与横屏沉浸（两者都会劫持全局系统栏，而面板常驻不会
+  ///     dispose，没有兜底清理点）；
+  ///   * 面板内的整页跳转改推根 Navigator（否则页面会顶掉面板内容）；
+  ///   * tab 结构恒按窄屏判定（保留封面 tab）。
+  ///
+  /// 默认 false：既有 `const FullPlayer()` 调用点（player_drag_overlay.dart、
+  /// full_player_route.dart）行为完全不变。
+  final bool dockMode;
+
+  const FullPlayer({super.key, this.dockMode = false});
 
   @override
   State<FullPlayer> createState() => _FullPlayerState();
@@ -205,6 +220,11 @@ class _FullPlayerState extends State<FullPlayer>
   double _spectrumCurveOpacity = 1.0;
 
   void _collapseByButton() {
+    // 车机模式：面板常驻，任何入口都不得收起。
+    // 这里必须早返回：面板内的 ModalRoute 是 CarModePanel 自带的
+    // MaterialPageRoute（不是 DraggablePlayerRoute），会走到下面的 else 分支
+    // `Navigator.of(context).maybePop()` 把面板那一页 pop 掉 → 面板永久空白。
+    if (widget.dockMode) return;
     final route = ModalRoute.of(context);
     if (route is DraggablePlayerRoute) {
       _isDismissing = true;
@@ -217,6 +237,26 @@ class _FullPlayerState extends State<FullPlayer>
     } else {
       Navigator.of(context).maybePop();
     }
+  }
+
+  /// 面板内「整页跳转」的目标 Navigator。
+  ///
+  /// 车机模式下必须走根 Navigator：面板自带一层 Navigator，按原逻辑
+  /// `Navigator.of(context)` 会把专辑页 / 歌手页 / MV 等 pushed 到面板内部，
+  /// 把常驻播放器顶掉（视觉上「面板被换成了专辑页」）。
+  /// 与 DlnaCastingOverlay 通过 appNavigatorKey 跳转的做法一致。
+  NavigatorState? _pageNavigator(BuildContext context) {
+    if (widget.dockMode) return appNavigatorKey.currentState;
+    return Navigator.maybeOf(context);
+  }
+
+  /// 车机模式顶栏左侧按钮：二次确认后退出车机模式（整块面板随之卸载）。
+  ///
+  /// 车机面板不可收起，所以这里是面板内唯一的「退出」入口；必须走二次确认，
+  /// 避免误触后常驻播放器突然消失、用户不知发生了什么。
+  Future<void> _confirmExitCarMode() async {
+    final exited = await confirmExitCarMode(context);
+    if (exited) showToast('已退出车机模式');
   }
 
   // ── 顶栏向下拖拽原路返回（与上滑展开镜像） ──
@@ -342,19 +382,21 @@ class _FullPlayerState extends State<FullPlayer>
     // 先 dismiss FullPlayer，再 push 专辑页。
     // 注意：必须在 dismiss 之前捕获 navigatorState 引用，因为 dismiss 后
     // widget 会被 dispose，State.mounted 变为 false，原来的 if (mounted) 检查会失败。
-    final navigatorState = Navigator.of(context);
+    final navigatorState = _pageNavigator(context);
     final route = ModalRoute.of(context);
     if (route is DraggablePlayerRoute) {
       _isDismissing = true;
       route.dismiss();
       // 等待 FullPlayer 淡出动画完成（约 250ms）后再 push 专辑页
       Future.delayed(const Duration(milliseconds: 300), () {
-        navigatorState.push(
+        navigatorState?.push(
           MaterialPageRoute(builder: (_) => AlbumDetailPage(album: album)),
         );
       });
     } else {
-      navigatorState.push(
+      // 车机模式会走到这里：route 是面板宿主路由（非 DraggablePlayerRoute），
+      // navigatorState 已是根 Navigator，专辑页铺满主内容区、面板保持常驻。
+      navigatorState?.push(
         MaterialPageRoute(builder: (_) => AlbumDetailPage(album: album)),
       );
     }
@@ -470,13 +512,13 @@ class _FullPlayerState extends State<FullPlayer>
     }
     // 注意：必须在 dismiss 之前捕获 navigatorState 引用，因为 dismiss 后
     // widget 会被 dispose，State.mounted 变为 false，原来的 if (mounted) 检查会失败。
-    final navigatorState = Navigator.of(context);
+    final navigatorState = _pageNavigator(context);
     final route = ModalRoute.of(context);
     if (route is DraggablePlayerRoute) {
       _isDismissing = true;
       route.dismiss();
       Future.delayed(const Duration(milliseconds: 300), () {
-        navigatorState.push(
+        navigatorState?.push(
           MaterialPageRoute(
             builder: (_) => ArtistDetailPage(
               artistId: artistId,
@@ -487,7 +529,7 @@ class _FullPlayerState extends State<FullPlayer>
         );
       });
     } else {
-      navigatorState.push(
+      navigatorState?.push(
         MaterialPageRoute(
           builder: (_) => ArtistDetailPage(
             artistId: artistId,
@@ -668,7 +710,12 @@ class _FullPlayerState extends State<FullPlayer>
     if (!mounted) return;
     final width = MediaQuery.sizeOf(context).width;
     final deviceIsPad = isPadLayout(context);
-    final isWideLayout = deviceIsPad || width >= 600;
+    // 车机模式恒按窄屏处理：面板宽度已由 CarModePanel 覆盖到 MediaQuery.size，
+    // 但用户若在设置里把「设备类型」手动选成平板，isPadLayout 仍会返回 true，
+    // 那会让 tab 结构删掉封面 tab —— 而面板走的是 compact 分支、没有左栏封面，
+    // 封面会彻底不可达。所以这里显式短路。
+    final isWideLayout =
+        !widget.dockMode && (deviceIsPad || width >= 600);
     final player = context.read<PlayerProvider>();
     final song = player.currentSong;
     final isLocalSong = song != null && !song.isOnline;
@@ -691,8 +738,9 @@ class _FullPlayerState extends State<FullPlayer>
     );
     // ignore: avoid_print
     print(
-      '[PlayerTab] md length=${next.length} cover=${next.hasCover} '
-      'comments=${next.hasComments} local=$isLocalSong index=${_tabController.index}',
+      '[PlayerTab] md dock=${widget.dockMode} length=${next.length} '
+      'cover=${next.hasCover} comments=${next.hasComments} '
+      'local=$isLocalSong index=${_tabController.index}',
     );
     setState(() {});
   }
@@ -713,6 +761,11 @@ class _FullPlayerState extends State<FullPlayer>
       route.controller.addStatusListener(_onDragRouteStatus);
     } else if (route == null) {
       // 拖拽覆盖层（非路由）：不切换系统栏，展开后由路由接管
+      _dragRoute = null;
+      _systemUiModified = false;
+    } else if (widget.dockMode) {
+      // 车机常驻面板：面板内的 ModalRoute 是 CarModePanel 的宿主路由，
+      // 不是全屏页，不接管系统栏也不设横屏沉浸标志。
       _dragRoute = null;
       _systemUiModified = false;
     } else {
@@ -736,6 +789,9 @@ class _FullPlayerState extends State<FullPlayer>
       // 引发无效的 applyImmersiveForOrientation 调用导致系统栏闪烁
       if (_lastPhysicalSize == current) return;
       _lastPhysicalSize = current;
+      // 车机面板不接管系统栏：方向变化时什么都不做
+      // （面板宽度变化也不会走 didChangeMetrics，它量的是设备物理屏）。
+      if (widget.dockMode) return;
       if (_zenMode) {
         SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
       } else {
@@ -853,8 +909,9 @@ class _FullPlayerState extends State<FullPlayer>
   }
 
   /// 当前是否需要横屏沉浸：横屏且设置开关（横屏隐藏状态栏）开启。
+  /// 车机模式下恒为 false：面板只是屏幕的一部分，不该让整个 App 的系统栏消失。
   bool _landscapeImmersiveNeeded() =>
-      _isLandscapeNow() && kLandscapeImmersiveEnabled;
+      !widget.dockMode && _isLandscapeNow() && kLandscapeImmersiveEnabled;
 
   /// 同步全局「横屏沉浸生效」标志：仅非 Zen 且开关开启的横屏为 true，供主界面 _SystemUiUpdater 短路。
   void _syncLandscapeImmersiveFlag() {
@@ -865,6 +922,10 @@ class _FullPlayerState extends State<FullPlayer>
   /// 进入 Zen 沉浸模式：隐藏顶栏、控件、系统栏，拓宽歌词/封面视图。
   void _enterZenMode() {
     if (_zenMode) return;
+    // 车机模式：面板常驻不会 dispose，而 Zen 会设全局沉浸标志
+    // kPlayerZenImmersiveActive；面板一旦进入 Zen 就没有兜底清理点，
+    // 会让主界面 _SystemUiUpdater 被永久短路。
+    if (widget.dockMode) return;
     setState(() => _zenMode = true);
     _zenController.forward();
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
@@ -946,7 +1007,9 @@ class _FullPlayerState extends State<FullPlayer>
   /// 封面长按包装：指针监听 + 按压内缩动效 + Zen 长按引导提示层。
   /// [child] 为原封面内容（含播放/暂停缩放动画）。
   Widget _wrapArtworkZenPress({required Widget child}) {
-    if (!_zenLongPressEnabled) return child;
+    // 车机模式禁用长按进 Zen：见 _enterZenMode 的说明。
+    // 这一处是主守卫（连长按提示层与按压动效一并去掉）。
+    if (!_zenLongPressEnabled || widget.dockMode) return child;
     return Listener(
       onPointerDown: _onArtworkPointerDown,
       onPointerMove: _onArtworkPointerMove,
@@ -1051,7 +1114,7 @@ class _FullPlayerState extends State<FullPlayer>
           if (filePath.startsWith('file://')) {
             filePath = Uri.parse(filePath).toFilePath();
           }
-          final embedded = LocalLyricLoader.loadForAudio(filePath);
+          final embedded = await LocalLyricLoader.loadForAudioAsync(filePath);
           if (embedded != null && embedded.isNotEmpty) {
             lyricText = embedded;
           }
@@ -1060,6 +1123,7 @@ class _FullPlayerState extends State<FullPlayer>
 
       // 内嵌歌词为空时回退到酷狗 API
       if (lyricText.isEmpty) {
+        if (!mounted) return;
         final kugouProvider = context.read<KugouProvider>();
         // 本地歌曲的 songId 是 'local_<path>'，不是酷狗 hash，
         // 传空 hash 让酷狗 API 完全基于 songName 搜索歌词
@@ -1230,13 +1294,16 @@ class _FullPlayerState extends State<FullPlayer>
     );
     return PlayerSystemUiScope(
       dragRoute: _dragRoute,
-      // 拖拽覆盖层（非路由）期间系统栏恒为主页面样式
-      forceMainStyle: _isDragOverlay,
+      // 拖拽覆盖层（非路由）期间系统栏恒为主页面样式；
+      // 车机面板也不是全屏页，同样一律沿用主页面样式。
+      forceMainStyle: _isDragOverlay || widget.dockMode,
       expandedOverlayStyle: mdOverlayStyle,
       child: PopScope(
         canPop: false,
         onPopInvokedWithResult: (didPop, _) {
           if (didPop || _isDismissing) return;
+          // 车机面板常驻，返回键不得让它消失
+          if (widget.dockMode) return;
           if (_zenMode) {
             _exitZenMode();
             return;
@@ -1328,10 +1395,10 @@ class _FullPlayerState extends State<FullPlayer>
                     },
                     behavior: HitTestBehavior.opaque,
                     // 封面 tab 与顶栏一样支持向下拖拽原路返回关闭播放器
-                    onVerticalDragStart: _onTopBarDragStart,
-                    onVerticalDragUpdate: _onTopBarDragUpdate,
-                    onVerticalDragEnd: _onTopBarDragEnd,
-                    onVerticalDragCancel: _onTopBarDragCancel,
+                    onVerticalDragStart: widget.dockMode ? null : _onTopBarDragStart,
+                    onVerticalDragUpdate: widget.dockMode ? null : _onTopBarDragUpdate,
+                    onVerticalDragEnd: widget.dockMode ? null : _onTopBarDragEnd,
+                    onVerticalDragCancel: widget.dockMode ? null : _onTopBarDragCancel,
                     child: _buildArtworkView(
                       playerProvider,
                       currentSong,
@@ -1377,7 +1444,14 @@ class _FullPlayerState extends State<FullPlayer>
             animation: _zenAnimation,
             child: Padding(
               padding: EdgeInsets.only(bottom: _zenMode ? 16 : bottomPadding),
-              child: _buildControls(playerProvider, colorScheme),
+              child: _buildControls(
+                playerProvider,
+                colorScheme,
+                // 车机面板是窄容器：用紧凑档控件（传输行 164dp，见
+                // MD3ETransportRow），否则 212dp 的传输行 + 40dp 内边距
+                // 在 20% 宽的面板里必然 RenderFlex overflow。
+                isExpanded: widget.dockMode,
+              ),
             ),
           ),
         ],
@@ -1451,10 +1525,10 @@ class _FullPlayerState extends State<FullPlayer>
                                 // 同时保留长按封面进入/退出 Zen 模式（按压内缩 + 引导提示）
                                 child: GestureDetector(
                                   behavior: HitTestBehavior.opaque,
-                                  onVerticalDragStart: _onTopBarDragStart,
-                                  onVerticalDragUpdate: _onTopBarDragUpdate,
-                                  onVerticalDragEnd: _onTopBarDragEnd,
-                                  onVerticalDragCancel: _onTopBarDragCancel,
+                                  onVerticalDragStart: widget.dockMode ? null : _onTopBarDragStart,
+                                  onVerticalDragUpdate: widget.dockMode ? null : _onTopBarDragUpdate,
+                                  onVerticalDragEnd: widget.dockMode ? null : _onTopBarDragEnd,
+                                  onVerticalDragCancel: widget.dockMode ? null : _onTopBarDragCancel,
                                   child: _wrapArtworkZenPress(
                                     child: AnimatedScale(
                                       // 频谱模式（style 0/1 圆形旋转封面）不需要封面的放大缩小动画
@@ -1643,10 +1717,10 @@ class _FullPlayerState extends State<FullPlayer>
                                   // 同时保留长按封面进入/退出 Zen 模式（按压内缩 + 引导提示）
                                   child: GestureDetector(
                                     behavior: HitTestBehavior.opaque,
-                                    onVerticalDragStart: _onTopBarDragStart,
-                                    onVerticalDragUpdate: _onTopBarDragUpdate,
-                                    onVerticalDragEnd: _onTopBarDragEnd,
-                                    onVerticalDragCancel: _onTopBarDragCancel,
+                                    onVerticalDragStart: widget.dockMode ? null : _onTopBarDragStart,
+                                    onVerticalDragUpdate: widget.dockMode ? null : _onTopBarDragUpdate,
+                                    onVerticalDragEnd: widget.dockMode ? null : _onTopBarDragEnd,
+                                    onVerticalDragCancel: widget.dockMode ? null : _onTopBarDragCancel,
                                     child: _wrapArtworkZenPress(
                                       child: AnimatedScale(
                                         // 频谱模式（style 0/1 圆形旋转封面）不需要封面的放大缩小动画
@@ -1773,18 +1847,29 @@ class _FullPlayerState extends State<FullPlayer>
     // 整个顶栏支持向下拖拽原路返回（点击按钮仍由子元素处理，竞技场自动区分）
     return GestureDetector(
       behavior: HitTestBehavior.translucent,
-      onVerticalDragStart: _onTopBarDragStart,
-      onVerticalDragUpdate: _onTopBarDragUpdate,
-      onVerticalDragEnd: _onTopBarDragEnd,
-      onVerticalDragCancel: _onTopBarDragCancel,
+      // 车机模式：顶栏不参与「下拉原路收起」，否则手势会被白白吃掉
+      // （_onTopBarDragStart 内部会因 route 不是 DraggablePlayerRoute 而早返回，
+      // 但仍是注册了手势识别器）。
+      onVerticalDragStart: widget.dockMode ? null : _onTopBarDragStart,
+      onVerticalDragUpdate: widget.dockMode ? null : _onTopBarDragUpdate,
+      onVerticalDragEnd: widget.dockMode ? null : _onTopBarDragEnd,
+      onVerticalDragCancel: widget.dockMode ? null : _onTopBarDragCancel,
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
         child: Row(
           children: [
-            IconButton(
-              icon: const Icon(Icons.keyboard_arrow_down),
-              onPressed: _collapseByButton,
-            ),
+            // 车机模式：面板不可收起，左侧按钮改为「退出车机模式」（二次确认）
+            if (widget.dockMode)
+              IconButton(
+                icon: const Icon(Icons.close_fullscreen),
+                tooltip: '退出车机模式',
+                onPressed: _confirmExitCarMode,
+              )
+            else
+              IconButton(
+                icon: const Icon(Icons.keyboard_arrow_down),
+                onPressed: _collapseByButton,
+              ),
             const Spacer(),
             // MD3E v2: 顶部栏右侧 FLAC 质量徽章，点击复用 _showQualityDialog
             _buildQualityPill(playerProvider),
@@ -1902,12 +1987,26 @@ class _FullPlayerState extends State<FullPlayer>
         children: [
           if (!isExpanded) const Spacer(),
           if (isExpanded) ...[
-            const Spacer(),
-            LayoutBuilder(
-              builder: (context, constraints) {
-                final maxSize = (constraints.maxWidth - 32).clamp(0.0, 380.0);
+            // 用 Expanded 包一层，让 LayoutBuilder 拿到**有界**的高度：
+            // 原实现靠上下两个 Spacer 撑居中，Column 给非 flex 子级的高度约束
+            // 是 infinity，于是正方形封面只能按宽度取边长，短屏（车机面板、
+            // 横屏手机）下会顶破剩余高度 → RenderFlex overflow。
+            // 改后 maxSize 同时受可用高度约束，居中由 Center 保证，长屏观感不变。
+            Expanded(
+              child: LayoutBuilder(
+                builder: (context, constraints) {
+                  final maxSize = (constraints.maxWidth - 32)
+                      .clamp(0.0, 380.0)
+                      .clamp(
+                        0.0,
+                        (constraints.maxHeight - 72).clamp(
+                          0.0,
+                          double.infinity,
+                        ),
+                      );
                 // 长按封面进入/退出 Zen 模式：精确 2000ms + 按压内缩与引导提示
-                return _wrapArtworkZenPress(
+                return Center(
+                  child: _wrapArtworkZenPress(
                   child: ConstrainedBox(
                     constraints: BoxConstraints(
                       maxWidth: maxSize,
@@ -1930,11 +2029,12 @@ class _FullPlayerState extends State<FullPlayer>
                         ),
                       ),
                     ),
+                    ),
                   ),
                 );
               },
             ),
-            const Spacer(),
+            ),
           ] else
             Expanded(
               child: AspectRatio(
@@ -2629,8 +2729,7 @@ class _FullPlayerState extends State<FullPlayer>
                     title: const Text('查看 MV'),
                     onTap: () {
                       Navigator.pop(sheetContext);
-                      Navigator.push(
-                        rootContext,
+                      _pageNavigator(rootContext)?.push(
                         MaterialPageRoute(
                           builder: (_) => MvPlayerPage(song: song),
                         ),
@@ -2675,8 +2774,7 @@ class _FullPlayerState extends State<FullPlayer>
                   title: const Text('歌曲信息'),
                   onTap: () {
                     Navigator.pop(sheetContext);
-                    Navigator.push(
-                      rootContext,
+                    _pageNavigator(rootContext)?.push(
                       MaterialPageRoute(builder: (_) => const SongInfoPage()),
                     );
                   },
@@ -2716,8 +2814,7 @@ class _FullPlayerState extends State<FullPlayer>
                             active: eq.enabled,
                             onTap: () {
                               Navigator.pop(sheetContext);
-                              Navigator.push(
-                                rootContext,
+                              _pageNavigator(rootContext)?.push(
                                 MaterialPageRoute(
                                   builder: (_) => const EqualizerSettingsPage(),
                                 ),
@@ -2732,8 +2829,7 @@ class _FullPlayerState extends State<FullPlayer>
                         active: false,
                         onTap: () {
                           Navigator.pop(sheetContext);
-                          Navigator.push(
-                            rootContext,
+                          _pageNavigator(rootContext)?.push(
                             MaterialPageRoute(
                               builder: (_) => const SoundsPage(),
                             ),

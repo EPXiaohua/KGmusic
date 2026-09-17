@@ -15,6 +15,8 @@ import '../core/services/desktop_lyric_service.dart';
 import '../core/services/home_widget_service.dart';
 import '../core/services/lyricon_provider_service.dart';
 import '../core/services/listening_grade_service.dart';
+import '../core/services/listen_report_service.dart';
+import '../core/services/playback_duration_tracker.dart';
 import '../core/services/media_notification_service.dart';
 import '../core/services/wakelock_service.dart';
 import '../core/services/media_store_service.dart';
@@ -348,6 +350,12 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     addListener(_handleLyriconSongChange);
     // 同步「是否正在播放在线歌曲」到听歌等级服务（累计本地听歌时长用）
     addListener(_syncListeningGradeOnline);
+    // CSCC 真实播放事件上报（/user/listen/report）：切歌 → 补发前一首 end + 发新 start。
+    // 与上面的差量链路并存，互不干扰；开关共用 settings_upload_listening_duration。
+    addListener(_handleListenReportSongChange);
+    // 注入设备参数懒加载器：上报服务在取参前 await 它，保证同一播放段的
+    // start/end 使用一致的机型/系统版本（Rust 会话缓存 key 含机型，漂移会重复建会话）。
+    ListenReportService.instance.setDeviceInfoLoader(_ensureListenReportDeviceInfo);
     // 监听 Lyricon 连接状态：headless 唤醒等场景下 auto_restored/connected
     // 事件到达时可能晚于状态恢复的 notifyListeners，这里补推当前歌曲，
     // 否则词幕不会自动连接显示（PlayerProvider 自己监听自己无法感知 Lyricon 启用）。
@@ -360,29 +368,73 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
   void _syncListeningGradeOnline() {
     final playingOnline = (_currentSong?.isOnline ?? false) && _isPlaying;
     ListeningGradeService.instance.setListeningOnline(playingOnline);
-    // 真实播放上报：在线歌曲开始播放时上传一次播放历史（mxid=album_audio_id）。
-    // 背景：听歌等级/时长对部分账号按"真实播放统计"记账，/user/grade/info 的
-    // diff 差量上报不被服务器记账（实测 status=1/error_code=0 但服务器值不动）。
-    // 上传播放历史即是真实播放信号，让这类账号也能累计听歌时长。按 song.id 去重，
-    // 同一首歌只在重新开始播放时上报一次；best-effort，失败不影响播放。
-    if (playingOnline) {
-      _maybeUploadPlayHistory(_currentSong);
-    }
+    // 历史遗留：曾在「开始播放在线歌曲」时补发一次 /playhistory/upload，用于让
+    // 按真实播放统计记账的账号累计时长。该补偿链路已由 CSCC 真实播放事件
+    // （/user/listen/report，见 [_handleListenReportSongChange]）取代 —— 后者携带
+    // 扣除暂停/拖动后的真实时长与播放结束状态，语义正确且不与「播放历史」混淆，
+    // 故此处不再重复上报，避免同一首歌被两条链路各记一次。
+    // 保留 [uploadPlayHistory] 方法本身：收藏夹/歌单页等「确实要写播放历史」的
+    // 场景仍可复用。
   }
 
-  /// 最近一次已上报播放历史的歌曲 id（避免同一首歌重复上报）。
-  String? _lastUploadedPlaySongId;
+  // —— CSCC 真实播放事件上报（`/user/listen/report`）——
+  // 记录上一首已发过 start 的歌曲 id；id 变化即切歌边沿。
+  String? _lastListenReportSongId;
 
-  /// 最佳努力上报一次该在线歌曲的播放历史（需要 album_audio_id 作为 mxid）。
-  void _maybeUploadPlayHistory(Song? song) {
-    if (song == null || _lastUploadedPlaySongId == song.id) return;
-    final audioId = song.albumAudioId;
-    if (audioId == null || audioId.isEmpty) return;
-    _lastUploadedPlaySongId = song.id;
+  /// 监听自身 notifyListeners：切歌时上报 CSCC `end` + `start`。
+  ///
+  /// PlayerProvider 无专门切歌回调（playSong/next/previous/playSongAt 多处切歌），
+  /// 与 [_handleLyriconSongChange] 同法用 addListener 监听自身，首行 short-circuit。
+  /// 登录态与开关由 [ListenReportService] 内部自行判定（未登录/未开启则不请求），
+  /// 故此处只负责「切歌边沿」这一件事，不重复判定登录态。
+  void _handleListenReportSongChange() {
+    final song = _currentSong;
+    final songId = song?.id;
+    if (songId == _lastListenReportSongId) return;
+
+    // 切歌边沿：先把被换掉的那首按「切换下一首」结账，再开新的一首。
+    if (_lastListenReportSongId != null) {
+      // ignore: discarded_futures
+      ListenReportService.instance.onSongEnded(
+        reason: PlaybackEndReason.switched,
+      );
+    }
+    _lastListenReportSongId = songId;
+
+    if (song == null) return;
+    if (!song.isOnline) return;
+    final mixsongid = song.albumAudioId;
+    if (mixsongid == null || mixsongid.isEmpty) return;
     // ignore: discarded_futures
-    KugouApiClient().uploadPlayHistory(audioId).catchError((_) => null);
-    // ignore: avoid_print
-    print('[PlayUpload] online 歌曲上报播放历史 song=${song.id} mxid=$audioId');
+    ListenReportService.instance.onSongStarted(
+      songId: songId!,
+      mixsongid: mixsongid,
+      // 如实传当前出声状态：切歌瞬间往往仍在缓冲（_isPlaying 尚未翻 true），
+      // 传错会把缓冲等待算进 duration。
+      playing: _isPlaying,
+    );
+  }
+
+  /// CSCC 上报所需的设备参数（机型/系统版本）。懒解析一次并缓存。
+  bool _listenReportDeviceInfoSet = false;
+
+  Future<void> _ensureListenReportDeviceInfo() async {
+    if (_listenReportDeviceInfoSet) return;
+    _listenReportDeviceInfoSet = true;
+    try {
+      // 复用诊断导出同款设备信息通道（MediaStoreService.getDeviceSummary）。
+      final summary = await MediaStoreService.getDeviceSummary();
+      if (summary == null) return;
+      final model = '${summary['manufacturer'] ?? ''} ${summary['model'] ?? ''}'
+          .trim();
+      final release = summary['release']?.toString();
+      ListenReportService.instance.setDeviceInfo(
+        deviceModel: model.isEmpty ? null : model,
+        systemVersion: (release == null || release.isEmpty) ? null : release,
+      );
+    } catch (_) {
+      // 取不到则留空，Rust 侧按 `dev` 配置与 system_version=9 兜底
+    }
   }
 
   Future<void> _initAudioService() async {
@@ -860,6 +912,8 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       _playingSubscription = _audioService.playingStream.listen((isPlaying) {
         _isPlaying = isPlaying;
         WakelockService.instance.setSongPlaying(isPlaying);
+        // CSCC 时长计时：暂停时停表、恢复时续表（墙钟累计，天然扣除暂停）。
+        ListenReportService.instance.onPlayingChanged(isPlaying);
         // try-catch：_updateNotification 内部（updateWidget 等）异常不应
         // 中断后续，否则暂停时 Kotlin 收不到 isPlaying=false，WakeLock 不释放
         try {
@@ -988,6 +1042,27 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     }
     _handlingCompletion = true;
     try {
+      // —— CSCC：自然播完上报「完整播放」——
+      // 必须在本函数**任何**改动 _currentSong 的动作之前上报：否则随后的
+      // 「切歌边沿」（_handleListenReportSongChange）会把它记成 `切换下一首`，
+      // `completed` 语义将永久丢失（此前只有该切歌边沿一个上报点，即此缺陷）。
+      // 异常结束（URL 过期 / 试听片段提前 completed）不算「完整播放」，交由下方
+      // 各分支的重试逻辑处理，故此处按同一判据排除 —— 与单曲循环分支的
+      // `isAbnormal`、末曲分支的 `isAbnormalEnd` 同式。
+      final posAtCompletion = _position;
+      final durAtCompletion = _currentSong?.duration ?? Duration.zero;
+      final bool completedAbnormally = posAtCompletion.inMilliseconds > 500 &&
+          durAtCompletion.inSeconds > 0 &&
+          posAtCompletion.inSeconds < durAtCompletion.inSeconds * 0.8;
+      if (!completedAbnormally) {
+        // 幂等：onSongEnded 内部 `tracker.end()` 无活动段时直接返回，
+        // 故随后切歌边沿发出的 `switched` 上报不会造成重复。
+        // ignore: discarded_futures
+        ListenReportService.instance.onSongEnded(
+          reason: PlaybackEndReason.completed,
+        );
+      }
+
       if (_loopMode == AppLoopMode.one) {
         // 单曲循环：检测在线歌曲是否异常结束（URL 过期 / 流中断），
         // 避免无限重播损坏的链接
@@ -1031,6 +1106,31 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
           _retryingSongId = null;
           seek(Duration.zero);
           _audioService?.play();
+          // —— CSCC：单曲循环「重播」是唯一同曲重开的路径，必须补一次 start ——
+          // 本分支 `_currentSong` 不变，故切歌边沿（_handleListenReportSongChange）
+          // 不会触发；若不在此补 start，tracker 会一直停在空段，
+          // 结果是**只有第一圈**能上报「完整播放」，之后每圈都静默丢弃。
+          // 守卫条件与切歌边沿保持一致（在线 + 有 albumAudioId）。
+          final loopSong = _currentSong;
+          final loopMixsongid = loopSong?.albumAudioId;
+          if (loopSong != null &&
+              loopSong.isOnline &&
+              loopMixsongid != null &&
+              loopMixsongid.isNotEmpty) {
+            // 如实传 `_isPlaying`（与切歌边沿同一口径），**不要**硬传 true：
+            // 实测单曲循环重播需重新缓冲约 1.9s（start 上报时刻与实际 PLAYING 之差），
+            // 硬传 true 会把这段静默等待计入 duration，使每圈虚高约 2%
+            // （上报 104945ms vs 独立反算 102984ms）。传 false 时本段仅登记不起表，
+            // 待 playingStream 的 true 事件经 setPlaying(true) 起表 —— 该事件实测在
+            // 调用后约 1.9s 才到达，而 onSongStarted 内部的 await（读设置/设备信息）
+            // 只需毫秒级，故「事件早于 tracker.start() 被丢弃」的竞态在实际时序下不成立。
+            // ignore: discarded_futures
+            ListenReportService.instance.onSongStarted(
+              songId: loopSong.id,
+              mixsongid: loopMixsongid,
+              playing: _isPlaying,
+            );
+          }
         }
       } else if (_currentIndex >= _playlist.length - 1) {
         // 走到这里：当前是最后一首（含单首歌场景），且非 FM、非列表循环
@@ -2330,6 +2430,9 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     // 拖动进度条：中止淡化（AudioService.seek 内部也会中止，这里同步清掉
     // 预加载状态，避免拖回中段后仍按旧的"即将播完"判定起播下一首）
     _resetCrossfadePrepared();
+    // CSCC 时长计时：seek 按墙钟计时，跳过的区间本就不计时；此处仅重新起表，
+    // 避免把 seek 落地耗时算进播放时长。
+    ListenReportService.instance.onSeek();
     // 立即更新位置，让 UI（进度条、歌词行高亮、滚动）即时响应
     // 否则要等 just_audio positionStream 触发，会有一帧的滞后，
     // 导致拖动 slider 后歌词不跟随。
@@ -2666,6 +2769,14 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
   }
 
   Future<void> clearPlaylist() async {
+    // —— CSCC：清空播放列表 = 用户主动停止播放 ——
+    // 必须早于下方 `_currentSong = null`：否则随后触发的切歌边沿
+    // （_handleListenReportSongChange）会把它记成「切换下一首」，`stopped` 语义丢失。
+    // 幂等：onSongEnded 首行 `tracker.end()` 在无活动段时直接返回，故不会重复上报。
+    // ignore: discarded_futures
+    ListenReportService.instance.onSongEnded(
+      reason: PlaybackEndReason.stopped,
+    );
     _resetCrossfadePrepared();
     // 可选扩展：播放源停止回调（默认关闭）
     if (_currentSong != null && _currentSong!.isOnline) {
@@ -2846,6 +2957,12 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
 
     // 2. 维护当前播放索引
     if (_playlist.isEmpty) {
+      // —— CSCC：队列被删空 = 用户主动停止播放 ——
+      // 必须早于下方 `_currentSong = null`（理由同 clearPlaylist）。
+      // ignore: discarded_futures
+      ListenReportService.instance.onSongEnded(
+        reason: PlaybackEndReason.stopped,
+      );
       _currentIndex = -1;
       _currentSong = null;
       _isPlaying = false;
@@ -3624,9 +3741,9 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
             if (filePath.startsWith('file://')) {
               filePath = Uri.parse(filePath).toFilePath();
             }
-            final embedded = LocalLyricLoader.loadForAudio(filePath);
+            final embedded = await LocalLyricLoader.loadForAudioAsync(filePath);
             if (embedded != null && embedded.isNotEmpty) {
-              lines = LyricParserChain.parse(embedded);
+              lines = await parseLyricOffMainThread(embedded);
             }
           }
         }
@@ -3634,7 +3751,7 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
         // 内嵌歌词为空时从酷狗 API 获取
         if (lines.isEmpty) {
           final ctx = appNavigatorKey.currentContext;
-          if (ctx != null) {
+          if (ctx != null && ctx.mounted) {
             try {
               final kugou = ctx.read<KugouProvider>();
               // 本地歌曲传空 hash + "歌名 艺术家" 关键词搜索；搜索词与播放器页面 full_player 保持一致，
@@ -3675,6 +3792,28 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     } catch (_) {}
   }
 
+  /// —— CSCC：进程终止前的兜底结算 ——
+  ///
+  /// 缺口：`PlaybackDurationTracker` 是**纯内存**的，进程一退，当前这段未上报的
+  /// 收听时长就永久丢失（此前 `dispose()` 与生命周期回调都只保存播放状态、不上报）。
+  ///
+  /// **为何不在 `paused` / `inactive` 触发**：本应用是音乐播放器，UI 退到后台后音乐
+  /// **继续播放**（前台服务保活，且项目没有「后台播放」开关）。若在 paused 上报 `end`，
+  /// 会把**正在进行**的收听错误切断，而音乐仍在播、tracker 已被清空 →
+  /// 后续时长反而全部丢失。故只在 `detached`（引擎即将销毁）与 `dispose()` 触发。
+  ///
+  /// 局限：这是**尽力而为**。上报需经 Dart → 本地 Rust 服务 → 酷狗上游两跳，
+  /// 进程若被立即杀死，请求可能来不及发出。要彻底消除丢失需周期性 checkpoint，
+  /// 但那会碎片化片段，且缺少合适的 `state` 语义（参考实现只文档化了「完整播放」）。
+  void _flushListenReportOnExit() {
+    final tracker = ListenReportService.instance.tracker;
+    if (!tracker.isTracking) return;
+    // ignore: discarded_futures
+    ListenReportService.instance.onSongEnded(
+      reason: PlaybackEndReason.stopped,
+    );
+  }
+
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.paused ||
@@ -3687,6 +3826,11 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       HistoryRepository().flush();
       // 后台失败兜底：切歌失败（挂后台网络受限）时启动周期重试，网络恢复即续播
       _startRetryFailedTimer();
+      // 仅 detached（进程即将终止）才结算收听段。
+      // paused / inactive 时音乐仍在后台播放，此处结算会把正在进行的收听错误切断。
+      if (state == AppLifecycleState.detached) {
+        _flushListenReportOnExit();
+      }
     } else if (state == AppLifecycleState.resumed) {
       // 回到前台：停止兜底定时器，立即重试一次失败的当前歌曲
       _stopRetryFailedTimer();
@@ -3696,6 +3840,9 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
 
   @override
   void dispose() {
+    // 进程即将销毁：兜底结算当前收听段（详见 _flushListenReportOnExit）。
+    // 放在最前 —— 后续会取消各订阅、dispose notifier，先结算更安全。
+    _flushListenReportOnExit();
     _saveState(); // 退出时立即保存
     _saveDebounce?.cancel();
     _connectivitySub?.cancel();
@@ -3703,6 +3850,7 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     _stopRetryFailedTimer();
     WidgetsBinding.instance.removeObserver(this);
     removeListener(_handleLyriconSongChange);
+    removeListener(_handleListenReportSongChange);
     LyriconProviderService.instance.removeListener(_handleLyriconEnabledChanged);
     _positionSubscription?.cancel();
     _durationSubscription?.cancel();

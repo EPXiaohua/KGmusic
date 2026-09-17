@@ -25,10 +25,35 @@ import 'usb_audio_service.dart';
 class DiagnosticExporter {
   DiagnosticExporter._();
 
+  static const MethodChannel _diagnosticChannel = MethodChannel(
+    'com.md3music.md3music/diagnostic_log',
+  );
+
   /// 收集信息并构建 zip 报告，返回 zip 文件。
   static Future<File> buildReport() async {
     final logger = DiagnosticLogger.instance;
-    // 1. 确保缓冲中的日志全部落盘
+    logger.info('开始导出诊断日志');
+
+    // 1. 先收集原生日志。收集过程产生的 Dart 日志随后一并 flush，避免导出包
+    // 缺少最后几行；Android 原生日志使用系统自带 D/I/W/E 等级。
+    String androidLogs = '';
+    String usbLogs = '';
+    if (!kIsWeb && Platform.isAndroid) {
+      try {
+        androidLogs =
+            await _diagnosticChannel.invokeMethod<String>('getAndroidLogs') ??
+            '';
+      } catch (e) {
+        logger.warning('Android 原生日志导出失败: $e');
+      }
+      try {
+        usbLogs = await UsbAudioService.instance.getUsbLogs();
+      } catch (e) {
+        logger.warning('USB 日志导出失败: $e');
+      }
+    }
+
+    // 2. 确保缓冲中的日志全部落盘
     await logger.flush();
 
     final logDir = logger.logDir;
@@ -37,7 +62,7 @@ class DiagnosticExporter {
     final workDir = Directory('${tmpRoot.path}/diagnostic_report_$stamp')
       ..createSync(recursive: true);
 
-    // 2. 复制日志目录内全部文件（app.log / app.log.N / native_crash_*.txt）
+    // 3. 复制日志目录内全部文件（app.log / app.log.N / native_crash_*.txt）
     if (logDir != null && logDir.existsSync()) {
       for (final entity in logDir.listSync()) {
         if (entity is File) {
@@ -50,27 +75,38 @@ class DiagnosticExporter {
       }
     }
 
-    // 2.5 USB 独占链路内部日志（app 侧内存环形 + logcat 自读过滤，
-    // 覆盖 just_audio 模块与 native 传输层），写入 usb.log 随报告导出。
-    if (!kIsWeb && Platform.isAndroid) {
-      try {
-        final usbLogs = await UsbAudioService.instance.getUsbLogs();
-        if (usbLogs.isNotEmpty) {
-          File('${workDir.path}/usb.log').writeAsStringSync(usbLogs,
-              flush: true);
-        }
-      } catch (_) {
-        // USB 日志导出失败不影响整体诊断报告
-      }
+    if (androidLogs.isNotEmpty) {
+      File(
+        '${workDir.path}/android.log',
+      ).writeAsStringSync(androidLogs, flush: true);
+    }
+    // USB 独占链路内部日志（app 侧内存环形 + native 传输层）。
+    if (usbLogs.isNotEmpty) {
+      File('${workDir.path}/usb.log').writeAsStringSync(usbLogs, flush: true);
     }
 
-    // 3. 生成设备/应用概览 + 日志文件清单（缺 app.log 时可直接定位原因）
-    final infoText = await _collectInfoText();
-    final logInventory = _collectLogInventory(logDir);
-    File('${workDir.path}/diagnostic_info.txt')
-        .writeAsStringSync('$infoText\n$logInventory', flush: true);
+    // 4. 生成分级摘要，排查时可先看 WARNING / ERROR，再按文件定位原文。
+    final logFiles = <String, String>{};
+    for (final entity in workDir.listSync().whereType<File>()) {
+      final name = _baseName(entity.path);
+      if (!name.toLowerCase().contains('.log')) continue;
+      try {
+        logFiles[name] = entity.readAsStringSync();
+      } catch (_) {}
+    }
+    File('${workDir.path}/log_summary.txt').writeAsStringSync(
+      buildLogSummary(logFiles: logFiles, exportTime: DateTime.now()),
+      flush: true,
+    );
 
-    // 4. 打包 zip 并清理工作目录
+    // 5. 生成设备/应用概览 + 导出文件清单（缺 app.log 时可直接定位原因）
+    final infoText = await _collectInfoText();
+    final logInventory = _collectLogInventory(workDir);
+    File(
+      '${workDir.path}/diagnostic_info.txt',
+    ).writeAsStringSync('$infoText\n$logInventory', flush: true);
+
+    // 6. 打包 zip 并清理工作目录
     final zip = await packageZip(
       sourceDir: workDir,
       outputDir: tmpRoot,
@@ -136,6 +172,102 @@ class DiagnosticExporter {
     return buffer.toString();
   }
 
+  /// 生成分级日志摘要。兼容新版完整标签、旧版单字母标签及 Android logcat。
+  @visibleForTesting
+  static String buildLogSummary({
+    required Map<String, String> logFiles,
+    required DateTime exportTime,
+  }) {
+    final total = <DiagnosticLogLevel, int>{
+      for (final level in DiagnosticLogLevel.values) level: 0,
+    };
+    final perFile = <String, Map<DiagnosticLogLevel, int>>{};
+    final importantLines = <String>[];
+
+    final names = logFiles.keys.toList()..sort();
+    for (final name in names) {
+      final counts = <DiagnosticLogLevel, int>{
+        for (final level in DiagnosticLogLevel.values) level: 0,
+      };
+      for (final line in logFiles[name]!.split(RegExp(r'\r?\n'))) {
+        final level = _parseLevel(line);
+        if (level == null) continue;
+        counts[level] = counts[level]! + 1;
+        total[level] = total[level]! + 1;
+        if (level == DiagnosticLogLevel.warning ||
+            level == DiagnosticLogLevel.error) {
+          importantLines.add('[$name] $line');
+        }
+      }
+      perFile[name] = counts;
+    }
+
+    String row(String name, Map<DiagnosticLogLevel, int> counts) =>
+        '$name: DEBUG=${counts[DiagnosticLogLevel.debug]} '
+        'INFO=${counts[DiagnosticLogLevel.info]} '
+        'WARNING=${counts[DiagnosticLogLevel.warning]} '
+        'ERROR=${counts[DiagnosticLogLevel.error]}';
+
+    final buffer = StringBuffer()
+      ..writeln('MD3Music 分级日志摘要')
+      ..writeln('生成时间: ${exportTime.toIso8601String()}')
+      ..writeln('统计口径: 按带级别标记的日志行统计')
+      ..writeln('')
+      ..writeln('[按文件统计]');
+    if (perFile.isEmpty) {
+      buffer.writeln('（没有可统计的日志文件）');
+    } else {
+      for (final name in names) {
+        buffer.writeln(row(name, perFile[name]!));
+      }
+    }
+    buffer
+      ..writeln('')
+      ..writeln('[合计]')
+      ..writeln(row('全部日志', total))
+      ..writeln('')
+      ..writeln('[最近 WARNING / ERROR，最多 100 行]');
+    final recent = importantLines.length > 100
+        ? importantLines.sublist(importantLines.length - 100)
+        : importantLines;
+    if (recent.isEmpty) {
+      buffer.writeln('（无）');
+    } else {
+      for (final line in recent) {
+        buffer.writeln(line);
+      }
+    }
+    return buffer.toString();
+  }
+
+  static DiagnosticLogLevel? _parseLevel(String line) {
+    final dartMatch = RegExp(
+      r'^\d{4}-\d{2}-\d{2} .*\[(DEBUG|INFO|WARNING|ERROR|D|I|W|E)\] ',
+    ).firstMatch(line);
+    if (dartMatch != null) {
+      return switch (dartMatch.group(1)) {
+        'DEBUG' || 'D' => DiagnosticLogLevel.debug,
+        'INFO' || 'I' => DiagnosticLogLevel.info,
+        'WARNING' || 'W' => DiagnosticLogLevel.warning,
+        'ERROR' || 'E' => DiagnosticLogLevel.error,
+        _ => null,
+      };
+    }
+
+    // Android threadtime：`09-16 12:34:56.789  pid  tid D Tag: message`
+    // USB 环形：`09-16 12:34:56.789 D/Tag: message`
+    final nativeMatch = RegExp(
+      r'^\d{2}-\d{2} .*?\s([VDIWEF])(?:\s|/)',
+    ).firstMatch(line);
+    return switch (nativeMatch?.group(1)) {
+      'V' || 'D' => DiagnosticLogLevel.debug,
+      'I' => DiagnosticLogLevel.info,
+      'W' => DiagnosticLogLevel.warning,
+      'E' || 'F' => DiagnosticLogLevel.error,
+      _ => null,
+    };
+  }
+
   /// 生成诊断信息文本（白名单字段，测试可见）。
   ///
   /// 只输出入参给出的字段；不要在此读取 SharedPreferences 或任何账号数据。
@@ -170,7 +302,9 @@ class DiagnosticExporter {
       ..writeln('端口: ${serverPort ?? '未知'}')
       ..writeln('')
       ..writeln('[说明]')
-      ..writeln('本文件由应用内诊断功能自动生成，仅包含设备与运行环境信息。');
+      ..writeln('本文件由应用内诊断功能自动生成，仅包含设备与运行环境信息。')
+      ..writeln('日志级别: DEBUG / INFO / WARNING / ERROR')
+      ..writeln('日志文件: app.log*、android.log、usb.log、log_summary.txt');
     return buffer.toString();
   }
 
@@ -213,16 +347,14 @@ class DiagnosticExporter {
       final summary = await MediaStoreService.getDeviceSummary();
       if (summary != null) {
         deviceModel =
-            '${summary['manufacturer'] ?? ''} ${summary['model'] ?? ''}'
-                .trim();
+            '${summary['manufacturer'] ?? ''} ${summary['model'] ?? ''}'.trim();
         osVersion =
             'Android ${summary['release'] ?? ''} (API ${summary['sdkInt'] ?? ''})';
       }
       // 渲染引擎（skia/impeller）由构建期 flavor 决定，是图形类 bug 的
       // 关键上下文；复用设置页「当前渲染引擎」同款通道（MainActivity 注册）。
       try {
-        const channel =
-            MethodChannel('com.md3music.md3music/render_engine');
+        const channel = MethodChannel('com.md3music.md3music/render_engine');
         final v = await channel.invokeMethod<String>('getCurrent');
         renderEngine = v == 'impeller' ? 'impeller' : 'skia';
       } catch (_) {}

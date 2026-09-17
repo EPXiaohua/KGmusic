@@ -14,6 +14,7 @@ import 'modules/recognition/floating_recognition_service.dart';
 import 'core/services/equalizer_service.dart';
 import 'core/services/lyricon_provider_service.dart';
 import 'core/services/listening_grade_service.dart';
+import 'core/services/listen_report_service.dart';
 import 'core/services/media_notification_service.dart';
 import 'core/services/usb_audio_service.dart';
 import 'core/services/wakelock_service.dart';
@@ -116,6 +117,9 @@ Future<(bool, bool)> runBootstrap() async {
 
   // 启动听歌等级：本地听歌时长累计 + 自动上报（内部按平台/登录态自行处理）
   ListeningGradeService.instance.init();
+  // CSCC 真实播放事件上报（/user/listen/report）：由 PlayerProvider 在切歌/播放
+  // 边沿驱动，开关复用 settings_upload_listening_duration（默认关闭）。
+  ListenReportService.instance.init();
 
   // P0: 本地 API 服务器与 DLNA 本地 HTTP 服务器改为后台启动（不阻塞 runApp）。
   // 之前 await KugouApiServer.start() 在首帧前完成，其中
