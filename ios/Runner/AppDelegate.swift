@@ -604,6 +604,19 @@ final class LyricsPipManager: NSObject {
       // 16:9 帧尺寸；背景交给每帧自绘的半透明黑，layer 本底透明
       layer.bounds = CGRect(x: 0, y: 0, width: 720, height: 405)
       layer.backgroundColor = UIColor(white: 0, alpha: 0).cgColor
+      // PiP 要求 sampleBuffer layer 已挂进视图层级，否则 startPictureInPicture
+      // 会被系统静默忽略。挂到 keyWindow 根层并移到屏幕外，避免遮挡 App 界面。
+      let windows = UIApplication.shared.connectedScenes
+        .compactMap { $0 as? UIWindowScene }
+        .flatMap { $0.windows }
+      if let rootLayer = (windows.first { $0.isKeyWindow } ?? windows.first)?
+        .rootViewController?.view.layer {
+        layer.position = CGPoint(x: -10000, y: -10000)
+        rootLayer.addSublayer(layer)
+        NSLog("[MD3Music] lyrics pip layer attached")
+      } else {
+        NSLog("[MD3Music] lyrics pip no root layer!")
+      }
       let delegate = PipPlaybackDelegate()
       delegate.isPlaying = { [weak self] in self?.playing ?? false }
       // PiP 窗口播放/暂停按钮 → 回传 Dart 切换播放（Dart 播完经 update 回流状态）
