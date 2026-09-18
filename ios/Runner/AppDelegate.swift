@@ -4,6 +4,7 @@ import PhotosUI
 import UniformTypeIdentifiers
 import MediaPlayer
 import AVFoundation
+import AVKit
 import CoreMedia
 
 @main
