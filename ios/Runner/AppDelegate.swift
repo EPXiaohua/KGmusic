@@ -851,20 +851,20 @@ private final class PipPlaybackDelegate: NSObject,
     completionHandler()
   }
 
-  func pictureInPictureControllerTimeRange(
-    _ pictureInPictureController: AVPictureInPictureController,
-    didChange timeRange: CMTimeRange
-  ) {
-    // 歌词进度由 Dart 端 update 推送，忽略系统 timeRange 事件
+  func pictureInPictureControllerTimeRangeForPlayback(
+    _ pictureInPictureController: AVPictureInPictureController
+  ) -> CMTimeRange {
+    // 歌词进度由 Dart 端 update 推送，返回空区间即可（CMD+R 键等不适用）
+    CMTimeRange()
   }
 
-  func pictureInPictureControllerDidStart(
+  func pictureInPictureControllerDidStartPictureInPicture(
     _ pictureInPictureController: AVPictureInPictureController
   ) {
     onStarted()
   }
 
-  func pictureInPictureControllerDidStop(
+  func pictureInPictureControllerDidStopPictureInPicture(
     _ pictureInPictureController: AVPictureInPictureController
   ) {
     onStopped()
