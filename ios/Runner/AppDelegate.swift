@@ -473,6 +473,8 @@ final class LyricsPipManager: NSObject {
   private var renderedLineIndex = -1
   /// 强制下一帧重绘（setLyrics / start / 播放状态翻转时置位）
   private var frameDirty = false
+  /// 帧时钟：PTS 与它的当前时间对齐后帧才会被立即呈现
+  private var controlTimebase: CMTimebase?
   private var pipController: AVPictureInPictureController?
   private var displayLayer: AVSampleBufferDisplayLayer?
   /// 持有 playbackDelegate 强引用（controller.delegate 为弱引用）
@@ -550,6 +552,12 @@ final class LyricsPipManager: NSObject {
       self.playing = playing
       frameDirty = true
     }
+    // 每次进度推送都把帧时钟拉回 hostTime 并跟随播放/暂停，
+    // 避免长时间运行后 timebase 落后于帧 PTS 导致画面冻结
+    if let tb = controlTimebase {
+      CMTimebaseSetTime(tb, CMClock.hostTimeClock.time)
+      CMTimebaseSetRate(tb, playing ? 1.0 : 0.0)
+    }
     maybeRenderFrame()
   }
 
@@ -617,10 +625,13 @@ final class LyricsPipManager: NSObject {
       } else {
         NSLog("[MD3Music] lyrics pip no root layer!")
       }
-      // 帧时钟：hostTime 派生的 timebase，帧按 PTS 即时呈现；不设会导致
-      // sampleBuffer 层一直等待、PiP 窗口转圈
+      // 帧时钟：hostTime 派生的 timebase。必须把它的当前时间对齐到 hostTime
+      // （新建的 timebase 时间从 0 起算，而帧 PTS 是 hostTime，不对齐帧永远不显示）
       if let tb = try? CMTimebase(sourceClock: CMClock.hostTimeClock) {
+        CMTimebaseSetTime(tb, CMClock.hostTimeClock.time)
+        CMTimebaseSetRate(tb, 1.0)
         layer.controlTimebase = tb
+        controlTimebase = tb
       }
       let delegate = PipPlaybackDelegate()
       delegate.isPlaying = { [weak self] in self?.playing ?? false }
