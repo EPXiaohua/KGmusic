@@ -475,6 +475,9 @@ final class LyricsPipManager: NSObject {
   private var frameDirty = false
   /// 帧时钟：PTS 与它的当前时间对齐后帧才会被立即呈现
   private var controlTimebase: CMTimebase?
+  /// PiP 激活期间低频补帧：保证流不中断（单帧入队可能不被系统提交显示），
+  /// 也让歌词行变化在 update 停发时仍能上屏
+  private var frameTimer: Timer?
   private var pipController: AVPictureInPictureController?
   private var displayLayer: AVSampleBufferDisplayLayer?
   /// 持有 playbackDelegate 强引用（controller.delegate 为弱引用）
@@ -643,7 +646,11 @@ final class LyricsPipManager: NSObject {
           "command", arguments: ["action": "pipPlayPause", "playing": value])
       }
       delegate.onStarted = { [weak self] in self?.notifyState(active: true) }
-      delegate.onStopped = { [weak self] in self?.notifyState(active: false) }
+      delegate.onStopped = { [weak self] in
+        self?.frameTimer?.invalidate()
+        self?.frameTimer = nil
+        self?.notifyState(active: false)
+      }
       delegate.onRenderSizeChange = { [weak self] in
         self?.frameDirty = true
         self?.maybeRenderFrame()
@@ -661,6 +668,12 @@ final class LyricsPipManager: NSObject {
     // 启动时强制渲染首帧（用最近一次推送的进度），让窗口出现即有内容
     frameDirty = true
     maybeRenderFrame()
+    frameTimer?.invalidate()
+    frameTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+      guard let self = self else { return }
+      self.frameDirty = true
+      self.maybeRenderFrame()
+    }
     pipController?.startPictureInPicture()
     NSLog("[MD3Music] lyrics pip start requested")
     result(true)
@@ -763,7 +776,21 @@ final class LyricsPipManager: NSObject {
     ctx.fill(CGRect(x: 0, y: 0, width: CGFloat(progress) * width, height: barHeight))
 
     let idx = renderedLineIndex
-    guard lines.indices.contains(idx) else { return }
+    guard lines.indices.contains(idx) else {
+      // 无歌词可画：给出可见的回退画面（同时充当诊断信息——
+      // 如果悬浮窗显示这行字，说明渲染/推流链路是通的，只是歌词未送达）
+      let hint = lines.isEmpty
+        ? "♪ 等待歌词… (n=0, pos=\(Int(positionMs))ms)"
+        : "♪ 间奏中…"
+      let attrs: [NSAttributedString.Key: Any] = [
+        .font: UIFont.systemFont(ofSize: 26, weight: .medium),
+        .foregroundColor: UIColor.white.withAlphaComponent(0.75),
+      ]
+      (hint as NSString).draw(
+        at: CGPoint(x: 24, y: height / 2 - 16),
+        withAttributes: attrs)
+      return
+    }
 
     let horizontalPadding: CGFloat = 48
     let maxTextWidth = width - horizontalPadding * 2
