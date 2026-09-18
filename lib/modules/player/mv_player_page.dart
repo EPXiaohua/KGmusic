@@ -1,6 +1,5 @@
 import 'package:chewie/chewie.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:m3e_core/m3e_core.dart';
 import 'package:provider/provider.dart';
 import 'package:video_player/video_player.dart';
@@ -63,9 +62,10 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
   /// 设置开关：是否按 Home 自动进入画中画（默认关闭，手动按钮不受影响）。
   bool _autoPipEnabled = false;
 
-  /// 自实现全屏状态：进入时强制横屏 + 全屏铺视频，退出恢复竖屏。
-  /// 不用 chewie 内建全屏路由（iOS 卡死，见 ChewieController 注释）。
-  bool _isFullscreen = false;
+  /// Chewie 的 GlobalKey：横竖屏切换时页面在 Row/ListView 两套布局间切换，
+  /// 会导致 Chewie Element 重建、内建全屏状态（_isFullScreen）被重置，
+  /// 全屏返回箭头因此失效。GlobalKey 保证重挂载时复用同一 State。
+  final GlobalKey _chewieKey = GlobalKey();
 
   @override
   void initState() {
@@ -112,17 +112,6 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
   @override
   void dispose() {
     _disposed = true;
-    // 全屏态下退出页面：恢复方向与系统 UI（fire-and-forget，dispose 不能 await）
-    if (_isFullscreen) {
-      SystemChrome.setEnabledSystemUIMode(
-        SystemUiMode.manual,
-        overlays: SystemUiOverlay.values,
-      );
-      SystemChrome.setPreferredOrientations([
-        DeviceOrientation.portraitUp,
-        DeviceOrientation.portraitDown,
-      ]);
-    }
     // 移除投屏状态监听
     try {
       context.read<DlnaProvider>().removeListener(_onDlnaStateChanged);
@@ -178,7 +167,9 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
     final aspectRatio = controller?.value.aspectRatio;
     PipService.instance.setVideoActive(
       _autoPipEnabled && playing,
-      aspectRatio: (aspectRatio != null && aspectRatio > 0) ? aspectRatio : null,
+      aspectRatio: (aspectRatio != null && aspectRatio > 0)
+          ? aspectRatio
+          : null,
     );
   }
 
@@ -271,7 +262,10 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
     await _initVideoController(url, autoPlay: true);
   }
 
-  Future<void> _initVideoController(String url, {required bool autoPlay}) async {
+  Future<void> _initVideoController(
+    String url, {
+    required bool autoPlay,
+  }) async {
     _currentVideoUrl = url;
     try {
       final controller = VideoPlayerController.networkUrl(Uri.parse(url));
@@ -286,11 +280,6 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
         looping: false,
         showControls: true,
         showOptions: false,
-        // iOS 禁用 chewie 内建全屏路由：其全屏状态存放在原页面的 ChewieState，
-        // 进入全屏强制横屏会让本页 ListView/Row 重排、Chewie Element 重建，
-        // 状态失步导致全屏路由永不 pop（iOS 卡死；Android 靠系统返回键兜底）。
-        // 改由本页自实现全屏（见 _enterFullscreen/_exitFullscreen）。
-        allowFullScreen: false,
       );
       setState(() {
         _controller = controller;
@@ -352,8 +341,6 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
         looping: false,
         showControls: true,
         showOptions: false,
-        // 同上：禁用内建全屏路由，避免 iOS 全屏退出卡死
-        allowFullScreen: false,
       );
       if (_disposed) {
         controller.dispose();
@@ -389,10 +376,7 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
               padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
               child: Align(
                 alignment: Alignment.centerLeft,
-                child: Text(
-                  '清晰度',
-                  style: Theme.of(ctx).textTheme.titleMedium,
-                ),
+                child: Text('清晰度', style: Theme.of(ctx).textTheme.titleMedium),
               ),
             ),
             const Divider(height: 1),
@@ -422,39 +406,11 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
     );
   }
 
-  /// 自实现全屏：强制横屏 + 隐藏系统 UI，视频与 chewie 控件全屏铺开。
-  Future<void> _enterFullscreen() async {
-    if (_isFullscreen) return;
-    setState(() => _isFullscreen = true);
-    await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
-    await SystemChrome.setPreferredOrientations([
-      DeviceOrientation.landscapeLeft,
-      DeviceOrientation.landscapeRight,
-    ]);
-  }
-
-  /// 退出全屏：恢复竖屏与系统 UI。重复调用安全。
-  Future<void> _exitFullscreen() async {
-    if (!_isFullscreen) return;
-    setState(() => _isFullscreen = false);
-    await SystemChrome.setEnabledSystemUIMode(
-      SystemUiMode.manual,
-      overlays: SystemUiOverlay.values,
-    );
-    await SystemChrome.setPreferredOrientations([
-      DeviceOrientation.portraitUp,
-      DeviceOrientation.portraitDown,
-    ]);
-  }
-
   @override
   Widget build(BuildContext context) {
     // 画中画模式：只渲染纯视频（隐藏 AppBar 与其余 UI），窗口比例即视频比例
     if (PipService.instance.isPipMode.value) {
       return _buildPipBody();
-    }
-    if (_isFullscreen) {
-      return _buildFullscreenBody();
     }
     final colorScheme = Theme.of(context).colorScheme;
     final textTheme = Theme.of(context).textTheme;
@@ -475,49 +431,6 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
     );
   }
 
-  /// 全屏布局：纯黑底铺满，chewie 控件（进度条/播放/倍速）保留，
-  /// 左上角退出全屏按钮、右上角画中画按钮。Android 返回键退出全屏而非页面。
-  Widget _buildFullscreenBody() {
-    return PopScope(
-      canPop: false,
-      onPopInvokedWithResult: (didPop, _) {
-        if (!didPop) _exitFullscreen();
-      },
-      child: Scaffold(
-        backgroundColor: Colors.black,
-        body: Stack(
-          fit: StackFit.expand,
-          children: [
-            _chewieController != null
-                ? Chewie(controller: _chewieController!)
-                : const Center(
-                    child: M3ECircularProgressIndicator(color: Colors.white),
-                  ),
-            Positioned(
-              top: 12,
-              left: 12,
-              child: _buildOverlayIconButton(
-                Icons.arrow_back,
-                '退出全屏',
-                _exitFullscreen,
-              ),
-            ),
-            if (_pipSupported && _chewieController != null)
-              Positioned(
-                top: 12,
-                right: 12,
-                child: _buildOverlayIconButton(
-                  Icons.picture_in_picture_alt,
-                  '画中画',
-                  _enterPip,
-                ),
-              ),
-          ],
-        ),
-      ),
-    );
-  }
-
   Widget _buildLoading(ColorScheme colorScheme) {
     return Center(
       child: Column(
@@ -525,7 +438,10 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
         children: [
           const M3ELoadingIndicator(),
           const SizedBox(height: 16),
-          Text('正在加载 MV...', style: TextStyle(color: colorScheme.onSurfaceVariant)),
+          Text(
+            '正在加载 MV...',
+            style: TextStyle(color: colorScheme.onSurfaceVariant),
+          ),
         ],
       ),
     );
@@ -538,13 +454,19 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(Icons.music_off_outlined, size: 64, color: colorScheme.onSurfaceVariant),
+            Icon(
+              Icons.music_off_outlined,
+              size: 64,
+              color: colorScheme.onSurfaceVariant,
+            ),
             const SizedBox(height: 16),
             Text('该歌曲暂无 MV', style: textTheme.titleMedium),
             const SizedBox(height: 8),
             Text(
               '没有找到这首歌的 MV 资源',
-              style: textTheme.bodySmall?.copyWith(color: colorScheme.onSurfaceVariant),
+              style: textTheme.bodySmall?.copyWith(
+                color: colorScheme.onSurfaceVariant,
+              ),
             ),
           ],
         ),
@@ -566,7 +488,9 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
             Text(
               _errorMessage,
               textAlign: TextAlign.center,
-              style: textTheme.bodySmall?.copyWith(color: colorScheme.onSurfaceVariant),
+              style: textTheme.bodySmall?.copyWith(
+                color: colorScheme.onSurfaceVariant,
+              ),
             ),
             const SizedBox(height: 16),
             FilledButton.tonalIcon(
@@ -601,22 +525,13 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
         fit: StackFit.expand,
         children: [
           _chewieController != null
-              ? Chewie(controller: _chewieController!)
-              : const Center(child: M3ECircularProgressIndicator(color: Colors.white)),
+              ? Chewie(key: _chewieKey, controller: _chewieController!)
+              : const Center(
+                  child: M3ECircularProgressIndicator(color: Colors.white),
+                ),
           // 画中画按钮：仅支持的设备、视频就绪且非画中画状态时显示（右上角）
           if (_pipSupported && _chewieController != null)
-            Positioned(
-              top: 12,
-              right: 12,
-              child: _buildPipButton(),
-            ),
-          // 全屏按钮：右上角（画中画按钮存在时排其左侧）
-          if (_chewieController != null)
-            Positioned(
-              top: 12,
-              right: (_pipSupported && _chewieController != null) ? 64 : 12,
-              child: _buildFullscreenButton(),
-            ),
+            Positioned(top: 12, right: 12, child: _buildPipButton()),
         ],
       ),
     );
@@ -670,38 +585,20 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
     );
   }
 
-  /// 画中画按钮：点击进入画中画。
+  /// 画中画按钮：半透明圆形图标，点击进入画中画。
   Widget _buildPipButton() {
-    return _buildOverlayIconButton(
-      Icons.picture_in_picture_alt,
-      '画中画',
-      _enterPip,
-    );
-  }
-
-  /// 全屏按钮：进入自实现全屏。
-  Widget _buildFullscreenButton() {
-    return _buildOverlayIconButton(
-      Icons.fullscreen,
-      '全屏',
-      _enterFullscreen,
-    );
-  }
-
-  /// 视频区半透明圆形悬浮按钮（画中画/全屏/退出全屏共用样式）。
-  Widget _buildOverlayIconButton(
-    IconData icon,
-    String tooltip,
-    VoidCallback onTap,
-  ) {
     return Material(
       color: Colors.black.withValues(alpha: 0.6),
       shape: const CircleBorder(),
       clipBehavior: Clip.antiAlias,
       child: IconButton(
-        icon: Icon(icon, color: Colors.white, size: 20),
-        tooltip: tooltip,
-        onPressed: onTap,
+        icon: const Icon(
+          Icons.picture_in_picture_alt,
+          color: Colors.white,
+          size: 20,
+        ),
+        tooltip: '画中画',
+        onPressed: _enterPip,
       ),
     );
   }
@@ -744,7 +641,11 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
       child: Row(
         children: [
-          Icon(Icons.high_quality_outlined, size: 20, color: colorScheme.onSurfaceVariant),
+          Icon(
+            Icons.high_quality_outlined,
+            size: 20,
+            color: colorScheme.onSurfaceVariant,
+          ),
           const SizedBox(width: 8),
           Text('清晰度', style: textTheme.labelLarge),
           const Spacer(),
@@ -792,9 +693,15 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
             runSpacing: 8,
             children: [
               if (detail?.duration != null)
-                _infoChip(Icons.timer_outlined, _formatDuration(detail!.duration!)),
+                _infoChip(
+                  Icons.timer_outlined,
+                  _formatDuration(detail!.duration!),
+                ),
               if (detail?.playCountLabel.isNotEmpty == true)
-                _infoChip(Icons.play_circle_outline, '播放 ${detail!.playCountLabel}'),
+                _infoChip(
+                  Icons.play_circle_outline,
+                  '播放 ${detail!.playCountLabel}',
+                ),
               if (song.album.isNotEmpty)
                 _infoChip(Icons.album_outlined, song.album),
             ],
@@ -805,7 +712,9 @@ class _MvPlayerPageState extends State<MvPlayerPage> {
             const SizedBox(height: 4),
             Text(
               detail.desc!,
-              style: textTheme.bodyMedium?.copyWith(color: colorScheme.onSurfaceVariant),
+              style: textTheme.bodyMedium?.copyWith(
+                color: colorScheme.onSurfaceVariant,
+              ),
             ),
           ],
         ],
