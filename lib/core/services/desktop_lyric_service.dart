@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
@@ -21,7 +20,6 @@ import 'package:md3music/widgets/apple_lyrics/models/lyric_line.dart';
 import '../../widgets/apple_lyrics/layout/lyric_preferences.dart';
 import '../../widgets/apple_lyrics/parsers/lyric_parser_chain.dart';
 import 'media_notification_service.dart';
-import 'lyrics_pip_service.dart';
 import 'lyric_info_json_builder.dart';
 
 /// 解析歌词文本，超过 32KB 时移入 isolate。
@@ -65,8 +63,6 @@ class DesktopLyricService {
   DesktopLyricService._() {
     // AM 歌词偏好变化（字号/行距/字重/字体/副行/动态取色）→ 锁屏歌词跟随重推
     LyricPreferences.instance.addListener(_onLyricPrefsChangedForLockScreen);
-    // iOS PiP 悬浮窗激活态变化（含用户从 PiP 窗口关闭）→ 刷新按钮高亮
-    LyricsPipService.instance.onActiveChanged = _notify;
   }
 
   PlayerProvider? _player;
@@ -77,12 +73,7 @@ class DesktopLyricService {
   final SettingsRepository _settings = SettingsRepository();
 
   bool _enabled = false;
-
-  /// 悬浮歌词开关态。iOS 上 PiP 悬浮窗与 Android FloatingLyricService 是两条
-  /// 独立路径：iOS 返回 LyricsPipService 的激活态，按钮高亮随之同步（含用户
-  /// 从 PiP 窗口关闭时）；Android 行为不变。
-  bool get enabled =>
-      Platform.isIOS ? LyricsPipService.instance.active : _enabled;
+  bool get enabled => _enabled;
 
   // 蓝牙歌词开关：独立于悬浮窗。ColorOS SystemUI 与 AVRCP 共用 MediaSession，
   // 4.0 接入后原生端必须保持稳定 title/artist，因此不再用该通道改写会话身份。
@@ -314,36 +305,11 @@ class DesktopLyricService {
 
   /// 切换桌面歌词开关（mini_player / 通知栏按钮通用）
   Future<void> toggle() async {
-    // iOS：悬浮歌词走系统画中画（LyricsPipManager），不弹悬浮窗权限；
-    // Android 保持原 FloatingLyricService 路径，一行不改。
-    if (Platform.isIOS) {
-      await _toggleIosPipFloatingLyric();
-      return;
-    }
     if (_enabled) {
       await disable();
     } else {
       await enable();
     }
-  }
-
-  /// iOS 分支：开关 PiP 悬浮歌词（full_player / full_player_am / mini_player
-  /// 的桌面歌词按钮共用）。启动成功后补推当前歌曲歌词 + 立即推一次进度，
-  /// 让 PiP 首帧就位（不等下一个 1s tick）。
-  Future<void> _toggleIosPipFloatingLyric() async {
-    final active = await LyricsPipService.instance.toggle();
-    if (active) {
-      _bindProvidersFromContext();
-      final player = _player;
-      if (player != null) {
-        player.pushCurrentLyricsToPip();
-        await LyricsPipService.instance.update(
-          positionMs: player.position.inMilliseconds,
-          playing: player.isPlaying,
-        );
-      }
-    }
-    _notify();
   }
 
   Future<void> enable() async {

@@ -13,7 +13,6 @@ import '../core/services/audio_service.dart';
 import '../core/services/audio_service_io.dart'
     hide AudioService, createAudioSource;
 import '../core/services/desktop_lyric_service.dart';
-import '../core/services/lyrics_pip_service.dart';
 import '../core/services/home_widget_service.dart';
 import '../core/services/lyricon_provider_service.dart';
 import '../core/services/listening_grade_service.dart';
@@ -343,10 +342,6 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
   // 歌词异步拉取的竞态 token：每次切歌自增，过期结果被丢弃
   int _lyriconFetchToken = 0;
 
-  // —— iOS PiP 悬浮歌词钩子字段 ——（与 Lyricon 同法监听自身检测切歌）
-  Song? _lastPipSong;
-  int _pipFetchToken = 0;
-
   // —— 播放状态持久化 ——
   final _stateRepo = PlayerStateRepository();
   bool _stateRestored = false;
@@ -358,8 +353,6 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
     _initAudioService();
     // 监听自身变化检测切歌 → 推送 Lyricon（仅 enabled 时实际推送）
     addListener(_handleLyriconSongChange);
-    // 监听自身变化检测切歌 → 推送 iOS PiP 悬浮歌词（仅 iOS 且 PiP 激活时拉取）
-    addListener(_handlePipSongChange);
     // 同步「是否正在播放在线歌曲」到听歌等级服务（累计本地听歌时长用）
     addListener(_syncListeningGradeOnline);
     // CSCC 真实播放事件上报（/user/listen/report）：切歌 → 补发前一首 end + 发新 start。
@@ -479,8 +472,6 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       // 否则锁屏显示后进后台播放会被打断。仅 iOS 生效，Android 全 no-op。
       NowPlayingService.instance.onCommand = _handleNowPlayingCommand;
       await NowPlayingService.instance.init();
-      // iOS PiP 悬浮歌词：窗口内播放/暂停按钮 → 切换播放（与锁屏命令同一套）
-      LyricsPipService.instance.onPipPlayPause = _handlePipPlayPause;
       // USB 独占关闭后自动恢复 delegate 输出：旧 usb HAL 输出流被独占 force
       // disconnect 杀死，只有重建 AudioTrack（复刻"暂停→重播"）才能重新出声。
       UsbAudioService.instance.onExclusiveDisabled =
@@ -961,11 +952,6 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
           positionMs: _position.inMilliseconds,
           playing: isPlaying,
           speed: _speed,
-        );
-        // iOS PiP 悬浮歌词：状态翻转立即推（isPlaybackPaused / 窗口内按钮态）
-        LyricsPipService.instance.update(
-          positionMs: _position.inMilliseconds,
-          playing: isPlaying,
         );
         notifyListeners();
         // 播放/暂停切换时立即推 Lyricon，避免等下一个 positionStream tick
@@ -2527,11 +2513,6 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       playing: _isPlaying,
       speed: _speed,
     );
-    // iOS PiP 悬浮歌词：seek 后立即同步（暂停态 seek 也推，避免停留在旧行）
-    LyricsPipService.instance.update(
-      positionMs: position.inMilliseconds,
-      playing: _isPlaying,
-    );
   }
 
   Future<bool> _resolveAndPlayCurrentSong({
@@ -3525,11 +3506,6 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
       playing: true,
       speed: _speed,
     );
-    // iOS PiP 悬浮歌词进度：沿用同一 ~1s 节流（原生仅行变化时重绘）
-    LyricsPipService.instance.update(
-      positionMs: position.inMilliseconds,
-      playing: true,
-    );
   }
 
   /// iOS 锁屏/控制中心远程命令回调（channel 仅 iOS 注册，此处再判平台双保险）。
@@ -3554,107 +3530,6 @@ class PlayerProvider extends ChangeNotifier with WidgetsBindingObserver {
         if (positionMs != null) {
           seek(Duration(milliseconds: positionMs));
         }
-    }
-  }
-
-  // —— iOS PiP 悬浮歌词：切歌拉歌词 + 窗口内播放按钮 ——
-
-  /// 监听自身 notifyListeners：切歌时拉取歌词并推送 iOS PiP 悬浮窗。
-  /// 与 [_handleLyriconSongChange] 同法。仅 iOS 且 PiP 激活时实际拉取；
-  /// 未激活时清空 [_lastPipSong]，保证下次 start 后经 [pushCurrentLyricsToPip]
-  /// 能补推当前歌曲。
-  void _handlePipSongChange() {
-    if (!Platform.isIOS) return;
-    final song = _currentSong;
-    if (song?.id == _lastPipSong?.id) return;
-    if (!LyricsPipService.instance.active) {
-      _lastPipSong = null;
-      return;
-    }
-    _lastPipSong = song;
-    // ignore: discarded_futures
-    _pushPipSongChange(song);
-  }
-
-  /// PiP 启动成功后由 DesktopLyricService 调用：补推当前歌曲歌词。
-  void pushCurrentLyricsToPip() {
-    if (!Platform.isIOS) return;
-    _lastPipSong = null;
-    _handlePipSongChange();
-  }
-
-  /// 拉取歌词 → 解析 → 推送 LyricsPipService。
-  ///
-  /// 参考 [_pushLyriconSongChange] 的模式：内嵌歌词优先，空则走酷狗 API
-  /// （搜索词与 full_player / Lyricon 一致，命中同版本歌词）。
-  /// 竞态处理：每次触发自增 _pipFetchToken，过期结果丢弃。
-  Future<void> _pushPipSongChange(Song? song) async {
-    final token = ++_pipFetchToken;
-    try {
-      List<LyricLine> lines = const [];
-      if (song != null) {
-        // 本地歌曲优先读取内嵌歌词
-        if (!song.isOnline) {
-          final localPath = song.localPath;
-          if (localPath != null && localPath.isNotEmpty) {
-            String filePath = localPath;
-            if (filePath.startsWith('file://')) {
-              filePath = Uri.parse(filePath).toFilePath();
-            }
-            final embedded = await LocalLyricLoader.loadForAudioAsync(filePath);
-            if (embedded != null && embedded.isNotEmpty) {
-              lines = await parseLyricOffMainThread(embedded);
-            }
-          }
-        }
-
-        // 内嵌歌词为空时从酷狗 API 获取
-        if (lines.isEmpty) {
-          final ctx = appNavigatorKey.currentContext;
-          if (ctx != null && ctx.mounted) {
-            try {
-              final kugou = ctx.read<KugouProvider>();
-              final lyricHash = song.isOnline ? song.id : '';
-              final searchName = song.artist != '未知艺术家'
-                  ? '${song.title} ${song.artist}'
-                  : song.title;
-              final lyric = await kugou.getLyric(
-                lyricHash,
-                songName: searchName,
-                fmt: 'lrc',
-              );
-              if (token != _pipFetchToken) return;
-              final text = lyric?.displayLyric;
-              final translationText = lyric?.translatedContent;
-              final romaText = lyric?.romaContent;
-              if (text != null && text.isNotEmpty) {
-                lines = LyricParserChain.parse(
-                  text,
-                  translationText: translationText,
-                  romaText: romaText,
-                );
-              }
-            } catch (_) {}
-          }
-        }
-      }
-      if (token != _pipFetchToken) return;
-      await LyricsPipService.instance.setLyrics(lines);
-      // 立即推一次当前进度：切歌后不等下一个 1s tick，首帧就位
-      await LyricsPipService.instance.update(
-        positionMs: _position.inMilliseconds,
-        playing: _isPlaying,
-      );
-    } catch (_) {}
-  }
-
-  /// iOS PiP 窗口内播放/暂停按钮 → 切换播放（与锁屏远程命令同一套 resume/pause）。
-  void _handlePipPlayPause(bool playing) {
-    if (!Platform.isIOS) return;
-    if (playing) {
-      resume();
-    } else {
-      pause();
     }
   }
 
