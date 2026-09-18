@@ -881,7 +881,9 @@ private final class PipPlaybackDelegate: NSObject,
     // 必须返回非空区间，否则 PiP 判定"无可播放内容"一直转圈。
     // 歌词按流式推送没有总时长，给当前时刻起的一段长区间即可。
     let now = CMClock.hostTimeClock.time
-    let start = CMTime(value: now.value - now.timescale, timescale: now.timescale)
+    let start = CMTime(
+      value: now.value - Int64(now.timescale),
+      timescale: now.timescale)
     return CMTimeRange(start: start, duration: CMTime(seconds: 3600, preferredTimescale: 600))
   }
 
