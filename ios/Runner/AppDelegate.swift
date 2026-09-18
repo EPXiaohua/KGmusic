@@ -555,7 +555,7 @@ final class LyricsPipManager: NSObject {
     // 每次进度推送都把帧时钟拉回 hostTime 并跟随播放/暂停，
     // 避免长时间运行后 timebase 落后于帧 PTS 导致画面冻结
     if let tb = controlTimebase {
-      CMTimebaseSetTime(tb, at: CMClock.hostTimeClock.time)
+      CMTimebaseSetTime(tb, time: CMClock.hostTimeClock.time)
       CMTimebaseSetRate(tb, rate: playing ? 1.0 : 0.0)
     }
     maybeRenderFrame()
@@ -628,7 +628,7 @@ final class LyricsPipManager: NSObject {
       // 帧时钟：hostTime 派生的 timebase。必须把它的当前时间对齐到 hostTime
       // （新建的 timebase 时间从 0 起算，而帧 PTS 是 hostTime，不对齐帧永远不显示）
       if let tb = try? CMTimebase(sourceClock: CMClock.hostTimeClock) {
-        CMTimebaseSetTime(tb, at: CMClock.hostTimeClock.time)
+        CMTimebaseSetTime(tb, time: CMClock.hostTimeClock.time)
         CMTimebaseSetRate(tb, rate: 1.0)
         layer.controlTimebase = tb
         controlTimebase = tb
