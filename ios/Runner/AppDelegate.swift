@@ -615,6 +615,10 @@ final class LyricsPipManager: NSObject {
       }
       delegate.onStarted = { [weak self] in self?.notifyState(active: true) }
       delegate.onStopped = { [weak self] in self?.notifyState(active: false) }
+      delegate.onRenderSizeChange = { [weak self] in
+        self?.frameDirty = true
+        self?.maybeRenderFrame()
+      }
       let source = AVPictureInPictureController.ContentSource(
         sampleBufferDisplayLayer: layer,
         playbackDelegate: delegate)
@@ -828,6 +832,8 @@ private final class PipPlaybackDelegate: NSObject,
   var onSetPlaying: (Bool) -> Void = { _ in }
   var onStarted: () -> Void = {}
   var onStopped: () -> Void = {}
+  /// 用户缩放 PiP 窗口 → manager 重绘适配新尺寸
+  var onRenderSizeChange: () -> Void = {}
 
   func pictureInPictureControllerIsPlaybackPaused(
     _ pictureInPictureController: AVPictureInPictureController
@@ -863,8 +869,7 @@ private final class PipPlaybackDelegate: NSObject,
     didTransitionToRenderSize newRenderSize: CMVideoDimensions
   ) {
     // 用户缩放窗口后重绘一帧适配新尺寸
-    frameDirty = true
-    maybeRenderFrame()
+    onRenderSizeChange()
   }
 
   func pictureInPictureControllerDidStartPictureInPicture(
