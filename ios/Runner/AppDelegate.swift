@@ -617,6 +617,11 @@ final class LyricsPipManager: NSObject {
       } else {
         NSLog("[MD3Music] lyrics pip no root layer!")
       }
+      // 帧时钟：hostTime 派生的 timebase，帧按 PTS 即时呈现；不设会导致
+      // sampleBuffer 层一直等待、PiP 窗口转圈
+      if let tb = try? CMTimebase(sourceClock: CMClock.hostTimeClock) {
+        layer.controlTimebase = tb
+      }
       let delegate = PipPlaybackDelegate()
       delegate.isPlaying = { [weak self] in self?.playing ?? false }
       // PiP 窗口播放/暂停按钮 → 回传 Dart 切换播放（Dart 播完经 update 回流状态）
@@ -873,8 +878,11 @@ private final class PipPlaybackDelegate: NSObject,
   func pictureInPictureControllerTimeRangeForPlayback(
     _ pictureInPictureController: AVPictureInPictureController
   ) -> CMTimeRange {
-    // 歌词进度由 Dart 端 update 推送，返回空区间即可（CMD+R 键等不适用）
-    CMTimeRange()
+    // 必须返回非空区间，否则 PiP 判定"无可播放内容"一直转圈。
+    // 歌词按流式推送没有总时长，给当前时刻起的一段长区间即可。
+    let now = CMClock.hostTimeClock.time
+    let start = CMTime(value: now.value - now.timescale, timescale: now.timescale)
+    return CMTimeRange(start: start, duration: CMTime(seconds: 3600, preferredTimescale: 600))
   }
 
   func pictureInPictureController(
