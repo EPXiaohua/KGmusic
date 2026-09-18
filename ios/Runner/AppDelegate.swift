@@ -858,6 +858,15 @@ private final class PipPlaybackDelegate: NSObject,
     CMTimeRange()
   }
 
+  func pictureInPictureController(
+    _ pictureInPictureController: AVPictureInPictureController,
+    didTransitionToRenderSize newRenderSize: CMVideoDimensions
+  ) {
+    // 用户缩放窗口后重绘一帧适配新尺寸
+    frameDirty = true
+    maybeRenderFrame()
+  }
+
   func pictureInPictureControllerDidStartPictureInPicture(
     _ pictureInPictureController: AVPictureInPictureController
   ) {
