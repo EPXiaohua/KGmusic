@@ -555,11 +555,13 @@ final class LyricsPipManager: NSObject {
       self.playing = playing
       frameDirty = true
     }
-    // 每次进度推送都把帧时钟拉回 hostTime 并跟随播放/暂停，
-    // 避免长时间运行后 timebase 落后于帧 PTS 导致画面冻结
+    // 每次进度推送都把帧时钟拉回 hostTime，避免长时间运行后 timebase
+    // 落后于帧 PTS 导致画面冻结。注意 rate 必须恒为 1.0：歌词窗是常显
+    // 内容，若跟随 playing 置 0，系统 LayerSync 会冻结图层时序，帧的
+    // PTS 永远等不到呈现时刻 → 黑屏。暂停语义由 Dart 停推进度体现。
     if let tb = controlTimebase {
       CMTimebaseSetTime(tb, time: CMClock.hostTimeClock.time)
-      CMTimebaseSetRate(tb, rate: playing ? 1.0 : 0.0)
+      CMTimebaseSetRate(tb, rate: 1.0)
     }
     maybeRenderFrame()
   }
@@ -637,7 +639,6 @@ final class LyricsPipManager: NSObject {
         controlTimebase = tb
       }
       let delegate = PipPlaybackDelegate()
-      delegate.isPlaying = { [weak self] in self?.playing ?? false }
       // PiP 窗口播放/暂停按钮 → 回传 Dart 切换播放（Dart 播完经 update 回流状态）
       delegate.onSetPlaying = { [weak self] value in
         self?.playing = value
@@ -777,17 +778,15 @@ final class LyricsPipManager: NSObject {
 
     let idx = renderedLineIndex
     guard lines.indices.contains(idx) else {
-      // 无歌词可画：给出可见的回退画面（同时充当诊断信息——
-      // 如果悬浮窗显示这行字，说明渲染/推流链路是通的，只是歌词未送达）
-      let hint = lines.isEmpty
-        ? "♪ 等待歌词… (n=0, pos=\(Int(positionMs))ms)"
-        : "♪ 间奏中…"
+      // 无歌词可画：干净的回退画面（音符符号），不显示任何诊断信息
       let attrs: [NSAttributedString.Key: Any] = [
-        .font: UIFont.systemFont(ofSize: 26, weight: .medium),
-        .foregroundColor: UIColor.white.withAlphaComponent(0.75),
+        .font: UIFont.systemFont(ofSize: 44),
+        .foregroundColor: UIColor.white.withAlphaComponent(0.5),
       ]
+      let hint = lines.isEmpty ? "♪" : "♪ 间奏中…"
+      let size = (hint as NSString).size(withAttributes: attrs)
       (hint as NSString).draw(
-        at: CGPoint(x: 24, y: height / 2 - 16),
+        at: CGPoint(x: (width - size.width) / 2, y: (height - size.height) / 2),
         withAttributes: attrs)
       return
     }
@@ -883,7 +882,6 @@ final class LyricsPipManager: NSObject {
 @available(iOS 15.0, *)
 private final class PipPlaybackDelegate: NSObject,
     AVPictureInPictureSampleBufferPlaybackDelegate, AVPictureInPictureControllerDelegate {
-  var isPlaying: () -> Bool = { false }
   /// PiP 窗口播放/暂停按钮 → 回传 Dart
   var onSetPlaying: (Bool) -> Void = { _ in }
   var onStarted: () -> Void = {}
@@ -894,7 +892,10 @@ private final class PipPlaybackDelegate: NSObject,
   func pictureInPictureControllerIsPlaybackPaused(
     _ pictureInPictureController: AVPictureInPictureController
   ) -> Bool {
-    !isPlaying()
+    // 歌词悬浮窗是常显内容（不是视频），永远不能让系统按"暂停"
+    // 语义冻结图层时序——否则 LayerSync 会 pause，帧 PTS 永远等
+    // 不到呈现时刻 → 黑屏。暂停语义由 Dart 停推进度体现即可。
+    return false
   }
 
   func pictureInPictureController(
